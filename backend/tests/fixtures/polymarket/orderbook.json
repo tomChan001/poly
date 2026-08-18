@@ -1,0 +1,10 @@
+{
+  "market": "condition-1",
+  "asset_id": "token-yes",
+  "timestamp": "1787014800000",
+  "hash": "book-hash-1",
+  "asks": [
+    {"price": "0.11", "size": "4538"},
+    {"price": "0.12", "size": "4258"}
+  ]
+}

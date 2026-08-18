@@ -1,0 +1,27 @@
+{
+  "opportunities": [
+    {
+      "id": "oddpool-001",
+      "title": "Will the example event happen by 2026?",
+      "outcome": "Example outcome",
+      "updated_at": "2026-08-18T01:00:00Z",
+      "resolves_at": "2026-12-31T23:59:59Z",
+      "gross_spread": "0.13",
+      "estimated_fees": "0.02",
+      "legs": [
+        {
+          "venue": "kalshi",
+          "outcome": "no",
+          "market_url": "https://kalshi.com/markets/example",
+          "display_price": "0.76"
+        },
+        {
+          "venue": "polymarket",
+          "outcome": "yes",
+          "market_url": "https://polymarket.com/event/example",
+          "display_price": "0.11"
+        }
+      ]
+    }
+  ]
+}
