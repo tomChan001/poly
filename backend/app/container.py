@@ -1,3 +1,5 @@
+from backend.app.services.automation_gate import AutomationEvidence, AutomationGate
+from backend.app.services.execution import InMemoryExecutionStore
 from backend.app.services.mappings import MappingReviewService
 from backend.app.services.notifications import InMemoryOutbox, NotificationService
 from backend.app.services.opportunities import InMemoryOpportunityStore
@@ -19,3 +21,6 @@ class ApplicationContainer:
         self.outbox = InMemoryOutbox()
         self.notifications = NotificationService(self.outbox)
         self.system_control = SystemControl()
+        self.executions = InMemoryExecutionStore()
+        self.automation_gate = AutomationGate()
+        self.automation_evidence: AutomationEvidence | None = None

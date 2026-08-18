@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom/vitest'
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import { expect, test, vi } from 'vitest'
 
 import App from './App'
@@ -26,10 +26,33 @@ const opportunities = [
   },
 ]
 
+const executions = [
+  {
+    correlation_id: 'corr-1',
+    state: 'paired',
+    requested_quantity: '10',
+    matched_quantity: '10',
+    unhedged_quantity: '0',
+    legs: {
+      kalshi: { client_order_id: 'corr-1-kalshi', status: 'filled', filled_quantity: '10' },
+      polymarket: { client_order_id: 'corr-1-polymarket', status: 'filled', filled_quantity: '10' },
+    },
+    transitions: [
+      { source: 'submitted', target: 'paired', occurred_at: '2026-08-18T04:00:00Z' },
+    ],
+  },
+]
+
 test('renders the operational opportunity table', async () => {
   vi.stubGlobal(
     'fetch',
-    vi.fn().mockResolvedValue({ ok: true, json: async () => opportunities }),
+    vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      return Promise.resolve({
+        ok: true,
+        json: async () => (url.includes('/api/executions') ? executions : opportunities),
+      })
+    }),
   )
 
   render(<App />)
@@ -39,4 +62,8 @@ test('renders the operational opportunity table', async () => {
   ).toBeInTheDocument()
   expect(await screen.findByText('Example market')).toBeInTheDocument()
   expect(screen.getByText('READ ONLY')).toBeInTheDocument()
+
+  fireEvent.click(screen.getByRole('button', { name: '运行' }))
+  expect(await screen.findByText('PAIRED')).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: /批准|下单/ })).not.toBeInTheDocument()
 })

@@ -1,0 +1,28 @@
+groups:
+  - name: controlled-execution
+    rules:
+      - alert: UnhedgedPosition
+        expr: poly_unhedged_quantity > 0
+        for: 0m
+        labels: { severity: critical }
+        annotations: { summary: "An execution has unmatched filled quantity" }
+      - alert: ReconciliationMismatch
+        expr: increase(poly_reconciliation_mismatch_total[5m]) > 0
+        for: 0m
+        labels: { severity: critical }
+        annotations: { summary: "Platform and local account state differ" }
+      - alert: TradingCredentialFailure
+        expr: increase(poly_trading_credential_failure_total[5m]) > 0
+        for: 0m
+        labels: { severity: critical }
+        annotations: { summary: "Execution worker could not authenticate" }
+      - alert: MarketDataStalled
+        expr: poly_market_data_age_seconds > 30
+        for: 30s
+        labels: { severity: warning }
+        annotations: { summary: "Native market data is stale" }
+      - alert: FeeEstimateMismatch
+        expr: poly_fee_difference_dollars > 0.01
+        for: 0m
+        labels: { severity: warning }
+        annotations: { summary: "Actual venue fee differs from the estimate" }

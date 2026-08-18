@@ -7,9 +7,19 @@ from pydantic import BaseModel
 
 from backend.app.api.dependencies import get_container
 from backend.app.container import ApplicationContainer
+from backend.app.core.security import (
+    Principal,
+    Role,
+    require_authenticated,
+    require_role,
+)
 from backend.app.domain.enums import MappingStatus
 
-router = APIRouter(prefix="/api/mappings", tags=["mappings"])
+router = APIRouter(
+    prefix="/api/mappings",
+    tags=["mappings"],
+    dependencies=[Depends(require_authenticated)],
+)
 
 
 class TruthTableRow(BaseModel):
@@ -19,7 +29,6 @@ class TruthTableRow(BaseModel):
 
 class MappingReviewRequest(BaseModel):
     status: MappingStatus
-    reviewer: str
     checklist: dict[str, bool]
     truth_table: list[TruthTableRow]
     notes: str = ""
@@ -36,12 +45,13 @@ def review_mapping(
     mapping_id: UUID,
     payload: MappingReviewRequest,
     container: Annotated[ApplicationContainer, Depends(get_container)],
+    principal: Annotated[Principal, Depends(require_role(Role.REVIEWER))],
 ) -> MappingReviewResponse:
     try:
         review = container.mappings.review(
             mapping_id,
             payload.status,
-            payload.reviewer,
+            principal.subject,
             payload.checklist,
             [row.model_dump() for row in payload.truth_table],
             payload.notes,

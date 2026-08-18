@@ -224,6 +224,24 @@ tbody tr:last-child td { border-bottom: 0; }
 .metric-strip.analytics { margin-bottom: 18px; }
 .data-band { padding: 16px; }
 .empty-chart { min-height: 260px; display: grid; place-items: center; color: var(--muted); background-color: #fafbfb; border: 1px solid #e6eaec; font-size: 11px; }
+.execution-detail { margin-bottom: 14px; }
+.execution-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
+.execution-head code { color: var(--muted); font-size: 10px; }
+.execution-state { padding: 4px 7px; color: #4e5a62; background: #edf0f1; border-radius: 3px; font-size: 10px; }
+.execution-state.paired { color: var(--green); background: var(--green-soft); }
+.execution-state.partially_hedged, .execution-state.exception { color: var(--red); background: var(--red-soft); }
+.execution-summary { display: grid; grid-template-columns: repeat(3, 1fr); margin: 0; border-bottom: 1px solid var(--line); }
+.execution-summary div { padding: 14px 0; }
+.execution-summary dt { color: var(--muted); font-size: 10px; }
+.execution-summary dd { margin: 4px 0 0; font-size: 16px; font-weight: 650; }
+.execution-legs { display: grid; grid-template-columns: 1fr 1fr; border-bottom: 1px solid var(--line); }
+.execution-legs > div { display: grid; gap: 4px; padding: 14px 0; }
+.execution-legs > div + div { padding-left: 18px; border-left: 1px solid var(--line); }
+.execution-legs span, .execution-legs small { color: var(--muted); font-size: 10px; }
+.execution-legs small { overflow-wrap: anywhere; }
+.execution-timeline { display: grid; gap: 9px; margin: 14px 0 0; padding: 0; list-style: none; }
+.execution-timeline li { display: grid; grid-template-columns: 170px 1fr; gap: 12px; font-size: 11px; }
+.execution-timeline time { color: var(--muted); }
 
 .settings-form { overflow: hidden; }
 .settings-group { display: grid; grid-template-columns: 180px repeat(3, minmax(150px, 1fr)); gap: 16px; align-items: end; padding: 20px; border-bottom: 1px solid var(--line); }
@@ -280,4 +298,8 @@ tbody tr:last-child td { border-bottom: 0; }
   .settings-group { grid-template-columns: 1fr; padding: 16px; }
   .settings-group h3 { grid-column: auto; }
   .detail-drawer { width: 100%; }
+  .execution-summary { grid-template-columns: 1fr 1fr 1fr; }
+  .execution-legs { grid-template-columns: 1fr; }
+  .execution-legs > div + div { padding-left: 0; border-top: 1px solid var(--line); border-left: 0; }
+  .execution-timeline li { grid-template-columns: 1fr; gap: 3px; }
 }

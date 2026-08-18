@@ -9,12 +9,13 @@ import {
   ShieldCheck,
 } from 'lucide-react'
 
-import { getOpportunities } from './api/client'
+import { getExecutions, getOpportunities } from './api/client'
 import { TradingModeBanner } from './components/TradingModeBanner'
 import { AnalyticsPage } from './pages/AnalyticsPage'
 import { MappingQueuePage } from './pages/MappingQueuePage'
 import { OpportunitiesPage } from './pages/OpportunitiesPage'
 import { RiskSettingsPage } from './pages/RiskSettingsPage'
+import type { Execution } from './types/execution'
 import type { Opportunity } from './types/opportunity'
 import './App.css'
 
@@ -30,13 +31,19 @@ const navigation = [
 function App() {
   const [view, setView] = useState<View>('opportunities')
   const [opportunities, setOpportunities] = useState<Opportunity[]>([])
+  const [executions, setExecutions] = useState<Execution[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
   const refresh = async () => {
     setLoading(true)
     try {
-      setOpportunities(await getOpportunities())
+      const [latestOpportunities, latestExecutions] = await Promise.all([
+        getOpportunities(),
+        getExecutions(),
+      ])
+      setOpportunities(latestOpportunities)
+      setExecutions(latestExecutions)
       setError(null)
     } catch {
       setError('无法读取机会数据')
@@ -117,7 +124,9 @@ function App() {
           />
         )}
         {view === 'mappings' && <MappingQueuePage />}
-        {view === 'analytics' && <AnalyticsPage opportunities={opportunities} />}
+        {view === 'analytics' && (
+          <AnalyticsPage opportunities={opportunities} executions={executions} />
+        )}
         {view === 'settings' && <RiskSettingsPage />}
       </main>
     </div>

@@ -4,9 +4,14 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from backend.app.api.dependencies import get_container
 from backend.app.container import ApplicationContainer
+from backend.app.core.security import require_authenticated
 from backend.app.services.opportunities import OpportunityRecord
 
-router = APIRouter(prefix="/api/opportunities", tags=["opportunities"])
+router = APIRouter(
+    prefix="/api/opportunities",
+    tags=["opportunities"],
+    dependencies=[Depends(require_authenticated)],
+)
 
 
 @router.get("")

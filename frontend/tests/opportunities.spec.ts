@@ -29,6 +29,7 @@ for (const viewport of viewports) {
   test(`opportunity workspace fits the ${viewport.name} viewport`, async ({ page }, testInfo) => {
     await page.setViewportSize(viewport)
     await page.route('**/api/opportunities', (route) => route.fulfill({ json: [opportunity] }))
+    await page.route('**/api/executions', (route) => route.fulfill({ json: [] }))
     await page.goto('/')
 
     await expect(page.getByRole('heading', { name: '跨市场控制台' })).toBeVisible()

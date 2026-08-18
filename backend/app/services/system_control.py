@@ -10,3 +10,6 @@ class SystemControl:
         self.opening_enabled = False
         self.reason = reason
 
+    def set_opening(self, enabled: bool, reason: str) -> None:
+        self.opening_enabled = enabled
+        self.reason = reason

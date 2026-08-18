@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal
 
 from backend.app.domain.enums import Venue
+from backend.app.services.system_control import SystemControl
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,3 +50,25 @@ class FeeEngine:
             raise KeyError(f"FEE_UNKNOWN: {venue}/{market_category}") from exc
         return rule.estimate(quantity, price)
 
+
+@dataclass(frozen=True, slots=True)
+class FeeReconciliationResult:
+    matches: bool
+    difference: Decimal
+
+
+class FeeReconciliationService:
+    def __init__(
+        self,
+        system_control: SystemControl,
+        tolerance: Decimal = Decimal("0.01"),
+    ) -> None:
+        self._system_control = system_control
+        self._tolerance = tolerance
+
+    def compare(self, estimated: Decimal, actual: Decimal) -> FeeReconciliationResult:
+        difference = abs(actual - estimated)
+        matches = difference <= self._tolerance
+        if not matches:
+            self._system_control.disable_opening("actual fee differs from estimate")
+        return FeeReconciliationResult(matches, difference)
