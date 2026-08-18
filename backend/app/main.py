@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 
 from backend.app.api.routes.mappings import router as mappings_router
+from backend.app.api.routes.opportunities import router as opportunities_router
+from backend.app.api.routes.settings import router as settings_router
 from backend.app.container import ApplicationContainer
 from backend.app.core.config import settings
 
@@ -9,6 +11,8 @@ def create_app(container: ApplicationContainer | None = None) -> FastAPI:
     application = FastAPI(title="Cross-Market Control Plane")
     application.state.container = container or ApplicationContainer()
     application.include_router(mappings_router)
+    application.include_router(opportunities_router)
+    application.include_router(settings_router)
 
     @application.get("/health")
     def health() -> dict[str, str]:

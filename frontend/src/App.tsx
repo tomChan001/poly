@@ -1,121 +1,126 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from './assets/vite.svg'
-import heroImg from './assets/hero.png'
+import { useEffect, useMemo, useState } from 'react'
+import {
+  Activity,
+  BookOpenCheck,
+  ChartNoAxesCombined,
+  Gauge,
+  RefreshCw,
+  Settings2,
+  ShieldCheck,
+} from 'lucide-react'
+
+import { getOpportunities } from './api/client'
+import { TradingModeBanner } from './components/TradingModeBanner'
+import { AnalyticsPage } from './pages/AnalyticsPage'
+import { MappingQueuePage } from './pages/MappingQueuePage'
+import { OpportunitiesPage } from './pages/OpportunitiesPage'
+import { RiskSettingsPage } from './pages/RiskSettingsPage'
+import type { Opportunity } from './types/opportunity'
 import './App.css'
 
+type View = 'opportunities' | 'mappings' | 'analytics' | 'settings'
+
+const navigation = [
+  { id: 'opportunities' as const, label: '机会', icon: Gauge },
+  { id: 'mappings' as const, label: '审核', icon: BookOpenCheck },
+  { id: 'analytics' as const, label: '运行', icon: ChartNoAxesCombined },
+  { id: 'settings' as const, label: '风控', icon: Settings2 },
+]
+
 function App() {
-  const [count, setCount] = useState(0)
+  const [view, setView] = useState<View>('opportunities')
+  const [opportunities, setOpportunities] = useState<Opportunity[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  const refresh = async () => {
+    setLoading(true)
+    try {
+      setOpportunities(await getOpportunities())
+      setError(null)
+    } catch {
+      setError('无法读取机会数据')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    void refresh()
+  }, [])
+
+  const activeCount = useMemo(
+    () => opportunities.filter((item) => item.rejection_reasons.length === 0).length,
+    [opportunities],
+  )
 
   return (
-    <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={reactLogo} className="framework" alt="React logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand-mark" aria-hidden="true">
+          <Activity size={20} />
         </div>
-        <div>
-          <h1>Get started</h1>
-          <p>
-            Edit <code>src/App.tsx</code> and save to test <code>HMR</code>
-          </p>
+        <div className="brand-copy">
+          <strong>POLYHEDGE</strong>
+          <span>跨市场控制台</span>
         </div>
-        <button
-          type="button"
-          className="counter"
-          onClick={() => setCount((count) => count + 1)}
-        >
-          Count is {count}
-        </button>
-      </section>
+        <nav aria-label="主导航">
+          {navigation.map((item) => {
+            const Icon = item.icon
+            return (
+              <button
+                key={item.id}
+                type="button"
+                className={view === item.id ? 'nav-item active' : 'nav-item'}
+                onClick={() => setView(item.id)}
+              >
+                <Icon size={18} />
+                <span>{item.label}</span>
+              </button>
+            )
+          })}
+        </nav>
+        <div className="sidebar-foot">
+          <ShieldCheck size={16} />
+          <span>原生数据校验</span>
+        </div>
+      </aside>
 
-      <div className="ticks"></div>
+      <main className="workspace">
+        <header className="topbar">
+          <div>
+            <h1>跨市场控制台</h1>
+            <p>Kalshi × Polymarket</p>
+          </div>
+          <div className="topbar-actions">
+            <span className="live-indicator"><i />行情流</span>
+            <button
+              type="button"
+              className="icon-button"
+              title="刷新机会"
+              aria-label="刷新机会"
+              onClick={() => void refresh()}
+            >
+              <RefreshCw size={18} className={loading ? 'spin' : ''} />
+            </button>
+          </div>
+        </header>
 
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#documentation-icon"></use>
-          </svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://react.dev/" target="_blank">
-                <img className="button-icon" src={reactLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
-        </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#social-icon"></use>
-          </svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li>
-              <a href="https://github.com/vitejs/vite" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#github-icon"></use>
-                </svg>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a href="https://chat.vite.dev/" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#discord-icon"></use>
-                </svg>
-                Discord
-              </a>
-            </li>
-            <li>
-              <a href="https://x.com/vite_js" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#x-icon"></use>
-                </svg>
-                X.com
-              </a>
-            </li>
-            <li>
-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#bluesky-icon"></use>
-                </svg>
-                Bluesky
-              </a>
-            </li>
-          </ul>
-        </div>
-      </section>
+        <TradingModeBanner mode="READ ONLY" openingEnabled={false} />
 
-      <div className="ticks"></div>
-      <section id="spacer"></section>
-    </>
+        {error && <div className="error-band">{error}</div>}
+        {view === 'opportunities' && (
+          <OpportunitiesPage
+            opportunities={opportunities}
+            activeCount={activeCount}
+            loading={loading}
+          />
+        )}
+        {view === 'mappings' && <MappingQueuePage />}
+        {view === 'analytics' && <AnalyticsPage opportunities={opportunities} />}
+        {view === 'settings' && <RiskSettingsPage />}
+      </main>
+    </div>
   )
 }
 

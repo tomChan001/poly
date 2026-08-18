@@ -1,0 +1,64 @@
+from dataclasses import asdict, dataclass, replace
+from decimal import Decimal
+from uuid import UUID, uuid4
+
+
+@dataclass(slots=True)
+class RiskPolicyInput:
+    minimum_roi: Decimal
+    maximum_settlement_days: int
+    maximum_book_age_seconds: Decimal
+    per_trade_limit: Decimal
+    per_event_limit: Decimal
+    portfolio_limit: Decimal
+    explicit_cost: Decimal
+    risk_buffer: Decimal
+    maximum_unhedged_seconds: Decimal
+    maximum_unhedged_loss: Decimal
+
+    @classmethod
+    def defaults(cls) -> "RiskPolicyInput":
+        return cls(
+            minimum_roi=Decimal("0.03"),
+            maximum_settlement_days=30,
+            maximum_book_age_seconds=Decimal(2),
+            per_trade_limit=Decimal(10),
+            per_event_limit=Decimal(25),
+            portfolio_limit=Decimal(100),
+            explicit_cost=Decimal(0),
+            risk_buffer=Decimal("0.25"),
+            maximum_unhedged_seconds=Decimal(2),
+            maximum_unhedged_loss=Decimal(2),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RiskPolicy:
+    version: UUID
+    minimum_roi: Decimal
+    maximum_settlement_days: int
+    maximum_book_age_seconds: Decimal
+    per_trade_limit: Decimal
+    per_event_limit: Decimal
+    portfolio_limit: Decimal
+    explicit_cost: Decimal
+    risk_buffer: Decimal
+    maximum_unhedged_seconds: Decimal
+    maximum_unhedged_loss: Decimal
+
+
+class InMemoryRiskPolicyStore:
+    def __init__(self) -> None:
+        self._versions: dict[UUID, RiskPolicy] = {}
+        self.current: RiskPolicy | None = None
+
+    def create(self, value: RiskPolicyInput) -> RiskPolicy:
+        # Copying isolates historical policy versions from later UI edits.
+        snapshot = replace(value)
+        policy = RiskPolicy(uuid4(), **asdict(snapshot))
+        self._versions[policy.version] = policy
+        self.current = policy
+        return policy
+
+    def get(self, version: UUID) -> RiskPolicy:
+        return self._versions[version]
