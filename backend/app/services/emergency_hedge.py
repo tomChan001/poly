@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
 
+from backend.app.core.config import TradingMode
 from backend.app.domain.enums import Venue
 from backend.app.services.execution import (
     ExecutionTradingPort,
@@ -38,11 +39,18 @@ class EmergencyResult:
     action: EmergencyAction
     order: OrderSubmissionResult
     resolved: bool
+    simulated: bool = False
 
 
 class EmergencyHedgeService:
-    def __init__(self, ports: dict[Venue, ExecutionTradingPort]) -> None:
+    def __init__(
+        self,
+        ports: dict[Venue, ExecutionTradingPort],
+        *,
+        trading_mode: TradingMode = TradingMode.LIMITED_AUTO,
+    ) -> None:
         self._ports = ports
+        self._trading_mode = trading_mode
         self._results: dict[str, EmergencyResult] = {}
 
     async def resolve(
@@ -79,6 +87,20 @@ class EmergencyHedgeService:
                 limit_price=exposure.close_limit_price,
                 action=OrderAction.SELL,
             )
+
+        if self._trading_mode is not TradingMode.LIMITED_AUTO:
+            result = EmergencyResult(
+                action=action,
+                order=OrderSubmissionResult(
+                    request.client_order_id,
+                    OrderStatus.UNKNOWN,
+                    (),
+                ),
+                resolved=False,
+                simulated=True,
+            )
+            self._results[exposure.correlation_id] = result
+            return result
 
         port = self._ports[request.venue]
         try:

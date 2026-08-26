@@ -12,8 +12,10 @@ from backend.app.core.secrets import InMemorySecretStore, KeyringSecretStore
 from backend.app.db.capital import PostgresCapitalLedger
 from backend.app.db.executable_pairs import PostgresExecutablePairRepository
 from backend.app.db.executions import PostgresExecutionStore
+from backend.app.db.incidents import PostgresIncidentStore
 from backend.app.db.integration_config import PostgresIntegrationConfigRepository
 from backend.app.db.operational_control import PostgresOperationalControlStore
+from backend.app.db.outbox import PostgresOutbox
 from backend.app.domain.enums import Venue
 from backend.app.services.automation_gate import AutomationEvidence, AutomationGate
 from backend.app.services.capital import CapitalLedger
@@ -22,6 +24,11 @@ from backend.app.services.executable_pairs import (
     InMemoryExecutablePairRepository,
 )
 from backend.app.services.execution import ExecutionStore, InMemoryExecutionStore
+from backend.app.services.execution_supervisor import (
+    ExecutionSupervisor,
+    IncidentStore,
+    InMemoryIncidentStore,
+)
 from backend.app.services.fees import FeeEngine
 from backend.app.services.integration_config import (
     InMemoryIntegrationConfigRepository,
@@ -29,7 +36,11 @@ from backend.app.services.integration_config import (
 )
 from backend.app.services.live_runtime import BalanceTradingPort, LiveRuntimeService
 from backend.app.services.mappings import MappingReviewService
-from backend.app.services.notifications import InMemoryOutbox, NotificationService
+from backend.app.services.notifications import (
+    InMemoryOutbox,
+    NotificationService,
+    OutboxStore,
+)
 from backend.app.services.opportunities import InMemoryOpportunityStore
 from backend.app.services.optimizer import QuoteOptimizer
 from backend.app.services.pair_discovery import ConfiguredOddpoolPairDiscoveryService
@@ -53,11 +64,17 @@ class ApplicationContainer:
         self.capital_ledger = CapitalLedger({})
         self.risk_policies = InMemoryRiskPolicyStore()
         self.risk_policies.create(RiskPolicyInput.defaults())
-        self.outbox = InMemoryOutbox()
+        self.outbox: OutboxStore = InMemoryOutbox()
         self.notifications = NotificationService(self.outbox)
+        self.incidents: IncidentStore = InMemoryIncidentStore()
         self.system_control = SystemControl(
             opening_enabled=settings.opening_enabled,
             reason="configured default",
+        )
+        self.execution_supervisor = ExecutionSupervisor(
+            system_control=self.system_control,
+            incidents=self.incidents,
+            notifications=self.notifications,
         )
         self.executions: ExecutionStore = InMemoryExecutionStore()
         self.executable_pairs = ExecutablePairService(InMemoryExecutablePairRepository())
@@ -98,10 +115,18 @@ class ApplicationContainer:
             )
         )
         container.capital_ledger = PostgresCapitalLedger(sessions)
+        container.outbox = PostgresOutbox(sessions)
+        container.notifications = NotificationService(container.outbox)
+        container.incidents = PostgresIncidentStore(sessions)
         container.system_control = SystemControl(
             opening_enabled=settings.opening_enabled,
             reason="configured default",
             store=PostgresOperationalControlStore(sessions),
+        )
+        container.execution_supervisor = ExecutionSupervisor(
+            system_control=container.system_control,
+            incidents=container.incidents,
+            notifications=container.notifications,
         )
         container.runtime_status = RuntimeStatusService(
             container.integration_configs,
@@ -174,6 +199,7 @@ class ApplicationContainer:
             trading_mode=settings.trading_mode,
             optimizer=QuoteOptimizer(container.fees),
             capital_ledger=container.capital_ledger,
+            execution_supervisor=container.execution_supervisor,
         )
         return container
 

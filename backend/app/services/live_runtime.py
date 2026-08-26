@@ -17,6 +17,7 @@ from backend.app.services.execution import (
     ExecutionAuthorizationService,
     ExecutionEvidence,
     ExecutionStore,
+    ExecutionSupervisorPort,
     ExecutionTradingPort,
 )
 from backend.app.services.integration_config import (
@@ -68,6 +69,7 @@ class PairEvaluation:
     book_sequences: tuple[str, str]
     balance_versions: tuple[str, str]
     rule_versions: tuple[str, str]
+    estimated_fees: tuple[Decimal, Decimal]
 
 
 class LiveRuntimeService:
@@ -88,6 +90,7 @@ class LiveRuntimeService:
         trading_mode: TradingMode,
         optimizer: QuoteOptimizer,
         capital_ledger: CapitalLedger,
+        execution_supervisor: ExecutionSupervisorPort | None = None,
     ) -> None:
         self._integrations = integrations
         self._pairs = pairs
@@ -101,12 +104,15 @@ class LiveRuntimeService:
         self._trading_mode = trading_mode
         self._optimizer = optimizer
         self._capital_ledger = capital_ledger
+        self._execution_supervisor = execution_supervisor
         self._processed_books: set[tuple[str, str, str]] = set()
 
     async def run_once(self, now: datetime) -> int:
         """Run one polling cycle and return the number of executions started."""
         if self._trading_mode is not TradingMode.LIMITED_AUTO:
-            self._runtime_status.record_cycle(error="real submission requires limited_auto mode")
+            self._runtime_status.record_cycle(
+                error="real submission requires limited_auto mode"
+            )
             return 0
         if not self._system_control.opening_enabled:
             self._runtime_status.record_cycle(error="opening kill switch is disabled")
@@ -126,10 +132,14 @@ class LiveRuntimeService:
 
         market_data = await _resolve(self._market_data_factory(bundle))
         ports = await _resolve(self._trading_ports_factory(bundle))
+        if self._execution_supervisor is not None:
+            self._execution_supervisor.bind_emergency_ports(ports)
         executions = 0
         observed: list[OpportunityRecord] = []
         for pair in pairs:
-            evaluation = await self._evaluate_pair(pair, policy, market_data, ports, now)
+            evaluation = await self._evaluate_pair(
+                pair, policy, market_data, ports, now
+            )
             if evaluation is None:
                 continue
             observed.append(evaluation.opportunity)
@@ -146,6 +156,8 @@ class LiveRuntimeService:
                 self._system_control,
                 self._trading_mode,
                 self._execution_store,
+                self._execution_supervisor,
+                policy.maximum_unhedged_loss,
             )
             try:
                 existing = await self._execution_store.get(correlation_id)
@@ -182,6 +194,7 @@ class LiveRuntimeService:
                 polymarket_limit_price=evaluation.polymarket_limit_price,
                 conservative_roi=evaluation.conservative_roi,
                 minimum_roi=policy.minimum_roi,
+                estimated_fees=evaluation.estimated_fees,
             )
             authorization = ExecutionAuthorizationService().issue(
                 MappingStatus.EXACT,
@@ -231,7 +244,9 @@ class LiveRuntimeService:
                 polymarket_book,
                 now=now,
                 maximum_age=timedelta(seconds=float(policy.maximum_book_age_seconds)),
-                maximum_arrival_gap=timedelta(seconds=float(policy.maximum_arrival_gap_seconds)),
+                maximum_arrival_gap=timedelta(
+                    seconds=float(policy.maximum_arrival_gap_seconds)
+                ),
             )
         except BookSynchronizationError as exc:
             return _rejected_evaluation(
@@ -311,7 +326,9 @@ class LiveRuntimeService:
         kalshi_limit = _limit_price(books.kalshi.asks, quote.quantity)
         polymarket_limit = _limit_price(books.polymarket.asks, quote.quantity)
         age_ms = int(
-            max(now - books.kalshi.received_at, now - books.polymarket.received_at).total_seconds()
+            max(
+                now - books.kalshi.received_at, now - books.polymarket.received_at
+            ).total_seconds()
             * 1000
         )
         opportunity = OpportunityRecord(
@@ -332,11 +349,13 @@ class LiveRuntimeService:
             or pair.polymarket_expected_settlement_at
             or now,
             worst_case_settlement_at=pair.worst_case_settlement_at
-            or now
-            + timedelta(days=policy.maximum_settlement_days),
+            or now + timedelta(days=policy.maximum_settlement_days),
             book_age_ms=age_ms,
             rejection_reasons=(),
-            rule_versions=(_rule_hash(pair.kalshi_rule_text), _rule_hash(pair.polymarket_rule_text)),
+            rule_versions=(
+                _rule_hash(pair.kalshi_rule_text),
+                _rule_hash(pair.polymarket_rule_text),
+            ),
             book_sequences=(books.kalshi.sequence, books.polymarket.sequence),
             balance_versions=(str(kalshi_balance), str(polymarket_balance)),
             risk_policy_version=str(policy.version),
@@ -352,7 +371,11 @@ class LiveRuntimeService:
             conservative_roi=quote.conservative_roi,
             book_sequences=(books.kalshi.sequence, books.polymarket.sequence),
             balance_versions=(str(kalshi_balance), str(polymarket_balance)),
-            rule_versions=(_rule_hash(pair.kalshi_rule_text), _rule_hash(pair.polymarket_rule_text)),
+            rule_versions=(
+                _rule_hash(pair.kalshi_rule_text),
+                _rule_hash(pair.polymarket_rule_text),
+            ),
+            estimated_fees=(quote.kalshi_fee, quote.polymarket_fee),
         )
 
 
@@ -406,10 +429,7 @@ def _rejected_evaluation(
 ) -> PairEvaluation:
     books = tuple(book for book in (kalshi_book, polymarket_book) if book is not None)
     age_ms = max(
-        (
-            int((now - book.received_at).total_seconds() * 1000)
-            for book in books
-        ),
+        (int((now - book.received_at).total_seconds() * 1000) for book in books),
         default=0,
     )
     opportunity = OpportunityRecord(
@@ -430,11 +450,13 @@ def _rejected_evaluation(
         or pair.polymarket_expected_settlement_at
         or now,
         worst_case_settlement_at=pair.worst_case_settlement_at
-        or now
-        + timedelta(days=policy.maximum_settlement_days),
+        or now + timedelta(days=policy.maximum_settlement_days),
         book_age_ms=age_ms,
         rejection_reasons=reasons,
-        rule_versions=(_rule_hash(pair.kalshi_rule_text), _rule_hash(pair.polymarket_rule_text)),
+        rule_versions=(
+            _rule_hash(pair.kalshi_rule_text),
+            _rule_hash(pair.polymarket_rule_text),
+        ),
         book_sequences=(
             kalshi_book.sequence if kalshi_book is not None else "unavailable",
             polymarket_book.sequence if polymarket_book is not None else "unavailable",
@@ -461,5 +483,9 @@ def _rejected_evaluation(
             polymarket_book.sequence if polymarket_book is not None else "unavailable",
         ),
         balance_versions=("unavailable", "unavailable"),
-        rule_versions=(_rule_hash(pair.kalshi_rule_text), _rule_hash(pair.polymarket_rule_text)),
+        rule_versions=(
+            _rule_hash(pair.kalshi_rule_text),
+            _rule_hash(pair.polymarket_rule_text),
+        ),
+        estimated_fees=(Decimal(0), Decimal(0)),
     )

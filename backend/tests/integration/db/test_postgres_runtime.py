@@ -15,13 +15,18 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from backend.app.db.base import Base
 from backend.app.db.capital import PostgresCapitalLedger
+from backend.app.db.incidents import PostgresIncidentStore
 from backend.app.db.integration_config import PostgresIntegrationConfigRepository
 from backend.app.db.operational_control import PostgresOperationalControlStore
+from backend.app.db.outbox import PostgresOutbox
+from backend.app.domain.enums import ExecutionState
+from backend.app.services.execution_supervisor import ExecutionIncident
 from backend.app.services.integration_config import (
     IntegrationConfigRecord,
     IntegrationEnvironment,
     IntegrationProvider,
 )
+from backend.app.services.notifications import NotificationService
 from backend.app.services.system_control import SystemControl
 
 ADMIN_URL_ENV = "TEST_POSTGRES_ADMIN_URL"
@@ -93,9 +98,7 @@ async def test_initial_migration_runs_on_postgres_and_protects_audit_events() ->
 
             engine = create_async_engine(migration_url)
             sessions = async_sessionmaker(engine, expire_on_commit=False)
-            repository = PostgresIntegrationConfigRepository(
-                sessions
-            )
+            repository = PostgresIntegrationConfigRepository(sessions)
             try:
                 first = await repository.upsert(
                     IntegrationConfigRecord(
@@ -170,6 +173,47 @@ async def test_initial_migration_runs_on_postgres_and_protects_audit_events() ->
                         Decimal(2),
                         event_id="event-2",
                     )
+
+                incident_store = PostgresIncidentStore(sessions)
+                incident = ExecutionIncident(
+                    idempotency_key="execution:durable:exception",
+                    correlation_id="durable",
+                    state=ExecutionState.EXCEPTION,
+                    action="investigate",
+                    simulated=True,
+                    unhedged_quantity="0",
+                    occurred_at=datetime.now(UTC),
+                )
+                first_incident = await incident_store.add_if_absent(incident)
+                second_incident = await incident_store.add_if_absent(incident)
+                assert first_incident == second_incident
+
+                concurrent_incident = ExecutionIncident(
+                    idempotency_key="execution:concurrent:partially_hedged",
+                    correlation_id="concurrent",
+                    state=ExecutionState.PARTIALLY_HEDGED,
+                    action="hedge",
+                    simulated=False,
+                    unhedged_quantity="4",
+                    occurred_at=datetime.now(UTC),
+                )
+                claims = await asyncio.gather(
+                    *(incident_store.claim(concurrent_incident) for _ in range(8))
+                )
+                assert sum(claimed for _stored, claimed in claims) == 1
+                assert all(stored == concurrent_incident for stored, _claimed in claims)
+
+                notification = await NotificationService(
+                    PostgresOutbox(sessions)
+                ).enqueue_async(
+                    "execution:durable:exception",
+                    "execution.exception",
+                    {"private_key": "must-not-persist", "state": "exception"},
+                )
+                assert notification.payload == {
+                    "private_key": "[REDACTED]",
+                    "state": "exception",
+                }
             finally:
                 await engine.dispose()
 
@@ -204,7 +248,9 @@ async def test_initial_migration_runs_on_postgres_and_protects_audit_events() ->
 
             # The append-only guarantee must be enforced by PostgreSQL itself,
             # including writes that bypass the application service layer.
-            with pytest.raises(asyncpg.PostgresError, match="audit_event is append-only"):
+            with pytest.raises(
+                asyncpg.PostgresError, match="audit_event is append-only"
+            ):
                 await connection.execute(
                     "UPDATE audit_event SET actor = 'tampered' WHERE id = $1", event_id
                 )

@@ -26,8 +26,22 @@ def upgrade() -> None:
         "CREATE INDEX IF NOT EXISTS ix_capital_reservation_exposure "
         "ON capital_reservation (status, event_id, venue)"
     )
+    op.execute(
+        """
+        CREATE TABLE IF NOT EXISTS execution_incident (
+            idempotency_key VARCHAR(255) PRIMARY KEY,
+            correlation_id VARCHAR(64) NOT NULL,
+            state VARCHAR(32) NOT NULL,
+            action VARCHAR(64) NOT NULL,
+            simulated BOOLEAN NOT NULL,
+            unhedged_quantity VARCHAR(128) NOT NULL,
+            occurred_at TIMESTAMPTZ NOT NULL
+        )
+        """
+    )
 
 
 def downgrade() -> None:
+    op.execute("DROP TABLE IF EXISTS execution_incident")
     op.execute("DROP INDEX IF EXISTS ix_capital_reservation_exposure")
     op.execute("ALTER TABLE capital_reservation DROP COLUMN IF EXISTS event_id")

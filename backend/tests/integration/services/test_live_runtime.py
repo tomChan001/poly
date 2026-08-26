@@ -14,6 +14,8 @@ from backend.app.services.executable_pairs import (
     InMemoryExecutablePairRepository,
 )
 from backend.app.services.execution import (
+    ExecutionEvidence,
+    ExecutionRecord,
     FillReport,
     InMemoryExecutionStore,
     OrderOutcomeUnknown,
@@ -96,10 +98,38 @@ class AmbiguousTradingPort(FakeTradingPort):
         raise OrderOutcomeUnknown("response timed out")
 
 
+class RecordingExecutionSupervisor:
+    def __init__(self) -> None:
+        self.bound_ports = None
+        self.evidence: ExecutionEvidence | None = None
+        self.maximum_unhedged_loss: Decimal | None = None
+
+    def bind_emergency_ports(self, ports) -> None:
+        self.bound_ports = ports
+
+    async def finalize(
+        self,
+        _record: ExecutionRecord,
+        evidence: ExecutionEvidence | None = None,
+        *,
+        mode: TradingMode,
+        now: datetime,
+        maximum_unhedged_loss: Decimal = Decimal(0),
+    ) -> None:
+        assert mode is TradingMode.LIMITED_AUTO
+        assert now == NOW
+        self.evidence = evidence
+        self.maximum_unhedged_loss = maximum_unhedged_loss
+
+
 def fee_engine() -> FeeEngine:
     engine = FeeEngine()
-    engine.register(Venue.KALSHI, "standard", ProbabilityCurveFeeRule("kalshi-v1", Decimal("0.07")))
-    engine.register(Venue.POLYMARKET, "standard", ProbabilityCurveFeeRule("poly-v1", Decimal(0)))
+    engine.register(
+        Venue.KALSHI, "standard", ProbabilityCurveFeeRule("kalshi-v1", Decimal("0.07"))
+    )
+    engine.register(
+        Venue.POLYMARKET, "standard", ProbabilityCurveFeeRule("poly-v1", Decimal(0))
+    )
     return engine
 
 
@@ -132,7 +162,11 @@ async def configured_integrations() -> IntegrationConfigService:
         InMemorySecretStore(),
     )
     values = {
-        IntegrationProvider.ODDPOOL: ("https://oddpool.test", {}, {"api_token": "token"}),
+        IntegrationProvider.ODDPOOL: (
+            "https://oddpool.test",
+            {},
+            {"api_token": "token"},
+        ),
         IntegrationProvider.KALSHI: (
             "https://kalshi.test",
             {"key_id": "key"},
@@ -164,7 +198,9 @@ async def configured_integrations() -> IntegrationConfigService:
 
 
 @pytest.mark.asyncio
-async def test_live_cycle_executes_reviewed_profitable_pair_once_per_book_sequence() -> None:
+async def test_live_cycle_executes_reviewed_profitable_pair_once_per_book_sequence() -> (
+    None
+):
     integrations = await configured_integrations()
     pairs = ExecutablePairService(InMemoryExecutablePairRepository())
     pair = await pairs.create(
@@ -203,6 +239,7 @@ async def test_live_cycle_executes_reviewed_profitable_pair_once_per_book_sequen
         Venue.POLYMARKET: FakeTradingPort(Venue.POLYMARKET),
     }
     capital = CapitalLedger({})
+    supervisor = RecordingExecutionSupervisor()
     runtime = LiveRuntimeService(
         integrations=integrations,
         pairs=pairs,
@@ -216,6 +253,7 @@ async def test_live_cycle_executes_reviewed_profitable_pair_once_per_book_sequen
         trading_mode=TradingMode.LIMITED_AUTO,
         optimizer=QuoteOptimizer(fee_engine()),
         capital_ledger=capital,
+        execution_supervisor=supervisor,
     )
 
     first = await runtime.run_once(NOW)
@@ -246,10 +284,16 @@ async def test_live_cycle_executes_reviewed_profitable_pair_once_per_book_sequen
     assert len(capital.consumed_pairs) == 1
     assert capital.reservations == {}
     assert status.executions_started == 1
+    assert supervisor.bound_ports is ports
+    assert supervisor.evidence is not None
+    assert supervisor.evidence.estimated_fees[0] > 0
+    assert supervisor.maximum_unhedged_loss == risk.current.maximum_unhedged_loss
 
 
 @pytest.mark.asyncio
-async def test_live_cycle_releases_reservation_when_order_outcome_stays_unknown() -> None:
+async def test_live_cycle_releases_reservation_when_order_outcome_stays_unknown() -> (
+    None
+):
     integrations = await configured_integrations()
     pairs = ExecutablePairService(InMemoryExecutablePairRepository())
     pair = await pairs.create(

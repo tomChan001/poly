@@ -50,6 +50,7 @@ class ExecutionEvidence:
     polymarket_limit_price: Decimal
     conservative_roi: Decimal
     minimum_roi: Decimal
+    estimated_fees: tuple[Decimal, Decimal] = (Decimal(0), Decimal(0))
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -75,7 +76,9 @@ class ExecutionAuthorizationService:
         correlation_id: str | None = None,
     ) -> ExecutionAuthorization:
         if mapping_status is not MappingStatus.EXACT:
-            raise AuthorizationRejected("execution authorization requires an EXACT mapping")
+            raise AuthorizationRejected(
+                "execution authorization requires an EXACT mapping"
+            )
         if evidence.conservative_roi < evidence.minimum_roi:
             raise AuthorizationRejected("conservative ROI is below the policy minimum")
 
@@ -157,6 +160,7 @@ class ExecutionRecord:
     correlation_id: str
     state: ExecutionState
     requested_quantity: Decimal
+    evidence: ExecutionEvidence | None = None
     legs: dict[Venue, OrderSubmissionResult] = field(default_factory=dict)
     matched_quantity: Decimal = Decimal(0)
     unhedged_quantity: Decimal = Decimal(0)
@@ -174,6 +178,23 @@ class ExecutionStore(Protocol):
     async def list(self) -> list[ExecutionRecord]: ...
 
     async def get(self, correlation_id: str) -> ExecutionRecord: ...
+
+
+class ExecutionSupervisorPort(Protocol):
+    def bind_emergency_ports(
+        self,
+        ports: Mapping[Venue, ExecutionTradingPort],
+    ) -> None: ...
+
+    async def finalize(
+        self,
+        record: ExecutionRecord,
+        evidence: ExecutionEvidence | None = None,
+        *,
+        mode: TradingMode,
+        now: datetime,
+        maximum_unhedged_loss: Decimal = Decimal(0),
+    ) -> object | None: ...
 
 
 class InMemoryExecutionStore:
@@ -197,12 +218,16 @@ class ControlledExecutionService:
         system_control: SystemControl,
         trading_mode: TradingMode,
         store: ExecutionStore | None = None,
+        supervisor: ExecutionSupervisorPort | None = None,
+        maximum_unhedged_loss: Decimal = Decimal(0),
     ) -> None:
         self._ports = ports
         self._system_control = system_control
         self._trading_mode = trading_mode
         self._authorizations = ExecutionAuthorizationService()
         self._store = store
+        self._supervisor = supervisor
+        self._maximum_unhedged_loss = maximum_unhedged_loss
 
     async def execute(
         self,
@@ -221,6 +246,7 @@ class ControlledExecutionService:
             correlation_id=authorization.correlation_id,
             state=ExecutionState.PRECHECKED,
             requested_quantity=current_evidence.quantity,
+            evidence=current_evidence,
         )
         record.transition(ExecutionState.SUBMITTED, now)
         if self._store is not None:
@@ -233,7 +259,7 @@ class ControlledExecutionService:
             *(self._submit_or_recover(request) for request in requests.values()),
         )
         record.legs = dict(zip(requests, results, strict=True))
-        await self._finalize(record, now)
+        await self._finalize(record, now, current_evidence)
         return record
 
     async def recover_submitted(
@@ -254,10 +280,15 @@ class ControlledExecutionService:
                 if result is None
                 else replace(result, client_order_id=client_order_id)
             )
-        await self._finalize(record, now)
+        await self._finalize(record, now, record.evidence)
         return record
 
-    async def _finalize(self, record: ExecutionRecord, now: datetime) -> None:
+    async def _finalize(
+        self,
+        record: ExecutionRecord,
+        now: datetime,
+        evidence: ExecutionEvidence | None = None,
+    ) -> None:
         quantities = [record.legs[venue].filled_quantity for venue in Venue]
         record.matched_quantity = min(quantities)
         record.unhedged_quantity = max(quantities) - record.matched_quantity
@@ -266,17 +297,32 @@ class ControlledExecutionService:
             record.transition(ExecutionState.PAIRED, now)
         elif record.unhedged_quantity > 0:
             record.transition(ExecutionState.PARTIALLY_HEDGED, now)
-            await self._system_control.disable_opening_async(
-                "partially hedged execution"
-            )
+            if self._supervisor is None:
+                await self._system_control.disable_opening_async(
+                    "partially hedged execution"
+                )
         else:
             record.transition(ExecutionState.EXCEPTION, now)
-        if any(leg.status is OrderStatus.UNKNOWN for leg in record.legs.values()):
+        if any(
+            leg.status is OrderStatus.UNKNOWN for leg in record.legs.values()
+        ) and not (
+            self._supervisor is not None
+            and record.state
+            in {ExecutionState.PARTIALLY_HEDGED, ExecutionState.EXCEPTION}
+        ):
             await self._system_control.disable_opening_async(
                 "execution outcome unresolved"
             )
         if self._store is not None:
             await self._store.save(record)
+        if self._supervisor is not None:
+            await self._supervisor.finalize(
+                record,
+                evidence,
+                mode=self._trading_mode,
+                now=now,
+                maximum_unhedged_loss=self._maximum_unhedged_loss,
+            )
 
     def _requests(
         self,
@@ -316,6 +362,8 @@ class ControlledExecutionService:
             except Exception:  # noqa: BLE001 - unavailable reconciliation remains UNKNOWN
                 recovered = None
             if recovered is None:
-                return OrderSubmissionResult(request.client_order_id, OrderStatus.UNKNOWN, ())
+                return OrderSubmissionResult(
+                    request.client_order_id, OrderStatus.UNKNOWN, ()
+                )
             result = recovered
         return replace(result, client_order_id=request.client_order_id)
