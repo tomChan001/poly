@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -22,6 +22,15 @@ class OpportunityRecord:
     worst_case_settlement_at: datetime
     book_age_ms: int
     rejection_reasons: tuple[str, ...]
+    rule_versions: tuple[str, str] = field(default_factory=lambda: ("unavailable", "unavailable"))
+    book_sequences: tuple[str, str] = field(
+        default_factory=lambda: ("unavailable", "unavailable")
+    )
+    balance_versions: tuple[str, str] = field(
+        default_factory=lambda: ("unavailable", "unavailable")
+    )
+    risk_policy_version: str = "unavailable"
+    fee_status: str = "unknown"
 
     @classmethod
     def example(
@@ -70,4 +79,3 @@ class InMemoryOpportunityStore:
 
     def get(self, identifier: str) -> OpportunityRecord:
         return self._records[identifier]
-

@@ -33,13 +33,16 @@ async def test_opportunities_are_sorted_by_roi_and_explain_rejections() -> None:
     body = response.json()
     assert [item["id"] for item in body] == ["high", "low", "rejected"]
     assert body[-1]["rejection_reasons"] == ["STALE_BOOK"]
+    assert body[-1]["rule_versions"] == ["unavailable", "unavailable"]
+    assert body[-1]["fee_status"] == "unknown"
 
 
 @pytest.mark.asyncio
-async def test_business_api_fails_closed_without_oidc_verifier() -> None:
+async def test_business_api_denies_remote_access() -> None:
     transport = httpx.ASGITransport(app=create_app(ApplicationContainer()))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/api/opportunities")
 
-    assert response.status_code == 503
+    assert response.status_code == 403
+    assert response.json()["detail"] == "local access only"

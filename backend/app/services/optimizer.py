@@ -19,6 +19,11 @@ class QuotePolicy:
     quantity_step: Decimal
     explicit_cost: Decimal
     risk_buffer: Decimal
+    kalshi_balance: Decimal
+    polymarket_balance: Decimal
+    per_trade_limit: Decimal
+    per_event_limit: Decimal
+    portfolio_limit: Decimal
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,21 +127,67 @@ class QuoteOptimizer:
             maximum_depth,
             policy.quantity_step,
         )
-        eligible: list[ExecutableQuote] = []
-        for quantity in candidates:
-            quote = self._quote_for_quantity(
-                quantity,
+        try:
+            feasible_quantity = self._largest_quantity_within_hard_limits(
+                maximum_depth,
                 kalshi_category,
                 polymarket_category,
                 kalshi_asks,
                 polymarket_asks,
                 policy,
             )
+        except KeyError as exc:
+            if "FEE_UNKNOWN" in str(exc):
+                return OptimizationResult(None, ("FEE_UNKNOWN",))
+            raise
+        if feasible_quantity > 0:
+            candidates = [quantity for quantity in candidates if quantity <= feasible_quantity]
+            quantity = policy.quantity_step
+            while quantity <= feasible_quantity:
+                candidates.append(quantity)
+                quantity += policy.quantity_step
+            candidates = sorted(set(candidates))
+        else:
+            candidates = [policy.quantity_step]
+        eligible: list[ExecutableQuote] = []
+        rejection_reasons: list[str] = []
+        for quantity in candidates:
+            try:
+                quote = self._quote_for_quantity(
+                    quantity,
+                    kalshi_category,
+                    polymarket_category,
+                    kalshi_asks,
+                    polymarket_asks,
+                    policy,
+                )
+            except KeyError as exc:
+                if "FEE_UNKNOWN" in str(exc):
+                    return OptimizationResult(None, ("FEE_UNKNOWN",))
+                raise
+
+            if quote.kalshi_cost + quote.kalshi_fee > policy.kalshi_balance:
+                _append_reason(rejection_reasons, "KALSHI_BALANCE_INSUFFICIENT")
+                continue
+            if quote.polymarket_cost + quote.polymarket_fee > policy.polymarket_balance:
+                _append_reason(rejection_reasons, "POLYMARKET_BALANCE_INSUFFICIENT")
+                continue
+            if quote.deployed_capital > policy.per_trade_limit:
+                _append_reason(rejection_reasons, "PER_TRADE_LIMIT")
+                continue
+            if quote.deployed_capital > policy.per_event_limit:
+                _append_reason(rejection_reasons, "EVENT_LIMIT")
+                continue
+            if quote.deployed_capital > policy.portfolio_limit:
+                _append_reason(rejection_reasons, "PORTFOLIO_LIMIT")
+                continue
             if quote.conservative_roi >= policy.minimum_roi:
                 eligible.append(quote)
+                continue
+            _append_reason(rejection_reasons, "ROI_BELOW_THRESHOLD")
 
         if not eligible:
-            return OptimizationResult(None, ("ROI_BELOW_THRESHOLD",))
+            return OptimizationResult(None, tuple(rejection_reasons or ["ROI_BELOW_THRESHOLD"]))
         best = max(eligible, key=lambda quote: (quote.profit_floor, quote.conservative_roi))
         return OptimizationResult(best, ())
 
@@ -192,3 +243,44 @@ class QuoteOptimizer:
             explicit_cost=policy.explicit_cost,
             risk_buffer=policy.risk_buffer,
         )
+
+    def _largest_quantity_within_hard_limits(
+        self,
+        maximum: Decimal,
+        kalshi_category: str,
+        polymarket_category: str,
+        kalshi_asks: list[BookLevel],
+        polymarket_asks: list[BookLevel],
+        policy: QuotePolicy,
+    ) -> Decimal:
+        low = 0
+        high = int(maximum / policy.quantity_step)
+        while low < high:
+            midpoint = (low + high + 1) // 2
+            quantity = policy.quantity_step * midpoint
+            quote = self._quote_for_quantity(
+                quantity,
+                kalshi_category,
+                polymarket_category,
+                kalshi_asks,
+                polymarket_asks,
+                policy,
+            )
+            within_limits = (
+                quote.kalshi_cost + quote.kalshi_fee <= policy.kalshi_balance
+                and quote.polymarket_cost + quote.polymarket_fee
+                <= policy.polymarket_balance
+                and quote.deployed_capital <= policy.per_trade_limit
+                and quote.deployed_capital <= policy.per_event_limit
+                and quote.deployed_capital <= policy.portfolio_limit
+            )
+            if within_limits:
+                low = midpoint
+            else:
+                high = midpoint - 1
+        return policy.quantity_step * low
+
+
+def _append_reason(reasons: list[str], code: str) -> None:
+    if code not in reasons:
+        reasons.append(code)

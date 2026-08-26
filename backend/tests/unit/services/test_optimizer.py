@@ -58,6 +58,11 @@ def test_optimizer_rejects_non_exact_mapping() -> None:
         quantity_step=Decimal(1),
         explicit_cost=Decimal(0),
         risk_buffer=Decimal(0),
+        kalshi_balance=Decimal(100),
+        polymarket_balance=Decimal(100),
+        per_trade_limit=Decimal(100),
+        per_event_limit=Decimal(100),
+        portfolio_limit=Decimal(100),
     )
 
     result = optimizer.optimize(
@@ -71,3 +76,91 @@ def test_optimizer_rejects_non_exact_mapping() -> None:
 
     assert result.best_quote is None
     assert result.rejection_reasons == ("MAPPING_NOT_EXACT",)
+
+
+def test_optimizer_rejects_quantity_whose_swept_cost_exceeds_one_venue_balance() -> None:
+    optimizer = QuoteOptimizer(fee_engine())
+    policy = QuotePolicy(
+        minimum_roi=Decimal("0.01"),
+        maximum_quantity=Decimal(10),
+        quantity_step=Decimal(1),
+        explicit_cost=Decimal(0),
+        risk_buffer=Decimal(0),
+        kalshi_balance=Decimal(5),
+        polymarket_balance=Decimal(100),
+        per_trade_limit=Decimal(100),
+        per_event_limit=Decimal(100),
+        portfolio_limit=Decimal(100),
+    )
+
+    result = optimizer.optimize(
+        mapping_status=MappingStatus.EXACT,
+        kalshi_category="standard",
+        polymarket_category="standard",
+        kalshi_asks=[
+            BookLevel(Decimal("0.40"), Decimal(5)),
+            BookLevel(Decimal("0.82"), Decimal(5)),
+        ],
+        polymarket_asks=[BookLevel(Decimal("0.10"), Decimal(10))],
+        policy=policy,
+    )
+
+    assert result.best_quote is not None
+    assert result.best_quote.quantity < Decimal(10)
+    assert result.best_quote.kalshi_cost + result.best_quote.kalshi_fee <= Decimal(5)
+
+
+def test_unknown_fee_category_fails_closed() -> None:
+    optimizer = QuoteOptimizer(fee_engine())
+    policy = QuotePolicy(
+        minimum_roi=Decimal("0.01"),
+        maximum_quantity=Decimal(10),
+        quantity_step=Decimal(1),
+        explicit_cost=Decimal(0),
+        risk_buffer=Decimal(0),
+        kalshi_balance=Decimal(100),
+        polymarket_balance=Decimal(100),
+        per_trade_limit=Decimal(100),
+        per_event_limit=Decimal(100),
+        portfolio_limit=Decimal(100),
+    )
+
+    result = optimizer.optimize(
+        mapping_status=MappingStatus.EXACT,
+        kalshi_category="missing",
+        polymarket_category="standard",
+        kalshi_asks=[BookLevel(Decimal("0.40"), Decimal(10))],
+        polymarket_asks=[BookLevel(Decimal("0.10"), Decimal(10))],
+        policy=policy,
+    )
+
+    assert result.best_quote is None
+    assert result.rejection_reasons == ("FEE_UNKNOWN",)
+
+
+def test_optimizer_reports_the_venue_whose_balance_is_insufficient() -> None:
+    optimizer = QuoteOptimizer(fee_engine())
+    policy = QuotePolicy(
+        minimum_roi=Decimal("0.01"),
+        maximum_quantity=Decimal(10),
+        quantity_step=Decimal(1),
+        explicit_cost=Decimal(0),
+        risk_buffer=Decimal(0),
+        kalshi_balance=Decimal("0.10"),
+        polymarket_balance=Decimal(100),
+        per_trade_limit=Decimal(100),
+        per_event_limit=Decimal(100),
+        portfolio_limit=Decimal(100),
+    )
+
+    result = optimizer.optimize(
+        mapping_status=MappingStatus.EXACT,
+        kalshi_category="standard",
+        polymarket_category="standard",
+        kalshi_asks=[BookLevel(Decimal("0.40"), Decimal(10))],
+        polymarket_asks=[BookLevel(Decimal("0.10"), Decimal(10))],
+        policy=policy,
+    )
+
+    assert result.best_quote is None
+    assert result.rejection_reasons == ("KALSHI_BALANCE_INSUFFICIENT",)

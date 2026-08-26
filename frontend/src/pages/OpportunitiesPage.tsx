@@ -13,6 +13,24 @@ interface OpportunitiesPageProps {
 
 const money = (value: string) => `$${Number(value).toFixed(2)}`
 const percent = (value: string) => `${(Number(value) * 100).toFixed(2)}%`
+const rejectionLabels: Record<string, string> = {
+  FEE_UNKNOWN: '手续费规则未知',
+  BELOW_MINIMUM_QUANTITY: '可执行数量低于市场最小值',
+  BOOK_FRESHNESS_EVIDENCE_MISSING: '缺少盘口新鲜度证据',
+  BOOK_SEQUENCE_UNSAFE: '盘口序列不连续',
+  EVENT_LIMIT: '事件资金上限已触发',
+  INSUFFICIENT_DEPTH: '盘口深度不足',
+  KALSHI_BALANCE_INSUFFICIENT: 'Kalshi 可用资金不足',
+  MAPPING_NOT_EXACT: '市场映射未通过精确审核',
+  POLYMARKET_BALANCE_INSUFFICIENT: 'Polymarket 可用资金不足',
+  PORTFOLIO_LIMIT: '组合资金上限已触发',
+  PER_TRADE_LIMIT: '单笔资金上限已触发',
+  ROI_BELOW_THRESHOLD: '保守收益率低于门槛',
+  SETTLEMENT_TOO_LATE: '最晚结算时间超出限制',
+  STALE_BOOK: '盘口已过期',
+}
+
+const rejectionLabel = (reason: string) => rejectionLabels[reason] ?? reason
 
 
 export function OpportunitiesPage({ opportunities, activeCount, loading }: OpportunitiesPageProps) {
@@ -142,13 +160,15 @@ export function OpportunitiesPage({ opportunities, activeCount, loading }: Oppor
             <div><dt>Kalshi VWAP</dt><dd>{money(selected.kalshi_vwap)}</dd></div>
             <div><dt>Polymarket VWAP</dt><dd>{money(selected.polymarket_vwap)}</dd></div>
             <div><dt>费用</dt><dd>{money(selected.total_fees)}</dd></div>
+            <div><dt>费用状态</dt><dd>{selected.fee_status === 'unknown' || selected.rejection_reasons.includes('FEE_UNKNOWN') ? '未知（禁止执行）' : '已计算'}</dd></div>
+            <div><dt>行情年龄</dt><dd>{selected.book_age_ms} ms</dd></div>
             <div><dt>保守 ROI</dt><dd className="positive">{percent(selected.conservative_roi)}</dd></div>
           </dl>
           <div className="drawer-section">
             <h3>拒绝原因</h3>
             {selected.rejection_reasons.length === 0
               ? <p className="positive">全部硬风控已通过</p>
-              : selected.rejection_reasons.map((reason) => <p key={reason} className="rejection-line">{reason}</p>)}
+              : selected.rejection_reasons.map((reason) => <p key={reason} className="rejection-line">{rejectionLabel(reason)}</p>)}
           </div>
           <div className="drawer-section">
             <h3>结算窗口</h3>
@@ -159,4 +179,3 @@ export function OpportunitiesPage({ opportunities, activeCount, loading }: Oppor
     </div>
   )
 }
-

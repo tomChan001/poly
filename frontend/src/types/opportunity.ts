@@ -16,5 +16,9 @@ export interface Opportunity {
   worst_case_settlement_at: string
   book_age_ms: number
   rejection_reasons: string[]
+  rule_versions?: [string, string]
+  book_sequences?: [string, string]
+  balance_versions?: [string, string]
+  risk_policy_version?: string
+  fee_status?: 'calculated' | 'unknown'
 }
-

@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, expect, test, vi } from 'vitest'
 
 import App from './App'
+import { OpportunitiesPage } from './pages/OpportunitiesPage'
 
 afterEach(() => {
   cleanup()
@@ -256,6 +257,29 @@ test('renders the operational opportunity table', async () => {
   fireEvent.click(screen.getByRole('button', { name: '运行' }))
   expect(await screen.findByText('PAIRED')).toBeInTheDocument()
   expect(screen.queryByRole('button', { name: /批准|下单/ })).not.toBeInTheDocument()
+})
+
+test('explains structured opportunity rejection evidence in Chinese', () => {
+  const rejected = {
+    ...opportunities[0],
+    id: 'rejected-1',
+    book_age_ms: 2501,
+    rejection_reasons: ['STALE_BOOK', 'FEE_UNKNOWN'],
+  }
+
+  render(
+    <OpportunitiesPage
+      opportunities={[rejected]}
+      activeCount={0}
+      loading={false}
+    />,
+  )
+  fireEvent.click(screen.getByText('Example market'))
+
+  expect(screen.getByText('盘口已过期')).toBeInTheDocument()
+  expect(screen.getByText('手续费规则未知')).toBeInTheDocument()
+  expect(screen.getByText('未知（禁止执行）')).toBeInTheDocument()
+  expect(screen.getAllByText('2501 ms')).toHaveLength(2)
 })
 
 test('groups execution history by Beijing calendar day', async () => {

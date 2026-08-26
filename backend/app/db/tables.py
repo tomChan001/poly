@@ -142,6 +142,7 @@ class CapitalReservation(IdTimestampMixin, Base):
 
     execution_id: Mapped[UUID | None] = mapped_column(ForeignKey("execution.id"))
     correlation_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_id: Mapped[str | None] = mapped_column(String(255))
     venue: Mapped[str] = mapped_column(String(32), nullable=False)
     principal: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
     fee_buffer: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
@@ -218,4 +219,3 @@ class SystemControl(Base):
     changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     changed_by: Mapped[str] = mapped_column(String(255), nullable=False)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
-
