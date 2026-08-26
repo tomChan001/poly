@@ -17,23 +17,27 @@ from backend.app.core.config import TradingMode, settings
 from backend.app.services.automation_gate import AutomationStage
 
 
-def _apply_startup_gate(
+async def _apply_startup_gate(
     container: ApplicationContainer,
     trading_mode: TradingMode,
 ) -> None:
     """Fail closed before any runtime cycle can reach order authorization."""
     if trading_mode is not TradingMode.LIMITED_AUTO:
-        container.system_control.disable_opening("startup gate: deployment is not limited_auto")
+        await container.system_control.disable_opening_async(
+            "startup gate: deployment is not limited_auto"
+        )
         return
     evidence = container.automation_evidence
     if evidence is None:
-        container.system_control.disable_opening(
+        await container.system_control.disable_opening_async(
             "startup gate: automation evidence is missing"
         )
         return
     policy = container.risk_policies.current
     if policy is None:
-        container.system_control.disable_opening("startup gate: risk policy is missing")
+        await container.system_control.disable_opening_async(
+            "startup gate: risk policy is missing"
+        )
         return
     within_canary_caps = (
         policy.per_trade_limit <= 10
@@ -43,7 +47,7 @@ def _apply_startup_gate(
     stage = AutomationStage.CANARY_AUTO if within_canary_caps else AutomationStage.LIMITED_AUTO
     decision = container.automation_gate.evaluate(stage, evidence)
     if not decision.allowed:
-        container.system_control.disable_opening(
+        await container.system_control.disable_opening_async(
             "startup gate: " + "; ".join(decision.reasons)
         )
 
@@ -99,7 +103,8 @@ def create_app(
     async def lifespan(_application: FastAPI):
         runtime_task: asyncio.Task[None] | None = None
         if owns_container and application_container.live_runtime is not None:
-            _apply_startup_gate(application_container, settings.trading_mode)
+            await application_container.system_control.load_async()
+            await _apply_startup_gate(application_container, settings.trading_mode)
             runtime_task = asyncio.create_task(
                 _live_runtime_loop(
                     application_container,

@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -70,6 +71,8 @@ class ExecutionAuthorizationService:
         mapping_status: MappingStatus,
         evidence: ExecutionEvidence,
         now: datetime,
+        *,
+        correlation_id: str | None = None,
     ) -> ExecutionAuthorization:
         if mapping_status is not MappingStatus.EXACT:
             raise AuthorizationRejected("execution authorization requires an EXACT mapping")
@@ -78,7 +81,7 @@ class ExecutionAuthorizationService:
 
         return ExecutionAuthorization(
             id=str(uuid4()),
-            correlation_id=str(uuid4()),
+            correlation_id=correlation_id or str(uuid4()),
             evidence=evidence,
             issued_at=now,
             expires_at=now + timedelta(seconds=2),
@@ -165,27 +168,35 @@ class ExecutionRecord:
         self.state = target
 
 
+class ExecutionStore(Protocol):
+    async def save(self, record: ExecutionRecord) -> None: ...
+
+    async def list(self) -> list[ExecutionRecord]: ...
+
+    async def get(self, correlation_id: str) -> ExecutionRecord: ...
+
+
 class InMemoryExecutionStore:
     def __init__(self) -> None:
         self._records: dict[str, ExecutionRecord] = {}
 
-    def save(self, record: ExecutionRecord) -> None:
+    async def save(self, record: ExecutionRecord) -> None:
         self._records[record.correlation_id] = record
 
-    def list(self) -> list[ExecutionRecord]:
+    async def list(self) -> list[ExecutionRecord]:
         return list(self._records.values())
 
-    def get(self, correlation_id: str) -> ExecutionRecord:
+    async def get(self, correlation_id: str) -> ExecutionRecord:
         return self._records[correlation_id]
 
 
 class ControlledExecutionService:
     def __init__(
         self,
-        ports: dict[Venue, ExecutionTradingPort],
+        ports: Mapping[Venue, ExecutionTradingPort],
         system_control: SystemControl,
         trading_mode: TradingMode,
-        store: InMemoryExecutionStore | None = None,
+        store: ExecutionStore | None = None,
     ) -> None:
         self._ports = ports
         self._system_control = system_control
@@ -212,12 +223,17 @@ class ControlledExecutionService:
             requested_quantity=current_evidence.quantity,
         )
         record.transition(ExecutionState.SUBMITTED, now)
+        if self._store is not None:
+            # Persist the recovery identity before either venue request. If the
+            # process exits after an exchange accepts an order, restart logic
+            # can reconcile this record without opening the same pair again.
+            await self._store.save(record)
 
         results = await asyncio.gather(
             *(self._submit_or_recover(request) for request in requests.values()),
         )
         record.legs = dict(zip(requests, results, strict=True))
-        self._finalize(record, now)
+        await self._finalize(record, now)
         return record
 
     async def recover_submitted(
@@ -238,10 +254,10 @@ class ControlledExecutionService:
                 if result is None
                 else replace(result, client_order_id=client_order_id)
             )
-        self._finalize(record, now)
+        await self._finalize(record, now)
         return record
 
-    def _finalize(self, record: ExecutionRecord, now: datetime) -> None:
+    async def _finalize(self, record: ExecutionRecord, now: datetime) -> None:
         quantities = [record.legs[venue].filled_quantity for venue in Venue]
         record.matched_quantity = min(quantities)
         record.unhedged_quantity = max(quantities) - record.matched_quantity
@@ -250,13 +266,17 @@ class ControlledExecutionService:
             record.transition(ExecutionState.PAIRED, now)
         elif record.unhedged_quantity > 0:
             record.transition(ExecutionState.PARTIALLY_HEDGED, now)
-            self._system_control.disable_opening("partially hedged execution")
+            await self._system_control.disable_opening_async(
+                "partially hedged execution"
+            )
         else:
             record.transition(ExecutionState.EXCEPTION, now)
         if any(leg.status is OrderStatus.UNKNOWN for leg in record.legs.values()):
-            self._system_control.disable_opening("execution outcome unresolved")
+            await self._system_control.disable_opening_async(
+                "execution outcome unresolved"
+            )
         if self._store is not None:
-            self._store.save(record)
+            await self._store.save(record)
 
     def _requests(
         self,

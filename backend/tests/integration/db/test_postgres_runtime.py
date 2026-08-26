@@ -9,7 +9,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
-import asyncpg
+import asyncpg  # type: ignore[import-untyped]
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 

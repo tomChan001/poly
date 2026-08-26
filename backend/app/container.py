@@ -13,6 +13,7 @@ from backend.app.db.capital import PostgresCapitalLedger
 from backend.app.db.executable_pairs import PostgresExecutablePairRepository
 from backend.app.db.executions import PostgresExecutionStore
 from backend.app.db.integration_config import PostgresIntegrationConfigRepository
+from backend.app.db.operational_control import PostgresOperationalControlStore
 from backend.app.domain.enums import Venue
 from backend.app.services.automation_gate import AutomationEvidence, AutomationGate
 from backend.app.services.capital import CapitalLedger
@@ -97,6 +98,11 @@ class ApplicationContainer:
             )
         )
         container.capital_ledger = PostgresCapitalLedger(sessions)
+        container.system_control = SystemControl(
+            opening_enabled=settings.opening_enabled,
+            reason="configured default",
+            store=PostgresOperationalControlStore(sessions),
+        )
         container.runtime_status = RuntimeStatusService(
             container.integration_configs,
             container.system_control,

@@ -47,12 +47,13 @@ async def test_live_runtime_loop_records_cycle_errors_and_cancels_cleanly() -> N
     assert container.runtime_status.running is False
 
 
-def test_runtime_startup_closes_opening_when_evidence_is_missing() -> None:
+@pytest.mark.asyncio
+async def test_runtime_startup_closes_opening_when_evidence_is_missing() -> None:
     container = ApplicationContainer()
     container.system_control.set_opening(True, "configured open")
     container.automation_evidence = None
 
-    _apply_startup_gate(container, TradingMode.LIMITED_AUTO)
+    await _apply_startup_gate(container, TradingMode.LIMITED_AUTO)
 
     assert container.system_control.opening_enabled is False
     assert container.system_control.reason == "startup gate: automation evidence is missing"

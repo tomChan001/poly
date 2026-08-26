@@ -66,9 +66,15 @@ class FeeReconciliationService:
         self._system_control = system_control
         self._tolerance = tolerance
 
-    def compare(self, estimated: Decimal, actual: Decimal) -> FeeReconciliationResult:
+    async def compare(
+        self,
+        estimated: Decimal,
+        actual: Decimal,
+    ) -> FeeReconciliationResult:
         difference = abs(actual - estimated)
         matches = difference <= self._tolerance
         if not matches:
-            self._system_control.disable_opening("actual fee differs from estimate")
+            await self._system_control.disable_opening_async(
+                "actual fee differs from estimate"
+            )
         return FeeReconciliationResult(matches, difference)

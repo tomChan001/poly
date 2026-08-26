@@ -36,10 +36,10 @@ class OpeningControlRequest(BaseModel):
 
 
 @router.put("/opening")
-def set_opening_control(
+async def set_opening_control(
     request: OpeningControlRequest,
     container: Annotated[ApplicationContainer, Depends(get_container)],
-    _principal: Annotated[Principal, Depends(require_role(Role.OPERATOR))],
+    principal: Annotated[Principal, Depends(require_role(Role.OPERATOR))],
 ) -> dict[str, object]:
     # This database switch never cancels or closes existing positions. Those
     # actions require the evidence-driven partially-hedged runbook.
@@ -75,9 +75,13 @@ def set_opening_control(
                     "reasons": decision.reasons,
                 },
             )
-
-    container.system_control.set_opening(request.enabled, request.reason)
+    state = await container.system_control.set_opening_async(
+        request.enabled,
+        request.reason,
+        changed_by=principal.subject,
+    )
     return {
-        "opening_enabled": container.system_control.opening_enabled,
-        "reason": container.system_control.reason,
+        "opening_enabled": state.opening_enabled,
+        "reason": state.reason,
+        "version": state.version,
     }

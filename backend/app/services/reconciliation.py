@@ -22,7 +22,7 @@ class ReconciliationService:
     def __init__(self, system_control: SystemControl) -> None:
         self._control = system_control
 
-    def compare(
+    async def compare(
         self,
         local: AccountSnapshot,
         platform: AccountSnapshot,
@@ -36,8 +36,7 @@ class ReconciliationService:
         if local.open_order_ids != platform.open_order_ids:
             differences.append("open_orders")
         if differences:
-            self._control.disable_opening(
+            await self._control.disable_opening_async(
                 f"reconciliation mismatch on {local.venue}: {', '.join(differences)}"
             )
         return ReconciliationResult(not differences, tuple(differences))
-
