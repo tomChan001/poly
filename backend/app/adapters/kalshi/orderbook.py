@@ -12,7 +12,7 @@ def parse_kalshi_book(
     market_id: str,
     outcome: str,
     payload: dict[str, Any],
-    captured_at: datetime,
+    captured_at: datetime | None,
     received_at: datetime | None = None,
 ) -> NormalizedBook:
     normalized_outcome = outcome.lower()
@@ -32,4 +32,3 @@ def parse_kalshi_book(
         received_at=received_at or datetime.now(UTC),
         asks=tuple(asks),
     )
-

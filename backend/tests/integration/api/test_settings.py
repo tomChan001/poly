@@ -36,6 +36,7 @@ async def test_settings_update_creates_new_version() -> None:
 
     assert response.status_code == 200
     assert response.json()["minimum_roi"] == "0.05"
+    assert response.json()["maximum_arrival_gap_seconds"] == "0.5"
     assert response.json()["version"] != original_version
 
 

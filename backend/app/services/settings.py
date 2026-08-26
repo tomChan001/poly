@@ -15,6 +15,7 @@ class RiskPolicyInput:
     risk_buffer: Decimal
     maximum_unhedged_seconds: Decimal
     maximum_unhedged_loss: Decimal
+    maximum_arrival_gap_seconds: Decimal = Decimal("0.5")
 
     @classmethod
     def defaults(cls) -> "RiskPolicyInput":
@@ -29,6 +30,7 @@ class RiskPolicyInput:
             risk_buffer=Decimal("0.25"),
             maximum_unhedged_seconds=Decimal(2),
             maximum_unhedged_loss=Decimal(2),
+            maximum_arrival_gap_seconds=Decimal("0.5"),
         )
 
 
@@ -45,6 +47,7 @@ class RiskPolicy:
     risk_buffer: Decimal
     maximum_unhedged_seconds: Decimal
     maximum_unhedged_loss: Decimal
+    maximum_arrival_gap_seconds: Decimal = Decimal("0.5")
 
 
 class InMemoryRiskPolicyStore:

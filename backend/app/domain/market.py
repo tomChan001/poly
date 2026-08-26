@@ -17,7 +17,7 @@ class NormalizedBook:
     market_id: str
     outcome: str
     sequence: str
-    captured_at: datetime
+    captured_at: datetime | None
     received_at: datetime
     asks: tuple[BookLevel, ...]
 
@@ -44,4 +44,3 @@ def kalshi_asks_from_opposite_bids(bids: Iterable[BookLevel]) -> list[BookLevel]
     """
     asks = [BookLevel(Decimal(1) - bid.price, bid.quantity) for bid in bids]
     return sorted(asks, key=lambda level: level.price)
-

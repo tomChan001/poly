@@ -36,6 +36,7 @@ class RiskPolicyRequest(BaseModel):
     risk_buffer: NonNegativeDecimal
     maximum_unhedged_seconds: PositiveDecimal
     maximum_unhedged_loss: NonNegativeDecimal
+    maximum_arrival_gap_seconds: PositiveDecimal = Decimal("0.5")
 
 
 @router.get("/risk")

@@ -6,7 +6,9 @@ from backend.app.domain.market import NormalizedBook
 
 
 class BookSynchronizationError(ValueError):
-    pass
+    def __init__(self, message: str, *, code: str = "STALE_BOOK") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,10 +25,10 @@ class BookState:
         self.numeric_sequence: int | None = None
         self.safety = BookSafety.UNSAFE
 
-    def replace(self, book: NormalizedBook, *, numeric_sequence: int) -> None:
+    def replace(self, book: NormalizedBook, *, numeric_sequence: int | None) -> None:
         self.book = book
         self.numeric_sequence = numeric_sequence
-        self.safety = BookSafety.SAFE
+        self.safety = BookSafety.SAFE if numeric_sequence is not None else BookSafety.UNSAFE
 
     def accept_sequence(self, numeric_sequence: int) -> None:
         if self.numeric_sequence is None or numeric_sequence != self.numeric_sequence + 1:
@@ -44,7 +46,21 @@ def synchronize_books(
     maximum_age: timedelta,
     maximum_arrival_gap: timedelta,
 ) -> SynchronizedBooks:
-    if now - kalshi.received_at > maximum_age or now - polymarket.received_at > maximum_age:
+    # `received_at` protects the local pipeline, while `captured_at` protects
+    # against a venue returning an old snapshot in a newly completed response.
+    timestamps = (
+        kalshi.captured_at,
+        kalshi.received_at,
+        polymarket.captured_at,
+        polymarket.received_at,
+    )
+    if any(timestamp is None for timestamp in timestamps):
+        raise BookSynchronizationError(
+            "missing venue freshness evidence",
+            code="BOOK_FRESHNESS_EVIDENCE_MISSING",
+        )
+    complete_timestamps = tuple(timestamp for timestamp in timestamps if timestamp is not None)
+    if any(now - timestamp > maximum_age for timestamp in complete_timestamps):
         raise BookSynchronizationError("stale order book")
 
     arrival_gap = abs(kalshi.received_at - polymarket.received_at)
