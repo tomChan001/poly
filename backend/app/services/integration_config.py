@@ -38,6 +38,7 @@ ALLOWED_CONFIGURATION_FIELDS: dict[IntegrationProvider, frozenset[str]] = {
         {
             "account_type",
             "owner_address",
+            "proxy_address",
             "wallet_address",
             "funder_address",
             "signature_type",
@@ -95,6 +96,7 @@ class IntegrationConfigView:
 class ConnectionTestResult:
     provider: IntegrationProvider
     ok: bool
+    code: str
     detail: str
     checked_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
@@ -134,7 +136,12 @@ class InMemoryConnectionProbe:
         record: IntegrationConfigRecord,
         secrets: dict[str, str],
     ) -> ConnectionTestResult:
-        return ConnectionTestResult(record.provider, True, "test connection succeeded")
+        return ConnectionTestResult(
+            record.provider,
+            True,
+            "TEST_CONNECTION_OK",
+            "test connection succeeded",
+        )
 
 
 class IntegrationConfigRepository(Protocol):
@@ -357,6 +364,7 @@ class IntegrationConfigService:
     ) -> dict[str, str | int | bool]:
         normalized = dict(configuration)
         normalized_owner = normalized.get("owner_address") or normalized.get("wallet_address")
+        normalized_proxy = normalized.get("proxy_address") or normalized.get("funder_address")
         private_key = credentials.get("private_key")
         account_type = normalized.get("account_type")
         chain_id = normalized.get("chain_id")
@@ -367,13 +375,14 @@ class IntegrationConfigService:
             account_type=str(account_type),
             private_key=private_key,
             owner_address=str(normalized_owner) if normalized_owner is not None else None,
-            funder_address=str(normalized["funder_address"]) if "funder_address" in normalized else None,
+            funder_address=str(normalized_proxy) if normalized_proxy is not None else None,
             signature_type=normalized.get("signature_type"),
             chain_id=chain_id,
         )
         normalized.pop("wallet_address", None)
         normalized["account_type"] = profile.account_type.value
         normalized["owner_address"] = profile.owner_address
+        normalized["proxy_address"] = profile.funder_address
         normalized["funder_address"] = profile.funder_address
         normalized["signature_type"] = profile.signature_type
         normalized["chain_id"] = profile.chain_id

@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import sys
@@ -14,6 +15,7 @@ from backend.app.adapters.integration_probe import HttpIntegrationConnectionProb
 from backend.app.adapters.kalshi.http_transport import KalshiHttpTransport
 from backend.app.adapters.polymarket.sdk_transport import PolymarketSdkTransport
 from backend.app.services.integration_config import (
+    ConnectionTestResult,
     IntegrationConfigRecord,
     IntegrationEnvironment,
     IntegrationProvider,
@@ -477,6 +479,10 @@ async def test_connection_probe_uses_authenticated_account_transports() -> None:
         async def get_available_balance(self) -> Decimal:
             return Decimal("25.50")
 
+    class ReadOnlyTransport:
+        async def probe_read_only(self) -> None:
+            return None
+
     async def kalshi_factory(
         record: IntegrationConfigRecord,
         secrets: dict[str, str],
@@ -487,9 +493,9 @@ async def test_connection_probe_uses_authenticated_account_transports() -> None:
     async def polymarket_factory(
         record: IntegrationConfigRecord,
         secrets: dict[str, str],
-    ) -> AccountTransport:
+    ) -> ReadOnlyTransport:
         observed.append((record.provider.value, secrets))
-        return AccountTransport()
+        return ReadOnlyTransport()
 
     async with httpx.AsyncClient() as client:
         probe = HttpIntegrationConnectionProbe(
@@ -524,7 +530,160 @@ async def test_connection_probe_uses_authenticated_account_transports() -> None:
         )
 
     assert kalshi.ok is True
+    assert kalshi.code == "KALSHI_BALANCE_ACCESS_OK"
     assert kalshi.detail == "authenticated Kalshi balance access succeeded"
     assert polymarket.ok is True
-    assert polymarket.detail == "authenticated Polymarket balance access succeeded"
+    assert polymarket.code == "POLYMARKET_READ_ONLY_OK"
+    assert polymarket.detail == "Polymarket read-only authentication succeeded"
     assert [provider for provider, _ in observed] == ["kalshi", "polymarket"]
+
+
+def test_connection_probe_uses_polymarket_read_only_sdk_calls_without_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeReadOnlyClient:
+        def __init__(self) -> None:
+            self.balance_allowance_calls = 0
+            self.open_orders_calls = 0
+            self.trades_calls = 0
+            self.create_order_calls = 0
+            self.post_order_calls = 0
+            self.cancel_calls = 0
+            self.update_allowance_calls = 0
+
+        def get_balance_allowance(self, params: object) -> dict[str, object]:
+            self.balance_allowance_calls += 1
+            assert params is not None
+            return {"balance": "123000000"}
+
+        def get_open_orders(self, only_first_page: bool = False) -> list[dict[str, object]]:
+            self.open_orders_calls += 1
+            assert only_first_page is True
+            return []
+
+        def get_order(self, order_id: str) -> dict[str, object]:
+            return {"id": order_id, "status": "ORDER_STATUS_MATCHED"}
+
+        def get_trades(
+            self,
+            params: object = None,
+            only_first_page: bool = False,
+        ) -> list[dict[str, object]]:
+            self.trades_calls += 1
+            assert params is None
+            assert only_first_page is True
+            return []
+
+        def create_order(self, order: object) -> object:
+            self.create_order_calls += 1
+            return order
+
+        def post_order(self, order: object, order_type: object) -> dict[str, object]:
+            self.post_order_calls += 1
+            return {"order": order, "order_type": order_type}
+
+        def cancel(self, order_id: str) -> None:
+            self.cancel_calls += 1
+
+        def update_balance_allowance(self, params: object) -> None:
+            self.update_allowance_calls += 1
+
+        def set_api_creds(self, creds: object) -> None:
+            return None
+
+    fake_client = FakeReadOnlyClient()
+    credential_arguments: dict[str, object] = {}
+    fake_transport = PolymarketSdkTransport(
+        fake_client,
+        order_args_factory=lambda **values: SimpleNamespace(**values),
+        trade_params_factory=lambda **values: SimpleNamespace(**values),
+        balance_params_factory=lambda: object(),
+        fok_order_type="FOK",
+    )
+
+    async def fake_from_credentials(**values: object) -> PolymarketSdkTransport:
+        credential_arguments.update(values)
+        return fake_transport
+
+    monkeypatch.setattr(
+        PolymarketSdkTransport,
+        "from_credentials",
+        staticmethod(fake_from_credentials),
+    )
+
+    async def exercise() -> tuple[ConnectionTestResult, FakeReadOnlyClient]:
+        async with httpx.AsyncClient() as client:
+            probe = HttpIntegrationConnectionProbe(client)
+            result = await probe.test(
+                IntegrationConfigRecord(
+                    provider=IntegrationProvider.POLYMARKET,
+                    enabled=True,
+                    environment=IntegrationEnvironment.PRODUCTION,
+                    base_url="https://clob.test",
+                    configuration={
+                        "chain_id": 137,
+                        "signature_type": 1,
+                        "funder_address": "0xfunder",
+                    },
+                ),
+                {"private_key": "private-key"},
+            )
+        return result, fake_client
+
+    result, counters = asyncio.run(exercise())
+
+    assert result.ok is True
+    assert result.code == "POLYMARKET_READ_ONLY_OK"
+    assert result.detail == "Polymarket read-only authentication succeeded"
+    assert counters.balance_allowance_calls == 1
+    assert counters.open_orders_calls == 1
+    assert counters.trades_calls == 1
+    assert counters.create_order_calls == 0
+    assert counters.post_order_calls == 0
+    assert counters.cancel_calls == 0
+    assert counters.update_allowance_calls == 0
+    assert credential_arguments["derive_only"] is True
+
+
+def test_connection_probe_sanitizes_polymarket_read_only_failures() -> None:
+    secret = "private-key-secret"
+
+    class FailingReadOnlyTransport:
+        async def probe_read_only(self) -> None:
+            raise RuntimeError(f"sdk rejected {secret}")
+
+    async def polymarket_factory(
+        record: IntegrationConfigRecord,
+        secrets: dict[str, str],
+    ) -> FailingReadOnlyTransport:
+        assert record.provider is IntegrationProvider.POLYMARKET
+        assert secrets["private_key"] == secret
+        return FailingReadOnlyTransport()
+
+    async def exercise() -> ConnectionTestResult:
+        async with httpx.AsyncClient() as client:
+            probe = HttpIntegrationConnectionProbe(
+                client,
+                polymarket_factory=polymarket_factory,
+            )
+            return await probe.test(
+                IntegrationConfigRecord(
+                    provider=IntegrationProvider.POLYMARKET,
+                    enabled=True,
+                    environment=IntegrationEnvironment.PRODUCTION,
+                    base_url="https://clob.test",
+                    configuration={
+                        "chain_id": 137,
+                        "signature_type": 1,
+                        "funder_address": "0xfunder",
+                    },
+                ),
+                {"private_key": secret},
+            )
+
+    result = asyncio.run(exercise())
+
+    assert result.ok is False
+    assert result.code == "POLYMARKET_READ_ONLY_FAILED"
+    assert result.detail == "Polymarket read-only authentication failed"
+    assert secret not in result.detail

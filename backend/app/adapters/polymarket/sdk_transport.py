@@ -63,6 +63,7 @@ class PolymarketSdkTransport:
         api_key: str | None = None,
         api_secret: str | None = None,
         passphrase: str | None = None,
+        derive_only: bool = False,
     ) -> "PolymarketSdkTransport":
         from py_clob_client_v2.client import ClobClient  # type: ignore[import-untyped]  # noqa: I001
 
@@ -97,7 +98,10 @@ class PolymarketSdkTransport:
             funder=funder_address,
         )
         if credentials is None:
-            derived = await asyncio.to_thread(client.create_or_derive_api_key)
+            derive_credentials = (
+                client.derive_api_key if derive_only else client.create_or_derive_api_key
+            )
+            derived = await asyncio.to_thread(derive_credentials)
             client.set_api_creds(derived)
         return cls(
             client,
@@ -371,4 +375,3 @@ def _normalize_order_status(value: object) -> str:
         "INVALID": "REJECTED",
         "REJECTED": "REJECTED",
     }.get(raw, "UNKNOWN")
-
