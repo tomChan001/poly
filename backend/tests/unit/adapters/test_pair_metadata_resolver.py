@@ -9,6 +9,7 @@ from backend.app.adapters.oddpool.schema import OddpoolOpportunity
 from backend.app.adapters.pair_metadata import (
     NativePairMetadataResolver,
     _decimal_field,
+    _polymarket_token,
 )
 
 
@@ -177,6 +178,76 @@ async def test_resolver_parses_gamma_json_decimals_exactly() -> None:
 
     assert pair.minimum_quantity == Decimal(5)
     assert pair.polymarket_minimum_tick == Decimal("0.001")
+
+
+@pytest.mark.asyncio
+async def test_resolver_uses_cross_verified_token_for_named_polymarket_outcome() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "kalshi.test":
+            return httpx.Response(
+                200,
+                json={
+                    "market": {
+                        "ticker": "KXBOXING",
+                        "title": "Mayweather or Pacquiao?",
+                        "status": "open",
+                        "rules_primary": "Kalshi native rule",
+                        "tick_size": "0.01",
+                        "minimum_order_size": "1",
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "question": "Mayweather or Pacquiao?",
+                    "description": "Polymarket native rule",
+                    "conditionId": "0xboxing",
+                    "outcomes": '["Mayweather", "Pacquiao"]',
+                    "clobTokenIds": '["token-mayweather", "token-pacquiao"]',
+                    "orderMinSize": "5",
+                    "orderPriceMinTickSize": "0.01",
+                }
+            ],
+        )
+
+    opportunity = OddpoolOpportunity.model_validate(
+        {
+            "id": "oddpool:boxing:mayweather",
+            "title": "Mayweather or Pacquiao?",
+            "outcome": "Mayweather",
+            "updated_at": "2026-09-01T00:00:00Z",
+            "gross_spread": "0.08",
+            "estimated_fees": "0.03",
+            "legs": [
+                {
+                    "venue": "kalshi",
+                    "outcome": "no",
+                    "market_ref": "KXBOXING",
+                    "display_price": "0.69",
+                },
+                {
+                    "venue": "polymarket",
+                    "outcome": "yes",
+                    "market_ref": "boxing-event",
+                    "display_price": "0.32",
+                    "source_condition_id": "0xboxing",
+                    "source_token_id": "token-mayweather",
+                },
+            ],
+        }
+    )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        pair = await NativePairMetadataResolver(
+            kalshi_base_url="https://kalshi.test",
+            polymarket_gamma_url="https://gamma.test",
+            http_client=http,
+        ).resolve(opportunity)
+
+    assert pair.polymarket_market_id == "token-mayweather"
+    assert pair.polymarket_outcome == "yes"
 
 
 @pytest.mark.asyncio
@@ -476,7 +547,11 @@ async def test_resolver_normalizes_offset_datetimes_to_utc() -> None:
     ("condition_id", "token_id", "message"),
     [
         ("0xwrong", "token-yes", "condition ID must resolve to one market"),
-        ("0xcondition", "wrong-token", "Polymarket token ID mismatch"),
+        (
+            "0xcondition",
+            "wrong-token",
+            "Polymarket token ID must resolve to one native token",
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -552,6 +627,45 @@ async def test_resolver_rejects_oddpool_native_id_mismatch(
         )
         with pytest.raises(ValueError, match=message):
             await resolver.resolve(opportunity)
+
+
+def test_polymarket_token_rejects_missing_expected_native_token() -> None:
+    payload: dict[str, object] = {
+        "outcomes": '["Mayweather", "Pacquiao"]',
+        "clobTokenIds": '["token-mayweather", "token-pacquiao"]',
+    }
+
+    with pytest.raises(ValueError, match="must resolve to one native token"):
+        _polymarket_token(payload, "yes", "unknown-token")
+
+
+def test_polymarket_token_rejects_duplicate_expected_native_token() -> None:
+    payload: dict[str, object] = {
+        "outcomes": '["Mayweather", "Pacquiao"]',
+        "clobTokenIds": '["token-shared", "token-shared"]',
+    }
+
+    with pytest.raises(ValueError, match="must resolve to one native token"):
+        _polymarket_token(payload, "yes", "token-shared")
+
+
+def test_polymarket_token_rejects_misaligned_native_arrays() -> None:
+    payload: dict[str, object] = {
+        "outcomes": '["Yes", "No"]',
+        "clobTokenIds": '["token-yes"]',
+    }
+
+    with pytest.raises(ValueError, match="do not align"):
+        _polymarket_token(payload, "yes", "token-yes")
+
+
+def test_polymarket_token_keeps_label_fallback_without_source_token() -> None:
+    payload: dict[str, object] = {
+        "outcomes": '["Yes", "No"]',
+        "clobTokenIds": '["token-yes", "token-no"]',
+    }
+
+    assert _polymarket_token(payload, "yes") == "token-yes"
 
 
 @pytest.mark.parametrize("value", ["0.001", 1, Decimal("0.001")])

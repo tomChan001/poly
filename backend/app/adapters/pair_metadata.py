@@ -63,7 +63,11 @@ class NativePairMetadataResolver:
             opportunity.title,
             polymarket_leg.source_condition_id,
         )
-        token_id = _polymarket_token(polymarket, polymarket_leg.outcome)
+        token_id = _polymarket_token(
+            polymarket,
+            polymarket_leg.outcome,
+            polymarket_leg.source_token_id,
+        )
         native_condition_id = _optional_text(
             polymarket,
             "conditionId",
@@ -207,13 +211,26 @@ def _select_polymarket_market(
     return matches[0]
 
 
-def _polymarket_token(payload: dict[str, object], outcome: str) -> str:
+def _polymarket_token(
+    payload: dict[str, object],
+    outcome: str,
+    expected_token_id: str | None = None,
+) -> str:
     outcomes = _string_list(payload.get("outcomes"), "outcomes")
     token_ids = _string_list(payload.get("clobTokenIds"), "clobTokenIds")
     if len(outcomes) != len(token_ids):
         raise ValueError("Polymarket outcomes and token IDs do not align")
+    if expected_token_id is not None:
+        matches = [token for token in token_ids if token == expected_token_id]
+        if len(matches) != 1:
+            raise ValueError("Polymarket token ID must resolve to one native token")
+        return matches[0]
     normalized = outcome.strip().lower()
-    matches = [token for label, token in zip(outcomes, token_ids, strict=True) if label.lower() == normalized]
+    matches = [
+        token
+        for label, token in zip(outcomes, token_ids, strict=True)
+        if label.lower() == normalized
+    ]
     if len(matches) != 1:
         raise ValueError(f"Polymarket outcome has no unique token: {outcome}")
     return matches[0]
