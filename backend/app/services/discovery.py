@@ -47,7 +47,11 @@ class DiscoveryService:
     async def ingest(self, opportunities: list[OddpoolOpportunity]) -> IngestResult:
         imported = 0
         for opportunity in opportunities:
-            urls = {leg.venue.value: leg.market_url for leg in opportunity.legs}
+            urls = {
+                leg.venue.value: leg.market_url
+                for leg in opportunity.legs
+                if leg.market_url is not None
+            }
             prices = {leg.venue.value: leg.display_price for leg in opportunity.legs}
             candidate = DiscoveryCandidate(
                 source_candidate_id=opportunity.id,
@@ -57,7 +61,10 @@ class DiscoveryService:
                 resolves_at=opportunity.resolves_at,
                 source_urls=urls,
                 source_prices=prices,
-                source_link_invalid=not all(_is_valid_http_url(url) for url in urls.values()),
+                source_link_invalid=(
+                    len(urls) != len(opportunity.legs)
+                    or not all(_is_valid_http_url(url) for url in urls.values())
+                ),
             )
             imported += int(await self._store.add_if_absent(candidate))
 

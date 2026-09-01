@@ -22,6 +22,7 @@ from backend.app.db.outbox import PostgresOutbox
 from backend.app.domain.enums import ExecutionState
 from backend.app.services.execution_supervisor import ExecutionIncident
 from backend.app.services.integration_config import (
+    ODDPOOL_BASE_URL,
     IntegrationConfigRecord,
     IntegrationEnvironment,
     IntegrationProvider,
@@ -105,7 +106,7 @@ async def test_initial_migration_runs_on_postgres_and_protects_audit_events() ->
                         provider=IntegrationProvider.ODDPOOL,
                         enabled=False,
                         environment=IntegrationEnvironment.SANDBOX,
-                        base_url="https://oddpool.test",
+                        base_url=ODDPOOL_BASE_URL,
                         updated_by="runtime-test",
                     )
                 )
@@ -114,7 +115,7 @@ async def test_initial_migration_runs_on_postgres_and_protects_audit_events() ->
                         provider=IntegrationProvider.ODDPOOL,
                         enabled=False,
                         environment=IntegrationEnvironment.PRODUCTION,
-                        base_url="https://oddpool.example",
+                        base_url=ODDPOOL_BASE_URL,
                         updated_by="runtime-test",
                     )
                 )

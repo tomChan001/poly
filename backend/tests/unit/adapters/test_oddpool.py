@@ -37,6 +37,25 @@ async def test_oddpool_import_is_idempotent_and_keeps_prices_as_evidence_only() 
     assert not hasattr(candidate, "quote_evaluation")
 
 
+@pytest.mark.asyncio
+async def test_discovery_marks_a_missing_source_link_invalid() -> None:
+    response = OddpoolResponse.model_validate(load_fixture())
+    opportunity = response.opportunities[0]
+    missing_link = opportunity.legs[0].model_copy(update={"market_url": None})
+    incomplete = opportunity.model_copy(
+        update={"legs": [missing_link, opportunity.legs[1]]}
+    )
+    store = InMemoryCandidateStore()
+
+    await DiscoveryService(store).ingest([incomplete])
+
+    candidate = next(iter(store.candidates.values()))
+    assert candidate.source_urls == {
+        "polymarket": "https://polymarket.com/event/example"
+    }
+    assert candidate.source_link_invalid is True
+
+
 def test_oddpool_schema_rejects_unknown_venue() -> None:
     payload = load_fixture()
     payload["opportunities"][0]["legs"][0]["venue"] = "unknown"

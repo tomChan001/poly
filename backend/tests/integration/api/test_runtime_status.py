@@ -5,6 +5,7 @@ from backend.app.container import ApplicationContainer
 from backend.app.core.security import Principal, Role, get_current_principal
 from backend.app.main import create_app
 from backend.app.services.integration_config import (
+    ODDPOOL_BASE_URL,
     IntegrationEnvironment,
     IntegrationProvider,
 )
@@ -27,7 +28,7 @@ async def test_runtime_status_reports_exact_missing_configuration_without_secret
         IntegrationProvider.ODDPOOL,
         enabled=True,
         environment=IntegrationEnvironment.PRODUCTION,
-        base_url="https://oddpool.test",
+        base_url=ODDPOOL_BASE_URL,
         configuration={},
         secrets={"api_token": "must-not-leak"},
         actor="local-operator",

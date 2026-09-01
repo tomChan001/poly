@@ -3,6 +3,7 @@ import pytest
 from backend.app.adapters.polymarket.account import PolymarketAccountResolver
 from backend.app.core.secrets import InMemorySecretStore
 from backend.app.services.integration_config import (
+    ODDPOOL_BASE_URL,
     InMemoryIntegrationConfigRepository,
     IntegrationConfigRecord,
     IntegrationConfigService,
@@ -31,7 +32,7 @@ async def configure_provider(
         tuple[str, dict[str, str | int | bool], dict[str, str | None]],
     ] = {
         IntegrationProvider.ODDPOOL: (
-            "https://oddpool.test",
+            ODDPOOL_BASE_URL,
             {},
             {"api_token": "oddpool-token"},
         ),

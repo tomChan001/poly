@@ -25,6 +25,7 @@ from backend.app.services.execution import (
 )
 from backend.app.services.fees import FeeEngine, ProbabilityCurveFeeRule
 from backend.app.services.integration_config import (
+    ODDPOOL_BASE_URL,
     InMemoryIntegrationConfigRepository,
     IntegrationConfigService,
     IntegrationEnvironment,
@@ -163,7 +164,7 @@ async def configured_integrations() -> IntegrationConfigService:
     )
     values = {
         IntegrationProvider.ODDPOOL: (
-            "https://oddpool.test",
+            ODDPOOL_BASE_URL,
             {},
             {"api_token": "token"},
         ),
