@@ -33,7 +33,13 @@ async def list_integrations(
     container: Annotated[ApplicationContainer, Depends(get_container)],
     _principal: Annotated[Principal, Depends(require_role(Role.OPERATOR))],
 ) -> list[IntegrationConfigView]:
-    return await container.integration_configs.list()
+    try:
+        return await container.integration_configs.list()
+    except SecretStorageError:
+        raise HTTPException(
+            status_code=503,
+            detail=_CREDENTIAL_STORAGE_UNAVAILABLE,
+        ) from None
 
 
 @router.put("/{provider}", response_model=IntegrationConfigView)

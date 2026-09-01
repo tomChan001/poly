@@ -166,6 +166,24 @@ async def test_integration_save_redacts_credential_store_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_integration_list_redacts_credential_store_failure() -> None:
+    secret_store = FailingSecretStore()
+    transport = httpx.ASGITransport(
+        app=app_for(Role.OPERATOR, secret_store),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        saved = await client.put("/api/integrations/kalshi", json=kalshi_payload())
+        secret_store.failing_operation = "get"
+        response = await client.get("/api/integrations")
+
+    assert saved.status_code == 200
+    assert response.status_code == 503
+    assert response.json() == {"detail": "credential storage unavailable"}
+    assert SECRET_STORAGE_SENTINEL not in response.text
+
+
+@pytest.mark.asyncio
 async def test_viewer_cannot_change_integration_configuration() -> None:
     transport = httpx.ASGITransport(app=app_for(Role.VIEWER))
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
