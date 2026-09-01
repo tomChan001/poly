@@ -1,10 +1,16 @@
+from typing import Literal
+
 import httpx
 import pytest
 
 from backend.app.adapters.polymarket.account import PolymarketAccountResolver
 from backend.app.container import ApplicationContainer
 from backend.app.core.config import TradingMode, settings
-from backend.app.core.secrets import InMemorySecretStore
+from backend.app.core.secrets import (
+    InMemorySecretStore,
+    SecretStorageError,
+    SecretStore,
+)
 from backend.app.core.security import Principal, Role, get_current_principal
 from backend.app.main import create_app
 from backend.app.services.integration_config import (
@@ -16,6 +22,7 @@ from backend.app.services.integration_config import (
 PRIVATE_KEY = "0x59c6995e998f97a5a0044966f094538c5f7d2b32a3d47ec9d7c2b4e1f7e3b5d1"
 OWNER_ADDRESS = "0xeC165c363b4fB6888BD058c6bB1269c77C9b8E81"
 PROXY_ADDRESS = "0x1111111111111111111111111111111111111111"
+SECRET_STORAGE_SENTINEL = "must-not-leak-private-key"
 
 
 def integration_payload(token: str = "oddpool-secret-token") -> dict[str, object]:
@@ -28,8 +35,52 @@ def integration_payload(token: str = "oddpool-secret-token") -> dict[str, object
     }
 
 
-def app_for(role: Role):
-    app = create_app(ApplicationContainer())
+def kalshi_payload() -> dict[str, object]:
+    return {
+        "enabled": True,
+        "environment": "production",
+        "base_url": "https://api.elections.kalshi.com",
+        "configuration": {"key_id": "test-key-id"},
+        "secrets": {"private_key": "test-kalshi-private-key"},
+    }
+
+
+class FailingSecretStore(InMemorySecretStore):
+    def __init__(
+        self,
+        failing_operation: Literal["get", "set", "delete"] | None = None,
+    ) -> None:
+        super().__init__()
+        self.failing_operation = failing_operation
+
+    async def get(self, key: str) -> str | None:
+        self._raise_if_failing("get")
+        return await super().get(key)
+
+    async def set(self, key: str, value: str) -> None:
+        self._raise_if_failing("set")
+        await super().set(key, value)
+
+    async def delete(self, key: str) -> None:
+        self._raise_if_failing("delete")
+        await super().delete(key)
+
+    def _raise_if_failing(
+        self,
+        operation: Literal["get", "set", "delete"],
+    ) -> None:
+        if self.failing_operation == operation:
+            raise SecretStorageError(SECRET_STORAGE_SENTINEL)
+
+
+def app_for(role: Role, secret_store: SecretStore | None = None):
+    container = ApplicationContainer()
+    if secret_store is not None:
+        container.integration_configs = IntegrationConfigService(
+            InMemoryIntegrationConfigRepository(),
+            secret_store,
+        )
+    app = create_app(container)
     app.dependency_overrides[get_current_principal] = lambda: Principal(
         "operator-1",
         frozenset({role}),
@@ -100,6 +151,21 @@ async def test_operator_can_save_credentials_without_reading_them_back() -> None
 
 
 @pytest.mark.asyncio
+async def test_integration_save_redacts_credential_store_failure() -> None:
+    secret_store = FailingSecretStore("set")
+    transport = httpx.ASGITransport(
+        app=app_for(Role.OPERATOR, secret_store),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.put("/api/integrations/kalshi", json=kalshi_payload())
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "credential storage unavailable"}
+    assert SECRET_STORAGE_SENTINEL not in response.text
+
+
+@pytest.mark.asyncio
 async def test_viewer_cannot_change_integration_configuration() -> None:
     transport = httpx.ASGITransport(app=app_for(Role.VIEWER))
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -118,6 +184,24 @@ async def test_operator_can_delete_one_stored_secret() -> None:
     assert deleted.status_code == 200
     assert deleted.json()["configured"] is False
     assert deleted.json()["fingerprint"] is None
+
+
+@pytest.mark.asyncio
+async def test_secret_delete_redacts_credential_store_failure() -> None:
+    secret_store = FailingSecretStore()
+    transport = httpx.ASGITransport(
+        app=app_for(Role.OPERATOR, secret_store),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        saved = await client.put("/api/integrations/kalshi", json=kalshi_payload())
+        secret_store.failing_operation = "delete"
+        response = await client.delete("/api/integrations/kalshi/secrets/private_key")
+
+    assert saved.status_code == 200
+    assert response.status_code == 503
+    assert response.json() == {"detail": "credential storage unavailable"}
+    assert SECRET_STORAGE_SENTINEL not in response.text
 
 
 @pytest.mark.asyncio
@@ -143,6 +227,24 @@ async def test_operator_can_test_a_configured_connection_without_secret_echo() -
     assert response.json()["ok"] is True
     assert response.json()["provider"] == "oddpool"
     assert "oddpool-secret-token" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_connection_test_redacts_credential_store_failure() -> None:
+    secret_store = FailingSecretStore()
+    transport = httpx.ASGITransport(
+        app=app_for(Role.OPERATOR, secret_store),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        saved = await client.put("/api/integrations/kalshi", json=kalshi_payload())
+        secret_store.failing_operation = "get"
+        response = await client.post("/api/integrations/kalshi/test")
+
+    assert saved.status_code == 200
+    assert response.status_code == 503
+    assert response.json() == {"detail": "credential storage unavailable"}
+    assert SECRET_STORAGE_SENTINEL not in response.text
 
 
 @pytest.mark.asyncio

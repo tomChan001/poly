@@ -5,6 +5,7 @@ from pydantic import AnyHttpUrl, BaseModel, SecretStr
 
 from backend.app.api.dependencies import get_container
 from backend.app.container import ApplicationContainer
+from backend.app.core.secrets import SecretStorageError
 from backend.app.core.security import Principal, Role, require_role
 from backend.app.services.integration_config import (
     ConnectionTestResult,
@@ -15,6 +16,8 @@ from backend.app.services.integration_config import (
 )
 
 router = APIRouter(prefix="/api/integrations", tags=["integrations"])
+
+_CREDENTIAL_STORAGE_UNAVAILABLE = "credential storage unavailable"
 
 
 class IntegrationUpdateRequest(BaseModel):
@@ -53,6 +56,11 @@ async def update_integration(
             },
             actor=principal.subject,
         )
+    except SecretStorageError:
+        raise HTTPException(
+            status_code=503,
+            detail=_CREDENTIAL_STORAGE_UNAVAILABLE,
+        ) from None
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -65,6 +73,11 @@ async def test_integration_connection(
 ) -> ConnectionTestResult:
     try:
         return await container.integration_configs.test_connection(provider)
+    except SecretStorageError:
+        raise HTTPException(
+            status_code=503,
+            detail=_CREDENTIAL_STORAGE_UNAVAILABLE,
+        ) from None
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -78,5 +91,10 @@ async def delete_integration_secret(
 ) -> SecretStatus:
     try:
         return await container.integration_configs.delete_secret(provider, name)
+    except SecretStorageError:
+        raise HTTPException(
+            status_code=503,
+            detail=_CREDENTIAL_STORAGE_UNAVAILABLE,
+        ) from None
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
