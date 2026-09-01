@@ -113,21 +113,23 @@ export function PairSettingsPage() {
       <div className="pair-workspace">
         <section className="pair-list" aria-label="自动候选列表">
           <header><h3>Oddpool 候选</h3><span>{pairs.length}</span></header>
-          {!loading && pairs.length === 0 && (
-            <div className="pair-empty">暂无自动发现的待审核候选</div>
-          )}
-          {pairs.map((pair) => (
-            <button
-              key={pair.id}
-              type="button"
-              className={pair.id === selectedId ? 'pair-row selected' : 'pair-row'}
-              onClick={() => { setSelectedId(pair.id); setMessage(null) }}
-            >
-              <strong>{pair.title}</strong>
-              <span>{pair.kalshi_market_id} / {pair.polymarket_market_id}</span>
-              <b className={`pair-status ${pair.status}`}>{pair.status.toUpperCase()}</b>
-            </button>
-          ))}
+          <div className="pair-list-scroll" role="region" aria-label="Oddpool 候选内容" tabIndex={0}>
+            {!loading && pairs.length === 0 && (
+              <div className="pair-empty">暂无自动发现的待审核候选</div>
+            )}
+            {pairs.map((pair) => (
+              <button
+                key={pair.id}
+                type="button"
+                className={pair.id === selectedId ? 'pair-row selected' : 'pair-row'}
+                onClick={() => { setSelectedId(pair.id); setMessage(null) }}
+              >
+                <strong>{pair.title}</strong>
+                <span>{pair.kalshi_market_id} / {pair.polymarket_market_id}</span>
+                <b className={`pair-status ${pair.status}`}>{pair.status.toUpperCase()}</b>
+              </button>
+            ))}
+          </div>
         </section>
 
         <section className="review-panel">
