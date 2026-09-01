@@ -85,15 +85,14 @@ Do not change keys, click handlers, loading conditions, selection classes, or ca
 
 - [ ] **Step 4: Add desktop and mobile scroll constraints**
 
-In `frontend/src/App.css`, make the left column a self-sized vertical container and add the
-scroll-region rules:
+In `frontend/src/App.css`, keep the left grid item stretched to the workspace height, make it a
+vertical container, and add the internal scroll-region rules:
 
 ```css
 .pair-list {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  align-self: start;
   border-right: 1px solid var(--line);
 }
 
@@ -113,8 +112,10 @@ Replace the existing one-line `.pair-list` rule rather than duplicating it. Insi
 .pair-list-scroll { max-height: min(42dvh, 360px); }
 ```
 
-The header remains outside the scroll wrapper, so it stays visible without sticky positioning.
-The right `.review-panel` receives no height or overflow changes.
+The left `.pair-list` stays stretched by the grid row, while the header remains outside the scroll
+wrapper so it stays visible without sticky positioning. The internal `.pair-list-scroll` owns the
+height cap and overflow behavior. The right `.review-panel` receives no height or overflow
+changes.
 
 - [ ] **Step 5: Run the focused test and verify GREEN**
 
