@@ -39,7 +39,8 @@ test('opens the integration menu with write-only credential inputs', async () =>
   fireEvent.click(await screen.findByRole('button', { name: '集成' }))
 
   expect(await screen.findByRole('heading', { name: '集成配置' })).toBeInTheDocument()
-  expect(screen.getByRole('textbox', { name: 'Oddpool API 地址' })).toBeInTheDocument()
+  expect(screen.getByText('https://api.oddpool.com')).toBeInTheDocument()
+  expect(screen.queryByRole('textbox', { name: 'Oddpool API 地址' })).not.toBeInTheDocument()
   expect(screen.getByLabelText('Oddpool API Token')).toHaveAttribute('type', 'password')
   expect(screen.getByRole('textbox', { name: 'Kalshi API 地址' })).toHaveValue(
     'https://api.elections.kalshi.com',
@@ -76,6 +77,67 @@ test('opens the integration menu with write-only credential inputs', async () =>
     screen.getByRole('button', { name: '测试连接（不会下单）' }),
   ).toBeDisabled()
   expect(screen.queryByRole('heading', { name: 'OIDC' })).not.toBeInTheDocument()
+})
+
+test('always saves the canonical Oddpool API address', async () => {
+  let savedBody: Record<string, unknown> | null = null
+  const legacyOddpoolIntegration = {
+    provider: 'oddpool',
+    enabled: true,
+    environment: 'production',
+    base_url: 'https://legacy.example.test',
+    configuration: {},
+    version: 1,
+    updated_at: '2026-08-26T00:00:00Z',
+    updated_by: 'operator-1',
+    secret_status: {
+      api_token: { configured: false, fingerprint: null },
+    },
+  }
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/integrations/oddpool') && init?.method === 'PUT') {
+        savedBody = JSON.parse(String(init.body)) as Record<string, unknown>
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            ...legacyOddpoolIntegration,
+            base_url: 'https://api.oddpool.com',
+            version: 2,
+          }),
+        })
+      }
+      if (url.endsWith('/api/integrations')) {
+        return Promise.resolve({ ok: true, json: async () => [legacyOddpoolIntegration] })
+      }
+      if (url.includes('/api/runtime')) {
+        return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+      }
+      if (url.includes('/health')) {
+        return Promise.resolve({ ok: true, json: async () => ({ status: 'ok' }) })
+      }
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '集成' }))
+  expect(await screen.findByText('https://api.oddpool.com')).toBeInTheDocument()
+  expect(screen.queryByText('https://legacy.example.test')).not.toBeInTheDocument()
+  fireEvent.change(screen.getByLabelText('Oddpool API Token'), {
+    target: { value: 'secret-token' },
+  })
+  const panel = screen.getByRole('heading', { name: 'Oddpool' }).closest('form')
+  expect(panel).not.toBeNull()
+  fireEvent.click(within(panel!).getByRole('button', { name: '保存' }))
+
+  await waitFor(() => expect(savedBody).not.toBeNull())
+  expect(savedBody).toMatchObject({
+    base_url: 'https://api.oddpool.com',
+    secrets: { api_token: 'secret-token' },
+  })
 })
 
 test('does not resubmit stale Magic addresses after changing account type', async () => {

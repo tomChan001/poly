@@ -41,12 +41,14 @@ interface EditableConfig {
   version: number | null
 }
 
+const ODDPOOL_BASE_URL = 'https://api.oddpool.com'
+
 const providers: ProviderDefinition[] = [
   {
     provider: 'oddpool',
     name: 'Oddpool',
     endpointLabel: 'Oddpool API 地址',
-    defaultUrl: '',
+    defaultUrl: ODDPOOL_BASE_URL,
     fields: [],
     secretFields: [{ name: 'api_token', label: 'Oddpool API Token' }],
     defaultConfiguration: {},
@@ -105,7 +107,7 @@ function fromServer(definition: ProviderDefinition, value: IntegrationConfig): E
     provider: value.provider,
     enabled: value.enabled,
     environment: value.environment,
-    baseUrl: value.base_url,
+    baseUrl: value.provider === 'oddpool' ? ODDPOOL_BASE_URL : value.base_url,
     configuration: { ...definition.defaultConfiguration, ...value.configuration },
     advancedFunderAddress: String(value.configuration.funder_address ?? ''),
     secrets: {},
@@ -181,7 +183,7 @@ export function IntegrationSettingsPage() {
       const saved = await saveIntegration(provider, {
         enabled: config.enabled,
         environment: config.environment,
-        base_url: config.baseUrl,
+        base_url: provider === 'oddpool' ? ODDPOOL_BASE_URL : config.baseUrl,
         configuration,
         secrets: Object.fromEntries(
           Object.entries(config.secrets).filter(([, value]) => value.length > 0),
@@ -267,16 +269,23 @@ export function IntegrationSettingsPage() {
               </header>
 
               <div className="integration-fields">
-                <label className="field-wide">
-                  <span>{definition.endpointLabel}</span>
-                  <input
-                    aria-label={definition.endpointLabel}
-                    type="url"
-                    required
-                    value={config.baseUrl}
-                    onChange={(event) => update(definition.provider, { baseUrl: event.target.value })}
-                  />
-                </label>
+                {definition.provider === 'oddpool' ? (
+                  <div className="field-wide">
+                    <span>{definition.endpointLabel}</span>
+                    <code>{ODDPOOL_BASE_URL}</code>
+                  </div>
+                ) : (
+                  <label className="field-wide">
+                    <span>{definition.endpointLabel}</span>
+                    <input
+                      aria-label={definition.endpointLabel}
+                      type="url"
+                      required
+                      value={config.baseUrl}
+                      onChange={(event) => update(definition.provider, { baseUrl: event.target.value })}
+                    />
+                  </label>
+                )}
                 <label>
                   <span>环境</span>
                   <select
