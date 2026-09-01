@@ -2,6 +2,7 @@ from typing import Literal
 
 import httpx
 import pytest
+
 from backend.app.adapters.polymarket.account import PolymarketAccountResolver
 from backend.app.container import ApplicationContainer
 from backend.app.core.config import TradingMode, settings
