@@ -4,7 +4,9 @@
 
 **Goal:** Make standard Kalshi RSA PEM private keys save reliably in Windows Credential Manager without changing the integration API or exposing secret material.
 
-**Architecture:** Extend `KeyringSecretStore` with a backwards-compatible versioned manifest. Values up to 900 characters remain single credentials; longer values are written as digest-namespaced chunks before an atomic manifest switch, then reconstructed and SHA-256 verified on read. Convert storage failures to a dedicated sanitized exception that the integration API maps to HTTP 503.
+**Architecture:** Extend `KeyringSecretStore` with a backwards-compatible versioned sidecar manifest. Values up to 900 characters remain verbatim single credentials at the original key; longer values are written as digest-namespaced chunks before an atomic sidecar-manifest switch, then reconstructed and SHA-256 verified on read. Keeping metadata on a separate key prevents even manifest-looking short literals from colliding with the internal format. Convert storage failures to a dedicated sanitized exception that the integration API maps to HTTP 503.
+
+> **Final implementation note:** The initial step examples below placed the manifest in the base key. Review found that this made a short literal identical to a valid manifest ambiguous. The implemented format therefore stores metadata at `<key>:manifest:v1`; the base key remains exclusively for verbatim short values. Long-secret deletion removes any stale base value, then the sidecar, then retries chunk cleanup so a failure cannot leave an active manifest pointing at missing chunks.
 
 **Tech Stack:** Python 3.12, `keyring` WinVault backend, `asyncio.to_thread`, SHA-256, JSON, FastAPI, pytest, Ruff.
 
