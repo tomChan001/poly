@@ -22,6 +22,7 @@ def app_for(container: ApplicationContainer):
 @pytest.mark.asyncio
 async def test_runtime_status_reports_exact_missing_configuration_without_secrets() -> None:
     container = ApplicationContainer()
+    container.system_control.set_opening(True, "test fixture")
     await container.integration_configs.update(
         IntegrationProvider.ODDPOOL,
         enabled=True,
