@@ -39,6 +39,16 @@ npm run dev
 配置。密码框始终为空；已保存凭证仅显示 SHA-256 指纹和配置状态。API、execution worker
 以及其他需要读取凭证的进程必须使用同一个受控操作系统服务账户运行，否则它们无法访问同一凭证库。
 
+### Oddpool API
+
+Oddpool 固定连接官方生产地址 `https://api.oddpool.com`，使用
+`X-API-Key` 调用只读的 `/arbitrage/current`。运营员只需填写 API Key；
+页面不允许修改服务地址。Oddpool 数据仅用于发现候选，规则、订单簿、费用、
+余额和成交仍必须由 Kalshi 与 Polymarket 原生接口复核。
+
+Oddpool 当前产品说明和服务条款对自动化交易用途存在表述差异。真实自动执行前，
+运营方必须自行取得 Oddpool 对该用途的确认或授权。
+
 ### Kalshi API 凭证
 
 1. 登录与当前环境匹配的 Kalshi 生产或 Demo 账户。
