@@ -108,6 +108,81 @@ async def test_resolver_uses_native_metadata_and_selects_polymarket_outcome_toke
 
 
 @pytest.mark.asyncio
+async def test_resolver_derives_kalshi_rule_url_when_native_api_omits_it() -> None:
+    ticker = "KXBOXING-26SEP19FMAYMPAC-FMAY"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "kalshi.test":
+            return httpx.Response(
+                200,
+                json={
+                    "market": {
+                        "ticker": ticker,
+                        "title": "Will Floyd Mayweather beat Manny Pacquiao?",
+                        "status": "open",
+                        "rules_primary": "Resolves yes if Floyd Mayweather wins the bout.",
+                        "rules_secondary": "Official results determine the outcome.",
+                        "tick_size": "0.01",
+                        "minimum_order_size": "1",
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "question": "Will Floyd Mayweather beat Manny Pacquiao?",
+                    "description": "Polymarket native rule",
+                    "conditionId": "0xcondition",
+                    "outcomes": '["Yes", "No"]',
+                    "clobTokenIds": '["token-yes", "token-no"]',
+                    "orderMinSize": "1",
+                    "orderPriceMinTickSize": "0.01",
+                    "active": True,
+                }
+            ],
+        )
+
+    opportunity = OddpoolOpportunity.model_validate(
+        {
+            "id": "oddpool-missing-kalshi-rule-url",
+            "title": "Will Floyd Mayweather beat Manny Pacquiao?",
+            "outcome": "complementary",
+            "updated_at": "2026-09-01T00:00:00Z",
+            "gross_spread": "0.08",
+            "estimated_fees": "0.03",
+            "legs": [
+                {
+                    "venue": "kalshi",
+                    "outcome": "no",
+                    "market_ref": ticker,
+                    "market_url": None,
+                    "display_price": "0.69",
+                },
+                {
+                    "venue": "polymarket",
+                    "outcome": "yes",
+                    "market_ref": "boxing-event",
+                    "market_url": "https://polymarket.com/event/boxing-event",
+                    "display_price": "0.32",
+                },
+            ],
+        }
+    )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        pair = await NativePairMetadataResolver(
+            kalshi_base_url="https://kalshi.test",
+            polymarket_gamma_url="https://gamma.test",
+            http_client=http,
+        ).resolve(opportunity)
+
+    assert pair.kalshi_market_id == ticker
+    assert pair.kalshi_rule_text == "Resolves yes if Floyd Mayweather wins the bout."
+    assert pair.kalshi_rule_url == f"https://kalshi.com/markets/{ticker}"
+
+
+@pytest.mark.asyncio
 async def test_resolver_falls_back_from_market_slug_to_event_slug() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "kalshi.test":
