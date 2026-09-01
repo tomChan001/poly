@@ -122,8 +122,14 @@ async def test_resolver_derives_kalshi_rule_url_when_native_api_omits_it() -> No
                         "status": "open",
                         "rules_primary": "Resolves yes if Floyd Mayweather wins the bout.",
                         "rules_secondary": "Official results determine the outcome.",
-                        "tick_size": "0.01",
-                        "minimum_order_size": "1",
+                        "price_level_structure": "linear_cent",
+                        "price_ranges": [
+                            {
+                                "start": "0.0000",
+                                "end": "1.0000",
+                                "step": "0.0100",
+                            }
+                        ],
                     }
                 },
             )
@@ -180,6 +186,9 @@ async def test_resolver_derives_kalshi_rule_url_when_native_api_omits_it() -> No
     assert pair.kalshi_market_id == ticker
     assert pair.kalshi_rule_text == "Resolves yes if Floyd Mayweather wins the bout."
     assert pair.kalshi_rule_url == f"https://kalshi.com/markets/{ticker}"
+    assert pair.kalshi_minimum_tick == Decimal("0.01")
+    assert pair.minimum_quantity >= Decimal(1)
+    assert pair.quantity_step == Decimal(1)
 
 
 @pytest.mark.asyncio
