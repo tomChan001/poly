@@ -2,7 +2,6 @@ import json
 from dataclasses import asdict
 from datetime import UTC, datetime
 from decimal import Decimal
-from urllib.parse import unquote, urlsplit
 
 import httpx
 
@@ -33,8 +32,8 @@ class NativePairMetadataResolver:
         legs = {leg.venue: leg for leg in opportunity.legs}
         kalshi_leg = legs[Venue.KALSHI]
         polymarket_leg = legs[Venue.POLYMARKET]
-        ticker = _last_path_segment(kalshi_leg.market_url)
-        slug = _last_path_segment(polymarket_leg.market_url)
+        ticker = kalshi_leg.market_ref
+        slug = polymarket_leg.market_ref
 
         kalshi_response = await self._http.get(
             f"{self._kalshi_base_url}/trade-api/v2/markets/{ticker}"
@@ -56,8 +55,27 @@ class NativePairMetadataResolver:
             )
             event_response.raise_for_status()
             polymarket_candidates = _event_markets(event_response.json())
-        polymarket = _select_polymarket_market(polymarket_candidates, opportunity.title)
+        polymarket = _select_polymarket_market(
+            polymarket_candidates,
+            opportunity.title,
+            polymarket_leg.source_condition_id,
+        )
         token_id = _polymarket_token(polymarket, polymarket_leg.outcome)
+        native_condition_id = _optional_text(
+            polymarket,
+            "conditionId",
+            "condition_id",
+        )
+        if (
+            polymarket_leg.source_condition_id is not None
+            and native_condition_id != polymarket_leg.source_condition_id
+        ):
+            raise ValueError("Polymarket condition ID mismatch")
+        if (
+            polymarket_leg.source_token_id is not None
+            and token_id != polymarket_leg.source_token_id
+        ):
+            raise ValueError("Polymarket token ID mismatch")
         polymarket_rule = _required_text(polymarket, "description")
         polymarket_minimum = _decimal_field(
             polymarket,
@@ -86,11 +104,15 @@ class NativePairMetadataResolver:
             kalshi_market_id=kalshi.external_id,
             kalshi_outcome=_outcome(kalshi_leg),
             kalshi_rule_text=kalshi.rule_text,
-            kalshi_rule_url=kalshi_leg.market_url,
+            kalshi_rule_url=(
+                kalshi_leg.market_url or f"https://kalshi.com/markets/{ticker}"
+            ),
             polymarket_market_id=token_id,
             polymarket_outcome=_outcome(polymarket_leg),
             polymarket_rule_text=polymarket_rule,
-            polymarket_rule_url=polymarket_leg.market_url,
+            polymarket_rule_url=(
+                polymarket_leg.market_url or f"https://polymarket.com/event/{slug}"
+            ),
             minimum_quantity=max(kalshi.minimum_quantity, polymarket_minimum, Decimal(1)),
             quantity_step=Decimal(1),
             enabled=True,
@@ -117,14 +139,6 @@ class NativePairMetadataResolver:
                 "material_fingerprint": material_fingerprint,
             }
         )
-
-
-def _last_path_segment(url: str) -> str:
-    parsed = urlsplit(url)
-    segments = [unquote(segment) for segment in parsed.path.split("/") if segment]
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not segments:
-        raise ValueError(f"cannot resolve market identifier from URL: {url}")
-    return segments[-1]
 
 
 def _wrapped_object(payload: object, name: str) -> dict[str, object]:
@@ -154,7 +168,18 @@ def _event_markets(payload: object) -> list[dict[str, object]]:
 def _select_polymarket_market(
     markets: list[dict[str, object]],
     opportunity_title: str,
+    expected_condition_id: str | None = None,
 ) -> dict[str, object]:
+    if expected_condition_id is not None:
+        matches = [
+            market
+            for market in markets
+            if _optional_text(market, "conditionId", "condition_id")
+            == expected_condition_id
+        ]
+        if len(matches) != 1:
+            raise ValueError("Polymarket condition ID must resolve to one market")
+        return matches[0]
     if len(markets) == 1:
         return markets[0]
     title = opportunity_title.strip().casefold()
@@ -164,7 +189,7 @@ def _select_polymarket_market(
         if str(market.get("question", "")).strip().casefold() == title
     ]
     if len(matches) != 1:
-        raise ValueError("Polymarket link must resolve to one uniquely matched market")
+        raise ValueError("Polymarket reference must resolve to one uniquely matched market")
     return matches[0]
 
 
@@ -192,6 +217,14 @@ def _required_text(payload: dict[str, object], name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise TypeError(f"Polymarket {name} must be non-empty text")
     return value
+
+
+def _optional_text(payload: dict[str, object], *names: str) -> str | None:
+    for name in names:
+        value = payload.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def _decimal_field(payload: dict[str, object], *names: str) -> Decimal:

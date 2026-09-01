@@ -48,7 +48,7 @@ class OddpoolPairDiscoveryService:
         imported = 0
         updated = 0
         duplicates = 0
-        errors: list[str] = []
+        errors = list(payload.errors)
         for opportunity in payload.opportunities:
             try:
                 value = await self._resolver.resolve(opportunity)
@@ -85,7 +85,6 @@ class ConfiguredOddpoolPairDiscoveryService:
     async def run_once(self) -> PairDiscoveryResult:
         bundle = await self._integrations.runtime_bundle()
         source = OddpoolClient(
-            bundle.oddpool.record.base_url,
             bundle.oddpool.credentials["api_token"],
             self._http,
         )

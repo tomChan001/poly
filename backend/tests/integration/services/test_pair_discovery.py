@@ -31,12 +31,14 @@ def response(updated_at: datetime) -> OddpoolResponse:
                         {
                             "venue": "kalshi",
                             "outcome": "no",
+                            "market_ref": "K-EVENT",
                             "market_url": "https://kalshi.com/markets/K-EVENT",
                             "display_price": "0.70",
                         },
                         {
                             "venue": "polymarket",
                             "outcome": "yes",
+                            "market_ref": "event-slug",
                             "market_url": "https://polymarket.com/event/event-slug",
                             "display_price": "0.20",
                         },
@@ -192,3 +194,18 @@ async def test_bad_candidate_does_not_block_other_automatic_candidates() -> None
     assert result.errors == ("oddpool-bad: market link is ambiguous",)
     [saved] = await pairs.list()
     assert saved.source_candidate_id == "oddpool-good"
+
+
+@pytest.mark.asyncio
+async def test_source_row_errors_are_reported_without_blocking_valid_candidates() -> None:
+    source = Source()
+    source.payload = source.payload.model_copy(
+        update={"errors": ("row 1: invalid Oddpool arbitrage row",)}
+    )
+    pairs = ExecutablePairService(InMemoryExecutablePairRepository())
+
+    result = await OddpoolPairDiscoveryService(source, Resolver(), pairs).run_once()
+
+    assert result.imported == 1
+    assert result.failed == 1
+    assert result.errors == ("row 1: invalid Oddpool arbitrage row",)

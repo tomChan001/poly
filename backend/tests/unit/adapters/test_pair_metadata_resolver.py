@@ -63,12 +63,14 @@ async def test_resolver_uses_native_metadata_and_selects_polymarket_outcome_toke
                 {
                     "venue": "kalshi",
                     "outcome": "no",
+                    "market_ref": "K-EVENT",
                     "market_url": "https://kalshi.com/markets/K-EVENT",
                     "display_price": "0.70",
                 },
                 {
                     "venue": "polymarket",
                     "outcome": "yes",
+                    "market_ref": "event-slug",
                     "market_url": "https://polymarket.com/event/event-slug",
                     "display_price": "0.20",
                 },
@@ -156,8 +158,8 @@ async def test_resolver_falls_back_from_market_slug_to_event_slug() -> None:
             "gross_spread": "0.10",
             "estimated_fees": "0.01",
             "legs": [
-                {"venue": "kalshi", "outcome": "no", "market_url": "https://kalshi.com/markets/K-EVENT", "display_price": "0.70"},
-                {"venue": "polymarket", "outcome": "yes", "market_url": "https://polymarket.com/event/event-slug", "display_price": "0.20"},
+                {"venue": "kalshi", "outcome": "no", "market_ref": "K-EVENT", "market_url": "https://kalshi.com/markets/K-EVENT", "display_price": "0.70"},
+                {"venue": "polymarket", "outcome": "yes", "market_ref": "event-slug", "market_url": "https://polymarket.com/event/event-slug", "display_price": "0.20"},
             ],
         }
     )
@@ -220,8 +222,8 @@ async def test_resolver_normalizes_offset_datetimes_to_utc() -> None:
             "gross_spread": "0.10",
             "estimated_fees": "0.01",
             "legs": [
-                {"venue": "kalshi", "outcome": "no", "market_url": "https://kalshi.com/markets/K-EVENT", "display_price": "0.70"},
-                {"venue": "polymarket", "outcome": "yes", "market_url": "https://polymarket.com/event/event-slug", "display_price": "0.20"},
+                {"venue": "kalshi", "outcome": "no", "market_ref": "K-EVENT", "market_url": "https://kalshi.com/markets/K-EVENT", "display_price": "0.70"},
+                {"venue": "polymarket", "outcome": "yes", "market_ref": "event-slug", "market_url": "https://polymarket.com/event/event-slug", "display_price": "0.20"},
             ],
         }
     )
@@ -236,3 +238,85 @@ async def test_resolver_normalizes_offset_datetimes_to_utc() -> None:
     assert pair.kalshi_expected_settlement_at == datetime(2026, 8, 25, 15, 0, tzinfo=UTC)
     assert pair.polymarket_expected_settlement_at == datetime(2026, 8, 25, 15, 0, tzinfo=UTC)
     assert pair.worst_case_settlement_at == datetime(2026, 8, 25, 15, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("condition_id", "token_id", "message"),
+    [
+        ("0xwrong", "token-yes", "condition ID must resolve to one market"),
+        ("0xcondition", "wrong-token", "Polymarket token ID mismatch"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_resolver_rejects_oddpool_native_id_mismatch(
+    condition_id: str,
+    token_id: str,
+    message: str,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "kalshi.test":
+            return httpx.Response(
+                200,
+                json={
+                    "market": {
+                        "ticker": "K-EVENT",
+                        "title": "Will the event happen?",
+                        "status": "open",
+                        "rules_primary": "Kalshi native rule",
+                        "rules_url": "https://kalshi.com/markets/K-EVENT",
+                        "tick_size": "0.01",
+                        "minimum_order_size": "1",
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "question": "Will the event happen?",
+                    "description": "Polymarket native rule",
+                    "conditionId": "0xcondition",
+                    "outcomes": '["Yes", "No"]',
+                    "clobTokenIds": '["token-yes", "token-no"]',
+                    "orderMinSize": "1",
+                    "orderPriceMinTickSize": "0.01",
+                }
+            ],
+        )
+
+    opportunity = OddpoolOpportunity.model_validate(
+        {
+            "id": "oddpool:42:yes",
+            "title": "Will the event happen?",
+            "outcome": "yes",
+            "updated_at": "2026-09-01T00:00:00Z",
+            "gross_spread": "0.08",
+            "estimated_fees": "0.03",
+            "legs": [
+                {
+                    "venue": "kalshi",
+                    "outcome": "no",
+                    "market_ref": "K-EVENT",
+                    "display_price": "0.69",
+                },
+                {
+                    "venue": "polymarket",
+                    "outcome": "yes",
+                    "market_ref": "event-slug",
+                    "display_price": "0.32",
+                    "source_condition_id": condition_id,
+                    "source_token_id": token_id,
+                },
+            ],
+        }
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as http:
+        resolver = NativePairMetadataResolver(
+            kalshi_base_url="https://kalshi.test",
+            polymarket_gamma_url="https://gamma.test",
+            http_client=http,
+        )
+        with pytest.raises(ValueError, match=message):
+            await resolver.resolve(opportunity)
