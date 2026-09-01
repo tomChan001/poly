@@ -366,22 +366,17 @@ async def test_resolver_falls_back_from_market_slug_to_event_slug() -> None:
             return httpx.Response(200, json=[])
         return httpx.Response(
             200,
-            json=[
-                {
-                    "markets": [
-                        {
-                            "question": "Will the event happen?",
-                            "description": "Polymarket native rule",
-                            "category": "news",
-                            "outcomes": '["Yes", "No"]',
-                            "clobTokenIds": '["token-yes", "token-no"]',
-                            "orderMinSize": "5",
-                            "orderPriceMinTickSize": "0.001",
-                            "endDate": "2026-08-27T16:30:00Z",
-                        }
-                    ]
-                }
-            ],
+            content=(
+                b'[{"markets":[{"question":"Will the event happen?",'
+                b'"description":"Polymarket native rule",'
+                b'"category":"news",'
+                b'"outcomes":"[\\"Yes\\", \\"No\\"]",'
+                b'"clobTokenIds":"[\\"token-yes\\", \\"token-no\\"]",'
+                b'"orderMinSize":5,'
+                b'"orderPriceMinTickSize":0.001,'
+                b'"endDate":"2026-08-27T16:30:00Z"}]}]'
+            ),
+            headers={"content-type": "application/json"},
         )
 
     opportunity = OddpoolOpportunity.model_validate(
@@ -407,6 +402,8 @@ async def test_resolver_falls_back_from_market_slug_to_event_slug() -> None:
         ).resolve(opportunity)
 
     assert pair.polymarket_market_id == "token-yes"
+    assert pair.minimum_quantity == Decimal(5)
+    assert pair.polymarket_minimum_tick == Decimal("0.001")
     assert pair.worst_case_settlement_at == datetime(2026, 8, 27, 16, 30, tzinfo=UTC)
 
 
@@ -566,6 +563,11 @@ def test_polymarket_decimal_field_accepts_exact_positive_values(value: object) -
 def test_polymarket_decimal_field_rejects_inexact_types(value: object) -> None:
     with pytest.raises(TypeError, match="must be an exact decimal"):
         _decimal_field({"tick": value}, "tick", maximum=Decimal(1))
+
+
+def test_polymarket_decimal_field_reports_missing_fields_separately() -> None:
+    with pytest.raises(TypeError, match="Polymarket metadata is missing tick"):
+        _decimal_field({}, "tick", maximum=Decimal(1))
 
 
 @pytest.mark.parametrize("value", ["NaN", "Infinity", "0", "-0.001", "1.001"])
