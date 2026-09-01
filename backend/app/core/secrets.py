@@ -8,6 +8,7 @@ from typing import Protocol
 _CHUNK_SIZE = 900
 _MAX_CHUNKS = 10_000
 _MANIFEST_PREFIX = "poly-keyring-chunks:v1:"
+_MANIFEST_KIND = "chunked-secret"
 _PLAIN_ENVELOPE_PREFIX = "poly-keyring-plain:v1:"
 _CORRUPTED_MESSAGE = "credential storage is corrupted"
 _CLEANUP_WARNING_MESSAGE = "credential storage cleanup failed"
@@ -105,7 +106,11 @@ class KeyringSecretStore:
                 await self._set_password(chunk_key, chunk)
                 written_chunk_keys.append(chunk_key)
             manifest = _MANIFEST_PREFIX + json.dumps(
-                {"sha256": digest, "chunks": len(chunks)},
+                {
+                    "kind": _MANIFEST_KIND,
+                    "sha256": digest,
+                    "chunks": len(chunks),
+                },
                 separators=(",", ":"),
             )
             await self._set_password(key, manifest)
@@ -222,16 +227,18 @@ def _parse_manifest(value: str) -> tuple[str, int] | None:
         return None
     if not isinstance(parsed, dict):
         return None
+    if parsed.get("kind") != _MANIFEST_KIND:
+        return None
     digest = parsed.get("sha256")
     chunks = parsed.get("chunks")
     if not isinstance(digest, str):
-        return None
+        raise SecretStorageError(_CORRUPTED_MESSAGE)
     if len(digest) != 64 or not all(
         character in string.hexdigits for character in digest
     ):
-        return None
+        raise SecretStorageError(_CORRUPTED_MESSAGE)
     if not isinstance(chunks, int) or isinstance(chunks, bool):
-        return None
+        raise SecretStorageError(_CORRUPTED_MESSAGE)
     if not 1 <= chunks <= _MAX_CHUNKS:
-        return None
+        raise SecretStorageError(_CORRUPTED_MESSAGE)
     return digest, chunks

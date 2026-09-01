@@ -10,6 +10,12 @@ from backend.app.core.secrets import KeyringSecretStore, SecretStorageError
 
 SERVICE = "poly-test"
 MANIFEST_PREFIX = "poly-keyring-chunks:v1:"
+MANIFEST_KIND = "chunked-secret"
+INVALID_TYPED_MANIFESTS: tuple[dict[str, object], ...] = (
+    {"kind": MANIFEST_KIND, "chunks": 1},
+    {"kind": MANIFEST_KIND, "sha256": "a" * 64, "chunks": True},
+    {"kind": MANIFEST_KIND, "sha256": "invalid", "chunks": 1},
+)
 
 
 class LimitedKeyring:
@@ -85,6 +91,7 @@ async def test_long_pem_round_trips_through_limited_keyring(
     manifest = limited_keyring.entries[(SERVICE, "signing-key")]
     assert manifest.startswith(MANIFEST_PREFIX)
     assert " " not in manifest.removeprefix(MANIFEST_PREFIX)
+    assert json.loads(manifest.removeprefix(MANIFEST_PREFIX))["kind"] == MANIFEST_KIND
 
 
 @pytest.mark.asyncio
@@ -297,6 +304,37 @@ async def test_incomplete_or_invalid_manifest_like_legacy_value_is_read_raw(
     store = KeyringSecretStore(SERVICE)
 
     assert await store.get("credential") == value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("manifest", INVALID_TYPED_MANIFESTS)
+async def test_invalid_typed_manifest_get_fails_closed(
+    limited_keyring: LimitedKeyring,
+    manifest: dict[str, object],
+) -> None:
+    value = MANIFEST_PREFIX + json.dumps(manifest)
+    limited_keyring.entries[(SERVICE, "credential")] = value
+    store = KeyringSecretStore(SERVICE)
+
+    with pytest.raises(SecretStorageError, match="^credential storage is corrupted$"):
+        await store.get("credential")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("manifest", INVALID_TYPED_MANIFESTS)
+async def test_invalid_typed_manifest_delete_fails_closed_without_changes(
+    limited_keyring: LimitedKeyring,
+    manifest: dict[str, object],
+) -> None:
+    value = MANIFEST_PREFIX + json.dumps(manifest)
+    limited_keyring.entries[(SERVICE, "credential")] = value
+    original_entries = limited_keyring.entries.copy()
+    store = KeyringSecretStore(SERVICE)
+
+    with pytest.raises(SecretStorageError, match="^credential storage is corrupted$"):
+        await store.delete("credential")
+
+    assert limited_keyring.entries == original_entries
 
 
 @pytest.mark.asyncio
