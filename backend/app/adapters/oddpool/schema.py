@@ -49,6 +49,18 @@ class OddpoolOfficialVenue(BaseModel):
     yes_ask: Decimal | None = None
     no_ask: Decimal | None = None
 
+    @field_validator(
+        "market_ticker",
+        "condition_id",
+        "yes_token_id",
+        "no_token_id",
+    )
+    @classmethod
+    def normalize_optional_identifier(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
+
 
 class OddpoolArbitrageRow(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -66,6 +78,24 @@ class OddpoolArbitrageRow(BaseModel):
     buy_no_market: str
     gross_cents: Decimal
     fee_cents: Decimal
+
+    @field_validator("event_id")
+    @classmethod
+    def normalize_event_id(cls, value: int | str) -> int | str:
+        if isinstance(value, str):
+            normalized = value.strip()
+            if not normalized:
+                raise ValueError("event ID is missing")
+            return normalized
+        return value
+
+    @field_validator("outcome_key", "polymarket_event_slug")
+    @classmethod
+    def require_identifier(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("identifier is missing")
+        return normalized
 
     @field_validator("timestamp", "resolution_time")
     @classmethod

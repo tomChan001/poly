@@ -6,6 +6,7 @@ from typing import Protocol, cast
 import httpx
 
 from backend.app.adapters.kalshi.http_transport import KalshiHttpTransport
+from backend.app.adapters.oddpool.client import retry_delay_seconds
 from backend.app.adapters.polymarket.sdk_transport import PolymarketSdkTransport
 from backend.app.services.integration_config import (
     ODDPOOL_BASE_URL,
@@ -31,6 +32,7 @@ type PolymarketTransportFactory = Callable[
     [IntegrationConfigRecord, dict[str, str]],
     Awaitable[PolymarketReadOnlyTransport],
 ]
+type Sleeper = Callable[[float], Awaitable[None]]
 
 
 class HttpIntegrationConnectionProbe:
@@ -40,10 +42,14 @@ class HttpIntegrationConnectionProbe:
         *,
         kalshi_factory: AccountTransportFactory | None = None,
         polymarket_factory: PolymarketTransportFactory | None = None,
+        sleeper: Sleeper = asyncio.sleep,
+        max_attempts: int = 6,
     ) -> None:
         self._http = http_client
         self._kalshi_factory = kalshi_factory or self._create_kalshi_transport
         self._polymarket_factory = polymarket_factory or self._create_polymarket_transport
+        self._sleeper = sleeper
+        self._max_attempts = max_attempts
 
     async def test(
         self,
@@ -55,7 +61,7 @@ class HttpIntegrationConnectionProbe:
 
         url, headers, scope = self._request(record, secrets)
         try:
-            response = await self._http.get(url, headers=headers)
+            response = await self._get_with_retry(url, headers)
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             # Only the status is returned. Response bodies from authentication
@@ -79,6 +85,21 @@ class HttpIntegrationConnectionProbe:
             "ODDPOOL_CONNECTION_OK",
             f"{scope} succeeded",
         )
+
+    async def _get_with_retry(
+        self,
+        url: str,
+        headers: dict[str, str],
+    ) -> httpx.Response:
+        response: httpx.Response | None = None
+        for attempt in range(self._max_attempts):
+            response = await self._http.get(url, headers=headers)
+            if response.status_code != 429 or attempt == self._max_attempts - 1:
+                break
+            await self._sleeper(retry_delay_seconds(attempt))
+        if response is None:
+            raise ValueError("Oddpool max_attempts must be positive")
+        return response
 
     async def _test_authenticated_account(
         self,

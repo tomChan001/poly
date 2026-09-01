@@ -113,6 +113,39 @@ async def test_oddpool_client_isolates_bad_and_unsupported_rows() -> None:
     assert response.errors == ("row 1: invalid Oddpool arbitrage row",)
 
 
+@pytest.mark.parametrize(
+    "identifier_path",
+    [
+        "event_id",
+        "outcome_key",
+        "polymarket_event_slug",
+        "kalshi.market_ticker",
+        "polymarket.condition_id",
+        "polymarket.no_token_id",
+    ],
+)
+@pytest.mark.asyncio
+async def test_oddpool_client_rejects_blank_native_identifiers(
+    identifier_path: str,
+) -> None:
+    row = json.loads(json.dumps(load_official_fixture()[0]))
+    owner, separator, field = identifier_path.partition(".")
+    if separator:
+        row[owner][field] = "   "
+    else:
+        row[owner] = "   "
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json=[row])
+        )
+    ) as http_client:
+        response = await OddpoolClient("test-token", http_client).fetch_opportunities()
+
+    assert response.opportunities == []
+    assert response.errors == ("row 0: invalid Oddpool arbitrage row",)
+
+
 def test_candidate_id_does_not_change_with_buy_direction() -> None:
     row = load_official_fixture()[0]
     first = OddpoolArbitrageRow.model_validate(row).to_opportunity()

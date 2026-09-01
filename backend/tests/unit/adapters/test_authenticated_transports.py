@@ -498,6 +498,41 @@ async def test_oddpool_probe_uses_official_read_only_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_oddpool_probe_retries_rate_limits_with_bounded_delays() -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            return httpx.Response(429)
+        return httpx.Response(200, json=[])
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    record = IntegrationConfigRecord(
+        provider=IntegrationProvider.ODDPOOL,
+        enabled=True,
+        environment=IntegrationEnvironment.PRODUCTION,
+        base_url="https://api.oddpool.com",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await HttpIntegrationConnectionProbe(
+            client,
+            sleeper=record_sleep,
+        ).test(record, {"api_token": "oddpool-key"})
+
+    assert attempts == 3
+    assert delays == [1, 2]
+    assert result.ok is True
+    assert result.code == "ODDPOOL_CONNECTION_OK"
+
+
+@pytest.mark.asyncio
 async def test_connection_probe_uses_authenticated_account_transports() -> None:
     observed: list[tuple[str, dict[str, str]]] = []
 
