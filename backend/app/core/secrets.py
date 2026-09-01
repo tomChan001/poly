@@ -1,15 +1,19 @@
 import asyncio
 import hashlib
 import json
+import logging
 import string
 from typing import Protocol
 
 _CHUNK_SIZE = 900
 _MAX_CHUNKS = 10_000
 _MANIFEST_PREFIX = "poly-keyring-chunks:v1:"
+_PLAIN_ENVELOPE_PREFIX = "poly-keyring-plain:v1:"
 _CORRUPTED_MESSAGE = "credential storage is corrupted"
+_CLEANUP_WARNING_MESSAGE = "credential storage cleanup failed"
 _OPERATION_ERROR_MESSAGE = "credential storage operation failed"
 _ROLLBACK_ERROR_MESSAGE = "credential storage rollback failed"
+_LOGGER = logging.getLogger(__name__)
 
 
 class SecretStorageError(RuntimeError):
@@ -50,6 +54,13 @@ class KeyringSecretStore:
         value = await self._get_password(key)
         if value is None:
             return None
+        if value.startswith(
+            (
+                _PLAIN_ENVELOPE_PREFIX + _MANIFEST_PREFIX,
+                _PLAIN_ENVELOPE_PREFIX + _PLAIN_ENVELOPE_PREFIX,
+            )
+        ):
+            return value.removeprefix(_PLAIN_ENVELOPE_PREFIX)
         manifest = _parse_manifest(value)
         if manifest is None:
             return value
@@ -71,9 +82,12 @@ class KeyringSecretStore:
         old_value = await self._get_password(key)
         old_manifest = _parse_manifest(old_value) if old_value is not None else None
         if len(value) <= _CHUNK_SIZE:
-            await self._set_password(key, value)
+            stored_value = value
+            if value.startswith((_MANIFEST_PREFIX, _PLAIN_ENVELOPE_PREFIX)):
+                stored_value = _PLAIN_ENVELOPE_PREFIX + value
+            await self._set_password(key, stored_value)
             if old_manifest is not None:
-                await self._delete_manifest_chunks(key, old_manifest)
+                await self._cleanup_manifest_chunks(key, old_manifest)
             return
 
         chunk_count = (len(value) + _CHUNK_SIZE - 1) // _CHUNK_SIZE
@@ -101,7 +115,7 @@ class KeyringSecretStore:
             raise
 
         if old_manifest is not None and old_manifest[0] != digest:
-            await self._delete_manifest_chunks(key, old_manifest)
+            await self._cleanup_manifest_chunks(key, old_manifest)
 
     async def delete(self, key: str) -> None:
         value = await self._get_password(key)
@@ -163,6 +177,19 @@ class KeyringSecretStore:
             [_chunk_key(key, digest, index) for index in range(chunk_count)]
         )
 
+    async def _cleanup_manifest_chunks(
+        self,
+        key: str,
+        manifest: tuple[str, int],
+    ) -> None:
+        for _attempt in range(2):
+            try:
+                await self._delete_manifest_chunks(key, manifest)
+            except SecretStorageError:
+                continue
+            return
+        _LOGGER.warning(_CLEANUP_WARNING_MESSAGE)
+
     async def _delete_keys(
         self,
         keys: list[str],
@@ -196,9 +223,11 @@ def _parse_manifest(value: str) -> tuple[str, int] | None:
     try:
         parsed = json.loads(value.removeprefix(_MANIFEST_PREFIX))
     except (json.JSONDecodeError, TypeError):
-        raise SecretStorageError(_CORRUPTED_MESSAGE) from None
+        return None
     if not isinstance(parsed, dict):
-        raise SecretStorageError(_CORRUPTED_MESSAGE)
+        return None
+    if "sha256" not in parsed and "chunks" not in parsed:
+        return None
 
     digest = parsed.get("sha256")
     chunks = parsed.get("chunks")

@@ -1,4 +1,5 @@
 import json
+import logging
 from collections.abc import Callable
 
 import keyring
@@ -99,6 +100,55 @@ async def test_short_value_remains_in_one_legacy_entry(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value",
+    [
+        "poly-keyring-chunks:v1:not-json",
+        'poly-keyring-chunks:v1:{"purpose":"literal credential value"}',
+    ],
+)
+async def test_manifest_prefix_short_values_round_trip_unambiguously(
+    limited_keyring: LimitedKeyring,
+    value: str,
+) -> None:
+    store = KeyringSecretStore(SERVICE)
+
+    await store.set("credential", value)
+
+    assert limited_keyring.entries[(SERVICE, "credential")] != value
+    assert await store.get("credential") == value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value",
+    [
+        "poly-keyring-chunks:v1:not-json",
+        'poly-keyring-chunks:v1:{"purpose":"legacy literal"}',
+    ],
+)
+async def test_legacy_manifest_prefix_literals_are_read_raw(
+    limited_keyring: LimitedKeyring,
+    value: str,
+) -> None:
+    limited_keyring.entries[(SERVICE, "credential")] = value
+    store = KeyringSecretStore(SERVICE)
+
+    assert await store.get("credential") == value
+
+
+@pytest.mark.asyncio
+async def test_legacy_plain_envelope_prefix_literal_is_read_raw(
+    limited_keyring: LimitedKeyring,
+) -> None:
+    value = "poly-keyring-plain:v1:legacy literal"
+    limited_keyring.entries[(SERVICE, "credential")] = value
+    store = KeyringSecretStore(SERVICE)
+
+    assert await store.get("credential") == value
+
+
+@pytest.mark.asyncio
 async def test_replacing_long_value_removes_old_chunks(
     limited_keyring: LimitedKeyring,
 ) -> None:
@@ -122,6 +172,34 @@ async def test_replacing_long_value_with_short_removes_old_chunks(
     await store.set("credential", "replacement")
 
     assert limited_keyring.entries == {(SERVICE, "credential"): "replacement"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", ["B" * 1900, "replacement"])
+async def test_committed_replacement_does_not_fail_when_old_chunk_cleanup_fails(
+    limited_keyring: LimitedKeyring,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    replacement: str,
+) -> None:
+    store = KeyringSecretStore(SERVICE)
+    await store.set("credential", "A" * 1900)
+    old_chunk_keys = _chunk_keys(limited_keyring, "credential")
+    bottom_message = "backend failed deleting private old credential"
+
+    def fail_old_chunk_delete(service: str, key: str) -> None:
+        if service == SERVICE and key in old_chunk_keys:
+            raise RuntimeError(bottom_message)
+        limited_keyring.delete_password(service, key)
+
+    monkeypatch.setattr(keyring, "delete_password", fail_old_chunk_delete)
+
+    with caplog.at_level(logging.WARNING):
+        await store.set("credential", replacement)
+
+    assert await store.get("credential") == replacement
+    assert "credential storage cleanup failed" in caplog.text
+    assert bottom_message not in caplog.text
 
 
 @pytest.mark.asyncio
