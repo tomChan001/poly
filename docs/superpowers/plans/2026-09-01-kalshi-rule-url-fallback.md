@@ -1,10 +1,10 @@
-# Kalshi Rule URL Fallback Implementation Plan
+# Kalshi Market Metadata Compatibility Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Allow Oddpool candidates with complete Kalshi rule text to pass native metadata normalization when Kalshi omits `rules_url`, without weakening rule validation or trading safety gates.
+**Goal:** Allow Oddpool candidates with complete Kalshi rule text to pass native metadata normalization when current Kalshi responses omit `rules_url`, `tick_size`, and `minimum_order_size`, without weakening rule validation or trading safety gates.
 
-**Architecture:** Keep the compatibility rule inside the Kalshi adapter boundary. Normalize ticker and primary rule text as required non-empty strings, preserve a non-empty API-provided rule URL, and otherwise derive a display-only Kalshi market URL from the ticker. The pair resolver, native identifier checks, review workflow, and execution gates remain unchanged.
+**Architecture:** Keep all response-shape compatibility inside the Kalshi adapter boundary. Normalize ticker and primary rule text as required non-empty strings, derive a display-only URL when needed, prefer the legacy tick when present, otherwise validate `price_ranges` and store its minimum positive step, and use one whole contract when the current response omits a minimum order size. The pair resolver, native identifier checks, review workflow, whole-contract policy, and execution gates remain unchanged.
 
 **Tech Stack:** Python 3.12, pytest, Pydantic domain models, httpx integration fixtures, Ruff, Mypy.
 
@@ -12,8 +12,8 @@
 
 ## File map
 
-- Modify `backend/app/adapters/kalshi/markets.py`: validate required Kalshi text fields and derive the display URL when `rules_url` is absent.
-- Modify `backend/tests/unit/adapters/test_market_metadata.py`: reproduce the missing-field failure and cover fallback, precedence, and fail-closed rule text behavior.
+- Modify `backend/app/adapters/kalshi/markets.py`: validate required Kalshi text fields, derive a display URL, normalize legacy/current tick metadata, and apply the whole-contract minimum.
+- Modify `backend/tests/unit/adapters/test_market_metadata.py`: cover link fallback, legacy/current field precedence, valid price ranges, invalid ranges, and fail-closed rule behavior.
 - Verify `backend/tests/unit/adapters/test_pair_metadata_resolver.py`: ensure native metadata resolution still uses Kalshi rules and identifier checks.
 - Verify `backend/tests/integration/services/test_pair_discovery.py`: ensure candidate isolation and review-draft creation remain intact.
 
@@ -144,7 +144,171 @@ git add backend/app/adapters/kalshi/markets.py backend/tests/unit/adapters/test_
 git commit -m "fix: tolerate missing Kalshi rule URLs"
 ```
 
-### Task 2: Verify the real candidate path and safety gates
+### Task 2: Normalize Kalshi fixed-point tick and quantity metadata
+
+**Files:**
+- Modify: `backend/app/adapters/kalshi/markets.py`
+- Test: `backend/tests/unit/adapters/test_market_metadata.py`
+- Test: `backend/tests/unit/adapters/test_pair_metadata_resolver.py`
+
+- [ ] **Step 1: Add a current-response regression test**
+
+Add a payload that matches the verified live Kalshi shape: no `tick_size`, no `minimum_order_size`, and one `price_ranges` entry.
+
+```python
+def test_kalshi_market_uses_current_price_ranges_and_whole_contract_default() -> None:
+    market = normalize_kalshi_market(
+        {
+            "ticker": "KXBOXING-26SEP19FMAYMPAC-FMAY",
+            "title": "Will Floyd Mayweather beat Manny Pacquiao?",
+            "status": "open",
+            "rules_primary": "Resolves yes if Floyd Mayweather wins the bout.",
+            "price_level_structure": "linear_cent",
+            "price_ranges": [
+                {"start": "0.0000", "end": "1.0000", "step": "0.0100"}
+            ],
+        }
+    )
+
+    assert market.minimum_tick == Decimal("0.0100")
+    assert market.minimum_quantity == Decimal(1)
+```
+
+- [ ] **Step 2: Run the current-response test and verify RED**
+
+Run:
+
+```powershell
+uv run pytest backend/tests/unit/adapters/test_market_metadata.py::test_kalshi_market_uses_current_price_ranges_and_whole_contract_default -q
+```
+
+Expected: FAIL with `KeyError: 'tick_size'`, reproducing the second live failure discovered after the URL fix.
+
+- [ ] **Step 3: Add range, precedence, and quantity edge tests**
+
+Add a tapered-range test and assert the minimum positive step is selected:
+
+```python
+def test_kalshi_market_uses_smallest_valid_price_range_step() -> None:
+    payload = current_kalshi_payload()
+    payload["price_ranges"] = [
+        {"start": "0.0000", "end": "0.1000", "step": "0.0010"},
+        {"start": "0.1000", "end": "0.9000", "step": "0.0100"},
+        {"start": "0.9000", "end": "1.0000", "step": "0.0010"},
+    ]
+
+    assert normalize_kalshi_market(payload).minimum_tick == Decimal("0.0010")
+```
+
+Keep the existing legacy fixture and add a malformed `price_ranges` value to it, proving a valid legacy `tick_size` has precedence. Assert the legacy `minimum_order_size` is also preserved.
+
+Add parametrized invalid current ranges:
+
+```python
+@pytest.mark.parametrize(
+    "price_ranges",
+    [
+        [],
+        [{"start": "0", "end": "1", "step": "0"}],
+        [{"start": "0.8", "end": "0.2", "step": "0.01"}],
+        [{"start": "-0.1", "end": "1", "step": "0.01"}],
+        [{"start": "0", "end": "1.1", "step": "0.01"}],
+        [{"start": "0", "end": "0.1", "step": "0.2"}],
+        [{"start": "bad", "end": "1", "step": "0.01"}],
+    ],
+)
+def test_kalshi_market_rejects_invalid_price_ranges(
+    price_ranges: object,
+) -> None:
+    payload = current_kalshi_payload()
+    payload["price_ranges"] = price_ranges
+
+    with pytest.raises((TypeError, ValueError)):
+        normalize_kalshi_market(payload)
+```
+
+Add a separate parametrized test for present-but-invalid legacy `minimum_order_size` values `0`, `-1`, and `"bad"`; all must raise instead of silently using the default. Extract `current_kalshi_payload()` as a test-only fixture function returning a fresh dictionary.
+
+- [ ] **Step 4: Implement strict legacy/current metadata parsing**
+
+Change the `MarketMetadata` construction to use two private helpers:
+
+```python
+minimum_tick=_minimum_tick(payload),
+minimum_quantity=_minimum_quantity(payload),
+```
+
+Implement:
+
+```python
+def _minimum_tick(payload: dict[str, Any]) -> Decimal:
+    legacy_tick = payload.get("tick_size")
+    if legacy_tick is not None:
+        tick = parse_price(legacy_tick)
+        if tick <= 0:
+            raise ValueError("Kalshi tick_size must be positive")
+        return tick
+
+    ranges = payload.get("price_ranges")
+    if not isinstance(ranges, list) or not ranges:
+        raise TypeError("Kalshi price_ranges must be a non-empty list")
+    steps: list[Decimal] = []
+    for price_range in ranges:
+        if not isinstance(price_range, dict):
+            raise TypeError("Kalshi price_ranges entries must be objects")
+        start = parse_price(price_range.get("start"))
+        end = parse_price(price_range.get("end"))
+        step = parse_price(price_range.get("step"))
+        if start >= end:
+            raise ValueError("Kalshi price range start must be below end")
+        if step <= 0 or step > end - start:
+            raise ValueError("Kalshi price range step is invalid")
+        steps.append(step)
+    return min(steps)
+
+
+def _minimum_quantity(payload: dict[str, Any]) -> Decimal:
+    raw_value = payload.get("minimum_order_size")
+    if raw_value is None:
+        return Decimal(1)
+    value = parse_decimal(raw_value)
+    if value <= 0:
+        raise ValueError("Kalshi minimum_order_size must be positive")
+    return value
+```
+
+Import `Decimal`. Do not infer fractional execution from `*_fp` market fields and do not change `NativePairMetadataResolver.quantity_step`.
+
+- [ ] **Step 5: Update the resolver current-response regression**
+
+In the existing resolver regression added for missing `rules_url`, replace the legacy `tick_size` and `minimum_order_size` with the live `price_level_structure` and `price_ranges` fields. Keep `OddpoolLeg.market_url=None`. Assert:
+
+```python
+assert pair.kalshi_minimum_tick == Decimal("0.01")
+assert pair.minimum_quantity >= Decimal(1)
+assert pair.quantity_step == Decimal(1)
+```
+
+- [ ] **Step 6: Run focused checks and verify GREEN**
+
+Run:
+
+```powershell
+uv run pytest backend/tests/unit/adapters/test_market_metadata.py backend/tests/unit/adapters/test_pair_metadata_resolver.py backend/tests/integration/services/test_pair_discovery.py -q
+uv run ruff check backend/app/adapters/kalshi/markets.py backend/tests/unit/adapters/test_market_metadata.py backend/tests/unit/adapters/test_pair_metadata_resolver.py
+uv run mypy backend/app/adapters/kalshi/markets.py backend/app/adapters/pair_metadata.py backend/tests/unit/adapters/test_market_metadata.py backend/tests/unit/adapters/test_pair_metadata_resolver.py
+```
+
+Expected: all tests pass, Ruff reports `All checks passed!`, and Mypy reports no issues.
+
+- [ ] **Step 7: Commit the fixed-point compatibility change**
+
+```powershell
+git add backend/app/adapters/kalshi/markets.py backend/tests/unit/adapters/test_market_metadata.py backend/tests/unit/adapters/test_pair_metadata_resolver.py
+git commit -m "fix: support current Kalshi market increments"
+```
+
+### Task 3: Verify the real candidate path and safety gates
 
 **Files:**
 - Verify only; no additional production changes expected.
@@ -165,7 +329,7 @@ Expected: the backend suite passes with only the existing destructive-database s
 
 Use the saved Oddpool Key through `KeyringSecretStore`, fetch current candidates read-only, and resolve at least one previously failing candidate through `NativePairMetadataResolver`. Print only candidate ID and success/error type; never print credentials or full upstream response bodies.
 
-Expected: the candidate no longer fails with `'rules_url'`. Other genuine identifier, settlement, or Polymarket metadata errors remain isolated.
+Expected: the candidate no longer fails with `'rules_url'`, `'tick_size'`, or `'minimum_order_size'`. Other genuine identifier, settlement, or Polymarket metadata errors remain isolated.
 
 - [ ] **Step 3: Restart the local backend and verify runtime status**
 
@@ -176,7 +340,7 @@ Invoke-RestMethod http://127.0.0.1:8010/health
 Invoke-RestMethod http://127.0.0.1:8010/api/runtime/status
 ```
 
-Expected: health is `ok`, trading mode remains `read_only`, opening remains disabled, and the runtime error no longer lists `'rules_url'` candidate failures.
+Expected: health is `ok`, trading mode remains `read_only`, opening remains disabled, and the runtime error no longer lists `'rules_url'`, `'tick_size'`, or `'minimum_order_size'` candidate failures.
 
 - [ ] **Step 4: Confirm repository state**
 
