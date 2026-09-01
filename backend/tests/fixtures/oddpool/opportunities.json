@@ -12,12 +12,14 @@
         {
           "venue": "kalshi",
           "outcome": "no",
+          "market_ref": "example",
           "market_url": "https://kalshi.com/markets/example",
           "display_price": "0.76"
         },
         {
           "venue": "polymarket",
           "outcome": "yes",
+          "market_ref": "example",
           "market_url": "https://polymarket.com/event/example",
           "display_price": "0.11"
         }

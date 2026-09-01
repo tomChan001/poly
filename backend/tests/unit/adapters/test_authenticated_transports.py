@@ -472,6 +472,32 @@ async def test_polymarket_transport_from_credentials_uses_full_v2_l2_triplet(
 
 
 @pytest.mark.asyncio
+async def test_oddpool_probe_uses_official_read_only_request() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == httpx.URL("https://api.oddpool.com/arbitrage/current")
+        assert request.headers["x-api-key"] == "oddpool-key"
+        assert "authorization" not in request.headers
+        return httpx.Response(200, json=[])
+
+    record = IntegrationConfigRecord(
+        provider=IntegrationProvider.ODDPOOL,
+        enabled=True,
+        environment=IntegrationEnvironment.PRODUCTION,
+        base_url="https://api.oddpool.com",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await HttpIntegrationConnectionProbe(client).test(
+            record,
+            {"api_token": "oddpool-key"},
+        )
+
+    assert result.ok is True
+    assert result.code == "ODDPOOL_CONNECTION_OK"
+
+
+@pytest.mark.asyncio
 async def test_connection_probe_uses_authenticated_account_transports() -> None:
     observed: list[tuple[str, dict[str, str]]] = []
 

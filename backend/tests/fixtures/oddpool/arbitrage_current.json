@@ -1,0 +1,30 @@
+[
+  {
+    "event_id": 42,
+    "event_title": "Fed rate decision March",
+    "kalshi_event_ticker": "KXFEDDECISION-26MAR",
+    "polymarket_event_slug": "fed-rate-march",
+    "market_type": "binary",
+    "outcome_key": "c25",
+    "label": "25bps cut",
+    "timestamp": "2026-03-11T14:30:00",
+    "resolution_time": "2026-03-19T18:00:00",
+    "kalshi": {
+      "market_ticker": "KXFEDDECISION-26MAR-C25",
+      "yes_ask": 0.32,
+      "no_ask": 0.69
+    },
+    "polymarket": {
+      "condition_id": "0xde04",
+      "yes_token_id": "token-yes",
+      "no_token_id": "token-no",
+      "yes_ask": 0.39,
+      "no_ask": 0.60
+    },
+    "buy_yes_market": "kalshi",
+    "buy_no_market": "polymarket",
+    "gross_cents": 8.0,
+    "fee_cents": 3,
+    "net_cents": 5.0
+  }
+]

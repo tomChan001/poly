@@ -2,13 +2,13 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from decimal import Decimal
 from typing import Protocol, cast
-from urllib.parse import urljoin
 
 import httpx
 
 from backend.app.adapters.kalshi.http_transport import KalshiHttpTransport
 from backend.app.adapters.polymarket.sdk_transport import PolymarketSdkTransport
 from backend.app.services.integration_config import (
+    ODDPOOL_BASE_URL,
     ConnectionTestResult,
     IntegrationConfigRecord,
     IntegrationProvider,
@@ -172,11 +172,10 @@ class HttpIntegrationConnectionProbe:
         record: IntegrationConfigRecord,
         secrets: dict[str, str],
     ) -> tuple[str, dict[str, str], str]:
-        base_url = f"{record.base_url.rstrip('/')}/"
         if record.provider is IntegrationProvider.ODDPOOL:
             return (
-                urljoin(base_url, "api/opportunities"),
-                {"Authorization": f"Bearer {secrets['api_token']}"},
+                f"{ODDPOOL_BASE_URL}/arbitrage/current",
+                {"X-API-Key": secrets["api_token"]},
                 "authenticated Oddpool request",
             )
         raise ValueError("public probe is only available for Oddpool")
