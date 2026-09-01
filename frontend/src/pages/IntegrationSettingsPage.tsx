@@ -288,6 +288,26 @@ export function IntegrationSettingsPage() {
                     <option value="production">Production</option>
                   </select>
                 </label>
+                {definition.provider === 'kalshi' && (
+                  <div className="field-wide integration-help">
+                    <p>
+                      登录 Kalshi，进入 <strong>Account &amp; security → API Keys</strong>，
+                      点击 <strong>Create Key</strong>。
+                    </p>
+                    <p>
+                      API Key ID 填入 Key ID；下载的 .key 文件完整内容填入 RSA 私钥。
+                      请粘贴包含 BEGIN/END PRIVATE KEY 的完整 PEM，不要填写文件路径。
+                    </p>
+                    <p>私钥只显示和下载一次，关闭页面前请安全保存。</p>
+                    <a
+                      href="https://docs.kalshi.com/getting_started/api_keys"
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Kalshi 官方 API Key 获取说明
+                    </a>
+                  </div>
+                )}
                 {definition.provider === 'polymarket' && (
                   <>
                     <div className="field-wide">

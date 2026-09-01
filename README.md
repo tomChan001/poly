@@ -39,6 +39,18 @@ npm run dev
 配置。密码框始终为空；已保存凭证仅显示 SHA-256 指纹和配置状态。API、execution worker
 以及其他需要读取凭证的进程必须使用同一个受控操作系统服务账户运行，否则它们无法访问同一凭证库。
 
+### Kalshi API 凭证
+
+1. 登录与当前环境匹配的 Kalshi 生产或 Demo 账户。
+2. 进入 `Account & security → API Keys`，点击 `Create Key`。
+3. 将页面显示的 API Key ID 填入本项目的 `Key ID`。
+4. 打开下载的 `.key` 文件，将包含 `-----BEGIN PRIVATE KEY-----` 和
+   `-----END PRIVATE KEY-----` 的完整 PEM 内容粘贴到 `RSA 私钥`。不要填写文件名或路径。
+
+私钥只显示和下载一次，Kalshi 不会保留可供再次下载的副本。Key ID 不是文件名、登录密码或私钥内容。创建替代密钥时，必须同时更新新 Key ID 和对应的新私钥。详见 [Kalshi 官方 API Key 文档](https://docs.kalshi.com/getting_started/api_keys)。
+
+如果连接测试返回 401，检查 Key ID 与私钥是否来自同一次创建、生产/Demo 环境是否匹配，以及 PEM 头尾是否完整。
+
 ### Polymarket Google / 邮箱账户
 
 Google 或邮箱创建的 Polymarket 账户选择 `Google / Magic Proxy`。应用不会收集 Google 密码、OAuth token 或浏览器 cookie；请按 [Polymarket 官方说明](https://help.polymarket.com/en/articles/13364258-how-do-i-export-my-key) 导出 Magic signer 私钥。保存时后端会从私钥推导 owner，通过官方公开 profile 查询核对 proxy/funder，并固定使用 `signature_type=1`。

@@ -45,6 +45,15 @@ test('opens the integration menu with write-only credential inputs', async () =>
     'https://api.elections.kalshi.com',
   )
   expect(screen.getByLabelText('Kalshi 环境')).toHaveValue('production')
+  expect(
+    screen.getByRole('link', { name: 'Kalshi 官方 API Key 获取说明' }),
+  ).toHaveAttribute('href', 'https://docs.kalshi.com/getting_started/api_keys')
+  expect(screen.getByText(/Account & security → API Keys/)).toBeInTheDocument()
+  expect(screen.getByText(/私钥只显示和下载一次/)).toBeInTheDocument()
+  expect(
+    screen.getByText(/API Key ID 填入 Key ID；下载的 .key 文件完整内容填入 RSA 私钥/),
+  ).toBeInTheDocument()
+  expect(screen.getByLabelText('RSA 私钥')).toHaveAttribute('type', 'password')
   expect(screen.getByLabelText('Polymarket 账户类型')).toHaveValue('magic_proxy')
   expect(screen.getByText('Google / Magic 登录不需要密码，也不会在这里收集密码。')).toBeInTheDocument()
   expect(
