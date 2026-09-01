@@ -192,6 +192,85 @@ async def test_resolver_derives_kalshi_rule_url_when_native_api_omits_it() -> No
 
 
 @pytest.mark.asyncio
+async def test_resolver_preserves_native_kalshi_rule_url_over_oddpool_link() -> None:
+    native_rule_url = "https://kalshi.com/rules/custom"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "kalshi.test":
+            return httpx.Response(
+                200,
+                json={
+                    "market": {
+                        "ticker": "K-EVENT",
+                        "title": "Will the event happen?",
+                        "status": "open",
+                        "rules_primary": "Kalshi native rule",
+                        "rules_url": native_rule_url,
+                        "price_level_structure": "linear_cent",
+                        "price_ranges": [
+                            {
+                                "start": "0.0000",
+                                "end": "1.0000",
+                                "step": "0.0100",
+                            }
+                        ],
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "question": "Will the event happen?",
+                    "description": "Polymarket native rule",
+                    "conditionId": "0xcondition",
+                    "outcomes": '["Yes", "No"]',
+                    "clobTokenIds": '["token-yes", "token-no"]',
+                    "orderMinSize": "1",
+                    "orderPriceMinTickSize": "0.01",
+                    "active": True,
+                }
+            ],
+        )
+
+    opportunity = OddpoolOpportunity.model_validate(
+        {
+            "id": "oddpool-native-kalshi-rule-url",
+            "title": "Will the event happen?",
+            "outcome": "complementary",
+            "updated_at": "2026-09-01T00:00:00Z",
+            "gross_spread": "0.08",
+            "estimated_fees": "0.03",
+            "legs": [
+                {
+                    "venue": "kalshi",
+                    "outcome": "no",
+                    "market_ref": "K-EVENT",
+                    "market_url": "https://third-party.example/old-kalshi-link",
+                    "display_price": "0.69",
+                },
+                {
+                    "venue": "polymarket",
+                    "outcome": "yes",
+                    "market_ref": "event-slug",
+                    "market_url": "https://polymarket.com/event/event-slug",
+                    "display_price": "0.32",
+                },
+            ],
+        }
+    )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        pair = await NativePairMetadataResolver(
+            kalshi_base_url="https://kalshi.test",
+            polymarket_gamma_url="https://gamma.test",
+            http_client=http,
+        ).resolve(opportunity)
+
+    assert pair.kalshi_rule_url == native_rule_url
+
+
+@pytest.mark.asyncio
 async def test_resolver_falls_back_from_market_slug_to_event_slug() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "kalshi.test":

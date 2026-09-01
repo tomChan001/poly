@@ -104,9 +104,7 @@ class NativePairMetadataResolver:
             kalshi_market_id=kalshi.external_id,
             kalshi_outcome=_outcome(kalshi_leg),
             kalshi_rule_text=kalshi.rule_text,
-            kalshi_rule_url=(
-                kalshi_leg.market_url or f"https://kalshi.com/markets/{ticker}"
-            ),
+            kalshi_rule_url=kalshi.rule_url,
             polymarket_market_id=token_id,
             polymarket_outcome=_outcome(polymarket_leg),
             polymarket_rule_text=polymarket_rule,
