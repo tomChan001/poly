@@ -51,12 +51,9 @@ class KeyringSecretStore:
         self._service_name = service_name
 
     async def get(self, key: str) -> str | None:
-        value = await self._get_password(key)
-        if value is None:
-            return None
-        manifest = _parse_manifest(value)
+        manifest = await self._get_manifest(key)
         if manifest is None:
-            return value
+            return await self._get_password(key)
 
         digest, chunk_count = manifest
         chunks: list[str] = []
@@ -72,11 +69,16 @@ class KeyringSecretStore:
         return result
 
     async def set(self, key: str, value: str) -> None:
-        old_value = await self._get_password(key)
-        old_manifest = _parse_manifest(old_value) if old_value is not None else None
+        old_manifest = await self._get_manifest(key)
         if len(value) <= _CHUNK_SIZE:
+            old_base_value = await self._get_password(key)
             await self._set_password(key, value)
             if old_manifest is not None:
+                try:
+                    await self._delete_keys([_manifest_key(key)])
+                except SecretStorageError:
+                    await self._restore_base_value(key, old_base_value)
+                    raise
                 await self._cleanup_manifest_chunks(key, old_manifest)
             return
 
@@ -102,24 +104,34 @@ class KeyringSecretStore:
                 },
                 separators=(",", ":"),
             )
-            await self._set_password(key, manifest)
+            await self._set_password(_manifest_key(key), manifest)
         except SecretStorageError:
             if old_manifest is None or old_manifest[0] != digest:
                 await self._rollback_keys(written_chunk_keys)
             raise
 
+        await self._cleanup_keys([key])
         if old_manifest is not None and old_manifest[0] != digest:
             await self._cleanup_manifest_chunks(key, old_manifest)
 
     async def delete(self, key: str) -> None:
-        value = await self._get_password(key)
-        manifest = _parse_manifest(value) if value is not None else None
-        if manifest is not None:
-            digest, chunk_count = manifest
-            await self._delete_keys(
-                [_chunk_key(key, digest, index) for index in range(chunk_count)]
-            )
+        manifest = await self._get_manifest(key)
+        if manifest is None:
+            await self._delete_keys([key])
+            return
+
         await self._delete_keys([key])
+        await self._delete_keys([_manifest_key(key)])
+        await self._delete_manifest_chunks_after_delete(key, manifest)
+
+    async def _get_manifest(self, key: str) -> tuple[str, int] | None:
+        value = await self._get_password(_manifest_key(key))
+        if value is None:
+            return None
+        manifest = _parse_manifest(value)
+        if manifest is None:
+            raise SecretStorageError(_CORRUPTED_MESSAGE)
+        return manifest
 
     async def _get_password(self, key: str) -> str | None:
         import keyring
@@ -180,6 +192,28 @@ class KeyringSecretStore:
             return
         _LOGGER.warning(_CLEANUP_WARNING_MESSAGE)
 
+    async def _delete_manifest_chunks_after_delete(
+        self,
+        key: str,
+        manifest: tuple[str, int],
+    ) -> None:
+        for _attempt in range(2):
+            try:
+                await self._delete_manifest_chunks(key, manifest)
+            except SecretStorageError:
+                continue
+            return
+        raise SecretStorageError(_CLEANUP_WARNING_MESSAGE)
+
+    async def _cleanup_keys(self, keys: list[str]) -> None:
+        for _attempt in range(2):
+            try:
+                await self._delete_keys(keys)
+            except SecretStorageError:
+                continue
+            return
+        _LOGGER.warning(_CLEANUP_WARNING_MESSAGE)
+
     async def _delete_keys(
         self,
         keys: list[str],
@@ -202,9 +236,22 @@ class KeyringSecretStore:
             return
         raise SecretStorageError(_ROLLBACK_ERROR_MESSAGE) from None
 
+    async def _restore_base_value(self, key: str, value: str | None) -> None:
+        if value is None:
+            await self._rollback_keys([key])
+            return
+        try:
+            await self._set_password(key, value)
+        except SecretStorageError:
+            raise SecretStorageError(_ROLLBACK_ERROR_MESSAGE) from None
+
 
 def _chunk_key(key: str, digest: str, index: int) -> str:
     return f"{key}:chunk:{digest}:{index}"
+
+
+def _manifest_key(key: str) -> str:
+    return f"{key}:manifest:v1"
 
 
 def _parse_manifest(value: str) -> tuple[str, int] | None:

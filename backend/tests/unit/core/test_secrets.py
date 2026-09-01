@@ -88,7 +88,8 @@ async def test_long_pem_round_trips_through_limited_keyring(
     ]
     assert chunk_values
     assert all(0 < len(chunk) <= 900 for chunk in chunk_values)
-    manifest = limited_keyring.entries[(SERVICE, "signing-key")]
+    assert (SERVICE, "signing-key") not in limited_keyring.entries
+    manifest = limited_keyring.entries[(SERVICE, _manifest_key("signing-key"))]
     assert manifest.startswith(MANIFEST_PREFIX)
     assert " " not in manifest.removeprefix(MANIFEST_PREFIX)
     assert json.loads(manifest.removeprefix(MANIFEST_PREFIX))["kind"] == MANIFEST_KIND
@@ -104,6 +105,22 @@ async def test_short_value_remains_in_one_legacy_entry(
 
     assert limited_keyring.entries == {(SERVICE, "api-token"): "short-secret"}
     assert await store.get("api-token") == "short-secret"
+
+
+@pytest.mark.asyncio
+async def test_valid_typed_manifest_literal_stays_verbatim_in_base_key(
+    limited_keyring: LimitedKeyring,
+) -> None:
+    value = MANIFEST_PREFIX + json.dumps(
+        {"kind": MANIFEST_KIND, "sha256": "a" * 64, "chunks": 1},
+        separators=(",", ":"),
+    )
+    store = KeyringSecretStore(SERVICE)
+
+    await store.set("credential", value)
+
+    assert limited_keyring.entries == {(SERVICE, "credential"): value}
+    assert await store.get("credential") == value
 
 
 @pytest.mark.asyncio
@@ -184,6 +201,60 @@ async def test_replacing_long_value_with_short_removes_old_chunks(
 
 
 @pytest.mark.asyncio
+async def test_replacing_short_value_with_long_commits_sidecar_and_removes_base(
+    limited_keyring: LimitedKeyring,
+) -> None:
+    store = KeyringSecretStore(SERVICE)
+    await store.set("credential", "short-value")
+
+    await store.set("credential", "A" * 1900)
+
+    assert (SERVICE, "credential") not in limited_keyring.entries
+    assert (SERVICE, _manifest_key("credential")) in limited_keyring.entries
+    assert await store.get("credential") == "A" * 1900
+
+
+@pytest.mark.asyncio
+async def test_short_to_long_sidecar_write_failure_preserves_short_value(
+    limited_keyring: LimitedKeyring,
+) -> None:
+    store = KeyringSecretStore(SERVICE)
+    await store.set("credential", "short-value")
+    original_entries = limited_keyring.entries.copy()
+    limited_keyring.fail_on_set_call = limited_keyring.set_calls + 4
+
+    with pytest.raises(SecretStorageError):
+        await store.set("credential", "A" * 1900)
+
+    assert await store.get("credential") == "short-value"
+    assert limited_keyring.entries == original_entries
+
+
+@pytest.mark.asyncio
+async def test_long_to_short_sidecar_delete_failure_preserves_long_value(
+    limited_keyring: LimitedKeyring,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = KeyringSecretStore(SERVICE)
+    old_value = "A" * 1900
+    await store.set("credential", old_value)
+    original_entries = limited_keyring.entries.copy()
+
+    def fail_sidecar_delete(service: str, key: str) -> None:
+        if service == SERVICE and key == _manifest_key("credential"):
+            raise RuntimeError("private sidecar delete failure")
+        limited_keyring.delete_password(service, key)
+
+    monkeypatch.setattr(keyring, "delete_password", fail_sidecar_delete)
+
+    with pytest.raises(SecretStorageError):
+        await store.set("credential", "replacement")
+
+    assert await store.get("credential") == old_value
+    assert limited_keyring.entries == original_entries
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("replacement", ["B" * 1900, "replacement"])
 async def test_committed_replacement_does_not_fail_when_old_chunk_cleanup_fails(
     limited_keyring: LimitedKeyring,
@@ -243,11 +314,86 @@ async def test_delete_can_retry_after_transient_chunk_delete_failure(
 
     monkeypatch.setattr(keyring, "delete_password", fail_one_chunk_delete)
 
-    with pytest.raises(SecretStorageError):
-        await store.delete("credential")
     await store.delete("credential")
 
     assert limited_keyring.entries == {}
+    assert await store.get("credential") is None
+
+
+@pytest.mark.asyncio
+async def test_delete_base_failure_keeps_long_value_active(
+    limited_keyring: LimitedKeyring,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = KeyringSecretStore(SERVICE)
+    value = "A" * 1900
+    await store.set("credential", value)
+    original_entries = limited_keyring.entries.copy()
+
+    def fail_base_delete(service: str, key: str) -> None:
+        if service == SERVICE and key == "credential":
+            raise RuntimeError("private base delete failure")
+        limited_keyring.delete_password(service, key)
+
+    monkeypatch.setattr(keyring, "delete_password", fail_base_delete)
+
+    with pytest.raises(SecretStorageError):
+        await store.delete("credential")
+
+    assert await store.get("credential") == value
+    assert limited_keyring.entries == original_entries
+
+
+@pytest.mark.asyncio
+async def test_delete_sidecar_failure_keeps_long_value_active(
+    limited_keyring: LimitedKeyring,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = KeyringSecretStore(SERVICE)
+    value = "A" * 1900
+    await store.set("credential", value)
+    original_entries = limited_keyring.entries.copy()
+
+    def fail_sidecar_delete(service: str, key: str) -> None:
+        if service == SERVICE and key == _manifest_key("credential"):
+            raise RuntimeError("private sidecar delete failure")
+        limited_keyring.delete_password(service, key)
+
+    monkeypatch.setattr(keyring, "delete_password", fail_sidecar_delete)
+
+    with pytest.raises(SecretStorageError):
+        await store.delete("credential")
+
+    assert await store.get("credential") == value
+    assert limited_keyring.entries == original_entries
+
+
+@pytest.mark.asyncio
+async def test_delete_persistent_chunk_failure_deactivates_manifest(
+    limited_keyring: LimitedKeyring,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = KeyringSecretStore(SERVICE)
+    await store.set("credential", "A" * 1900)
+    bottom_message = "private persistent chunk delete failure"
+
+    def fail_chunk_delete(service: str, key: str) -> None:
+        if service == SERVICE and ":chunk:" in key:
+            raise RuntimeError(bottom_message)
+        limited_keyring.delete_password(service, key)
+
+    monkeypatch.setattr(keyring, "delete_password", fail_chunk_delete)
+
+    with pytest.raises(
+        SecretStorageError,
+        match="^credential storage cleanup failed$",
+    ) as caught:
+        await store.delete("credential")
+
+    assert bottom_message not in str(caught.value)
+    assert (SERVICE, _manifest_key("credential")) not in limited_keyring.entries
+    assert _chunk_keys(limited_keyring, "credential")
+    assert await store.get("credential") is None
 
 
 @pytest.mark.asyncio
@@ -315,7 +461,7 @@ async def test_invalid_typed_manifest_get_fails_closed(
     manifest: dict[str, object],
 ) -> None:
     value = MANIFEST_PREFIX + json.dumps(manifest)
-    limited_keyring.entries[(SERVICE, "credential")] = value
+    limited_keyring.entries[(SERVICE, _manifest_key("credential"))] = value
     store = KeyringSecretStore(SERVICE)
 
     with pytest.raises(SecretStorageError, match="^credential storage is corrupted$"):
@@ -329,7 +475,7 @@ async def test_invalid_typed_manifest_delete_fails_closed_without_changes(
     manifest: dict[str, object],
 ) -> None:
     value = MANIFEST_PREFIX + json.dumps(manifest)
-    limited_keyring.entries[(SERVICE, "credential")] = value
+    limited_keyring.entries[(SERVICE, _manifest_key("credential"))] = value
     original_entries = limited_keyring.entries.copy()
     store = KeyringSecretStore(SERVICE)
 
@@ -449,7 +595,9 @@ async def test_replacing_uppercase_digest_manifest_cleans_its_distinct_chunk_key
             (SERVICE, f"credential:chunk:{upper_digest}:{index}")
         ] = chunk
     manifest["sha256"] = upper_digest
-    limited_keyring.entries[(SERVICE, "credential")] = MANIFEST_PREFIX + json.dumps(manifest)
+    limited_keyring.entries[(SERVICE, _manifest_key("credential"))] = (
+        MANIFEST_PREFIX + json.dumps(manifest)
+    )
 
     await store.set("credential", value)
 
@@ -527,5 +675,9 @@ def _chunk_keys(limited_keyring: LimitedKeyring, key: str) -> set[str]:
 
 
 def _manifest(limited_keyring: LimitedKeyring, key: str) -> dict[str, object]:
-    value = limited_keyring.entries[(SERVICE, key)]
+    value = limited_keyring.entries[(SERVICE, _manifest_key(key))]
     return json.loads(value.removeprefix(MANIFEST_PREFIX))
+
+
+def _manifest_key(key: str) -> str:
+    return f"{key}:manifest:v1"
