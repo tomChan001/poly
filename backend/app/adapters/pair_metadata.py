@@ -1,7 +1,7 @@
 import json
 from dataclasses import asdict
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import httpx
 
@@ -47,14 +47,17 @@ class NativePairMetadataResolver:
 
         kalshi_payload = _wrapped_object(kalshi_response.json(), "market")
         kalshi = normalize_kalshi_market(kalshi_payload)
-        polymarket_candidates = _object_list(polymarket_response.json(), "markets")
+        polymarket_candidates = _object_list(
+            _gamma_payload(polymarket_response),
+            "markets",
+        )
         if not polymarket_candidates:
             event_response = await self._http.get(
                 f"{self._polymarket_gamma_url}/events",
                 params={"slug": slug},
             )
             event_response.raise_for_status()
-            polymarket_candidates = _event_markets(event_response.json())
+            polymarket_candidates = _event_markets(_gamma_payload(event_response))
         polymarket = _select_polymarket_market(
             polymarket_candidates,
             opportunity.title,
@@ -127,6 +130,7 @@ class NativePairMetadataResolver:
                 polymarket,
                 "orderPriceMinTickSize",
                 "minimum_tick_size",
+                maximum=Decimal(1),
             ),
         )
         native_fingerprint, material_fingerprint = build_pair_fingerprints(pair)
@@ -146,6 +150,18 @@ def _wrapped_object(payload: object, name: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise TypeError(f"venue metadata response is missing {name}")
     return value
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Polymarket metadata contains invalid number: {value}")
+
+
+def _gamma_payload(response: httpx.Response) -> object:
+    return json.loads(
+        response.text,
+        parse_float=Decimal,
+        parse_constant=_reject_json_constant,
+    )
 
 
 def _object_list(payload: object, name: str) -> list[dict[str, object]]:
@@ -225,11 +241,28 @@ def _optional_text(payload: dict[str, object], *names: str) -> str | None:
     return None
 
 
-def _decimal_field(payload: dict[str, object], *names: str) -> Decimal:
+def _decimal_field(
+    payload: dict[str, object],
+    *names: str,
+    maximum: Decimal | None = None,
+) -> Decimal:
     for name in names:
-        value = payload.get(name)
-        if isinstance(value, (str, int)) and not isinstance(value, bool):
-            return Decimal(value)
+        if name not in payload:
+            continue
+        value = payload[name]
+        if isinstance(value, bool) or not isinstance(value, (str, int, Decimal)):
+            raise TypeError(f"Polymarket {name} must be an exact decimal")
+        try:
+            parsed = value if isinstance(value, Decimal) else Decimal(value)
+        except InvalidOperation as exc:
+            raise ValueError(f"Polymarket {name} is not a valid decimal") from exc
+        if not parsed.is_finite():
+            raise ValueError(f"Polymarket {name} must be finite")
+        if parsed <= 0:
+            raise ValueError(f"Polymarket {name} must be positive")
+        if maximum is not None and parsed > maximum:
+            raise ValueError(f"Polymarket {name} exceeds its maximum")
+        return parsed
     raise TypeError(f"Polymarket metadata is missing {names[0]}")
 
 

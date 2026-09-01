@@ -4,8 +4,12 @@ from decimal import Decimal
 import httpx
 import pytest
 
+from backend.app.adapters import pair_metadata
 from backend.app.adapters.oddpool.schema import OddpoolOpportunity
-from backend.app.adapters.pair_metadata import NativePairMetadataResolver
+from backend.app.adapters.pair_metadata import (
+    NativePairMetadataResolver,
+    _decimal_field,
+)
 
 
 @pytest.mark.asyncio
@@ -105,6 +109,74 @@ async def test_resolver_uses_native_metadata_and_selects_polymarket_outcome_toke
     assert pair.material_fingerprint
     assert pair.minimum_quantity == Decimal(5)
     assert pair.quantity_step == Decimal(1)
+
+
+@pytest.mark.asyncio
+async def test_resolver_parses_gamma_json_decimals_exactly() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "kalshi.test":
+            return httpx.Response(
+                200,
+                json={
+                    "market": {
+                        "ticker": "K-EVENT",
+                        "title": "Will the event happen?",
+                        "status": "open",
+                        "rules_primary": "Kalshi native rule",
+                        "tick_size": "0.01",
+                        "minimum_order_size": "1",
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            content=(
+                b'[{"question":"Will the event happen?",'
+                b'"description":"Polymarket native rule",'
+                b'"conditionId":"0xcondition",'
+                b'"outcomes":"[\\"Yes\\", \\"No\\"]",'
+                b'"clobTokenIds":"[\\"token-yes\\", \\"token-no\\"]",'
+                b'"orderMinSize":5,"orderPriceMinTickSize":0.001}]'
+            ),
+            headers={"content-type": "application/json"},
+        )
+
+    opportunity = OddpoolOpportunity.model_validate(
+        {
+            "id": "oddpool:decimal:yes",
+            "title": "Will the event happen?",
+            "outcome": "yes",
+            "updated_at": "2026-09-01T00:00:00Z",
+            "gross_spread": "0.08",
+            "estimated_fees": "0.03",
+            "legs": [
+                {
+                    "venue": "kalshi",
+                    "outcome": "no",
+                    "market_ref": "K-EVENT",
+                    "display_price": "0.69",
+                },
+                {
+                    "venue": "polymarket",
+                    "outcome": "yes",
+                    "market_ref": "event-slug",
+                    "display_price": "0.32",
+                    "source_condition_id": "0xcondition",
+                    "source_token_id": "token-yes",
+                },
+            ],
+        }
+    )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        pair = await NativePairMetadataResolver(
+            kalshi_base_url="https://kalshi.test",
+            polymarket_gamma_url="https://gamma.test",
+            http_client=http,
+        ).resolve(opportunity)
+
+    assert pair.minimum_quantity == Decimal(5)
+    assert pair.polymarket_minimum_tick == Decimal("0.001")
 
 
 @pytest.mark.asyncio
@@ -483,3 +555,32 @@ async def test_resolver_rejects_oddpool_native_id_mismatch(
         )
         with pytest.raises(ValueError, match=message):
             await resolver.resolve(opportunity)
+
+
+@pytest.mark.parametrize("value", ["0.001", 1, Decimal("0.001")])
+def test_polymarket_decimal_field_accepts_exact_positive_values(value: object) -> None:
+    assert _decimal_field({"tick": value}, "tick", maximum=Decimal(1)) == Decimal(str(value))
+
+
+@pytest.mark.parametrize("value", [True, 0.001])
+def test_polymarket_decimal_field_rejects_inexact_types(value: object) -> None:
+    with pytest.raises(TypeError, match="must be an exact decimal"):
+        _decimal_field({"tick": value}, "tick", maximum=Decimal(1))
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "0", "-0.001", "1.001"])
+def test_polymarket_tick_rejects_invalid_values(value: str) -> None:
+    with pytest.raises(ValueError):
+        _decimal_field({"tick": value}, "tick", maximum=Decimal(1))
+
+
+def test_gamma_payload_rejects_non_standard_numeric_constants() -> None:
+    request = httpx.Request("GET", "https://gamma.test/markets")
+    response = httpx.Response(
+        200,
+        text='[{"orderPriceMinTickSize": NaN}]',
+        request=request,
+    )
+
+    with pytest.raises(ValueError, match="invalid number"):
+        pair_metadata._gamma_payload(response)
