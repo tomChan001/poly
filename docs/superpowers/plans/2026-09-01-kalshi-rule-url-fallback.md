@@ -337,7 +337,7 @@ Restart port 8010 with the existing PostgreSQL connection, `TRADING_MODE=read_on
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8010/health
-Invoke-RestMethod http://127.0.0.1:8010/api/runtime/status
+Invoke-RestMethod http://127.0.0.1:8010/api/runtime
 ```
 
 Expected: health is `ok`, trading mode remains `read_only`, opening remains disabled, and the runtime error no longer lists `'rules_url'`, `'tick_size'`, or `'minimum_order_size'` candidate failures.
