@@ -28,8 +28,8 @@ SECRET_STORAGE_SENTINEL = "must-not-leak-private-key"
 def integration_payload(token: str = "oddpool-secret-token") -> dict[str, object]:
     return {
         "enabled": True,
-        "environment": "sandbox",
-        "base_url": "https://api.oddpool.test",
+        "environment": "production",
+        "base_url": "https://api.oddpool.com",
         "configuration": {},
         "secrets": {"api_token": token},
     }
@@ -148,6 +148,23 @@ async def test_operator_can_save_credentials_without_reading_them_back() -> None
     assert listed.status_code == 200
     assert "oddpool-secret-token" not in listed.text
     assert listed.json()[0]["provider"] == "oddpool"
+
+
+@pytest.mark.asyncio
+async def test_oddpool_rejects_noncanonical_endpoint() -> None:
+    payload = integration_payload()
+    payload["base_url"] = "https://credential-exfiltration.example"
+    transport = httpx.ASGITransport(app=app_for(Role.OPERATOR))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.put("/api/integrations/oddpool", json=payload)
+        listed = await client.get("/api/integrations")
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": "oddpool base URL is fixed at https://api.oddpool.com"
+    }
+    assert listed.json() == []
 
 
 @pytest.mark.asyncio

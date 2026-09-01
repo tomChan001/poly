@@ -19,6 +19,18 @@ class IntegrationEnvironment(StrEnum):
     PRODUCTION = "production"
 
 
+ODDPOOL_BASE_URL = "https://api.oddpool.com"
+
+
+def canonical_base_url(provider: IntegrationProvider, base_url: str) -> str:
+    normalized = base_url.rstrip("/")
+    if provider is IntegrationProvider.ODDPOOL:
+        if normalized != ODDPOOL_BASE_URL:
+            raise ValueError(f"oddpool base URL is fixed at {ODDPOOL_BASE_URL}")
+        return ODDPOOL_BASE_URL
+    return normalized
+
+
 class RuntimeConfigurationError(ValueError):
     def __init__(self, missing: tuple[str, ...]) -> None:
         super().__init__(f"runtime integrations are not ready: {', '.join(missing)}")
@@ -227,6 +239,7 @@ class IntegrationConfigService:
         secrets: dict[str, str | None],
         actor: str,
     ) -> IntegrationConfigView:
+        normalized_base_url = canonical_base_url(provider, base_url)
         self._validate_fields(provider, configuration, secrets)
         normalized_configuration = dict(configuration)
         merged_credentials = await self._merged_credentials(provider, secrets)
@@ -249,7 +262,7 @@ class IntegrationConfigService:
                 provider=provider,
                 enabled=enabled,
                 environment=environment,
-                base_url=base_url,
+                base_url=normalized_base_url,
                 configuration=normalized_configuration,
                 updated_at=datetime.now(UTC),
                 updated_by=actor,
