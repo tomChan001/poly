@@ -556,9 +556,16 @@ def test_connection_probe_uses_polymarket_read_only_sdk_calls_without_writes(
             assert params is not None
             return {"balance": "123000000"}
 
-        def get_open_orders(self, only_first_page: bool = False) -> list[dict[str, object]]:
+        def get_open_orders(
+            self,
+            params: object = None,
+            only_first_page: bool = False,
+            next_cursor: str | None = None,
+        ) -> list[dict[str, object]]:
             self.open_orders_calls += 1
+            assert params is None
             assert only_first_page is True
+            assert next_cursor is None
             return []
 
         def get_order(self, order_id: str) -> dict[str, object]:

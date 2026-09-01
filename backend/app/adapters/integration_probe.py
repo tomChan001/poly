@@ -187,7 +187,12 @@ def _optional_text(value: object) -> str | None:
 
 
 class _PolymarketSdkReadOnlyClient(Protocol):
-    def get_open_orders(self, only_first_page: bool = False) -> list[dict[str, object]]: ...
+    def get_open_orders(
+        self,
+        params: object = None,
+        only_first_page: bool = False,
+        next_cursor: str | None = None,
+    ) -> list[dict[str, object]]: ...
 
     def get_trades(
         self,
@@ -203,5 +208,5 @@ class _PolymarketSdkReadOnlyProbe:
 
     async def probe_read_only(self) -> None:
         await self._transport.get_available_balance()
-        await asyncio.to_thread(self._client.get_open_orders, True)
+        await asyncio.to_thread(self._client.get_open_orders, None, True)
         await asyncio.to_thread(self._client.get_trades, None, True)
