@@ -36,11 +36,13 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.func.now(),
         ),
+        if_not_exists=True,
     )
     op.create_index(
         "ix_execution_record_occurred_at",
         "execution_record",
         ["occurred_at"],
+        if_not_exists=True,
     )
 
 

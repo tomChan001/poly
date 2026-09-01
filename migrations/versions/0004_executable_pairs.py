@@ -34,11 +34,13 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.func.now(),
         ),
+        if_not_exists=True,
     )
     op.create_index(
         "ix_executable_pair_runtime",
         "executable_pair",
         ["enabled", "status"],
+        if_not_exists=True,
     )
 
 
