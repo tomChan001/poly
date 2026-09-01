@@ -524,3 +524,39 @@ test('shows real runtime state and lets a human review market equivalence', asyn
   })
   expect(screen.queryByRole('button', { name: /批准订单|下单/ })).not.toBeInTheDocument()
 })
+
+test('keeps the empty oddpool candidate state inside the scroll region', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/runtime')) {
+        return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+      }
+      if (url.endsWith('/api/pairs')) {
+        return Promise.resolve({ ok: true, json: async () => [] })
+      }
+      if (url.includes('/health')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            status: 'ok',
+            trading_mode: 'limited_auto',
+            opening_enabled: true,
+            reason: 'configured default',
+          }),
+        })
+      }
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '审核' }))
+
+  const candidateScrollRegion = await screen.findByRole('region', { name: 'Oddpool 候选内容' })
+  const candidateHeading = screen.getByRole('heading', { name: 'Oddpool 候选' })
+
+  expect(within(candidateScrollRegion).getByText('暂无自动发现的待审核候选')).toBeInTheDocument()
+  expect(candidateScrollRegion).not.toContainElement(candidateHeading)
+})
