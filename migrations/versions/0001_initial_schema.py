@@ -40,17 +40,19 @@ EXPECTED_TABLES = {
 
 # Database enforcement prevents a future application bug or ad-hoc SQL session
 # from rewriting evidence after an execution decision has been made.
-AUDIT_TRIGGER_SQL = """
+AUDIT_FUNCTION_SQL = """
 CREATE OR REPLACE FUNCTION reject_audit_event_mutation()
 RETURNS trigger AS $$
 BEGIN
     RAISE EXCEPTION 'audit_event is append-only';
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql
+"""
 
+AUDIT_TRIGGER_SQL = """
 CREATE TRIGGER audit_event_append_only
 BEFORE UPDATE OR DELETE ON audit_event
-FOR EACH ROW EXECUTE FUNCTION reject_audit_event_mutation();
+FOR EACH ROW EXECUTE FUNCTION reject_audit_event_mutation()
 """
 
 
@@ -63,6 +65,10 @@ def upgrade() -> None:
         )
 
     Base.metadata.create_all(bind=op.get_bind())
+    # asyncpg prepares one statement per execute call and rejects SQL batches.
+    # Keeping these commands separate also makes the database failure atomic
+    # because Alembic still runs both calls inside the migration transaction.
+    op.execute(AUDIT_FUNCTION_SQL)
     op.execute(AUDIT_TRIGGER_SQL)
 
 

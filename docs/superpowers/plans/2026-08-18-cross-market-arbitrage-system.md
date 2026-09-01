@@ -804,7 +804,7 @@ git commit -m "feat: add controlled two-leg execution state machine"
 
 - [ ] **Step 3: 加入访问控制**
 
-使用 OIDC 登录，角色固定为 `viewer`、`reviewer`、`operator`。只有 reviewer 可审批映射，只有 operator 可修改限额或切换 kill switch；系统不提供逐笔人工批准接口。切换真实交易模式要求重新认证并填写原因，单用户部署不强制双人审批。
+控制面仅允许本机访问，角色固定为 `viewer`、`reviewer`、`operator`。只有 reviewer 可审批映射，只有 operator 可修改限额或切换 kill switch；系统不提供逐笔人工批准接口。切换真实交易模式要求填写原因，单用户部署不强制双人审批。
 
 - [ ] **Step 4: 配置告警和 SLO**
 

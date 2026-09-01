@@ -2,7 +2,7 @@
 
 ## 关闭开仓
 
-1. operator 使用已验证 OIDC 会话调用 `PUT /api/system-control/opening`，提交
+1. 本机 operator 调用 `PUT /api/system-control/opening`，提交
    `{"enabled": false, "reason": "..."}`。
 2. 确认响应与数据库 `system_control.opening_enabled` 均为 `false`。
 3. 检查 `SUBMITTED`、`PARTIALLY_HEDGED` 和开放订单。关闭开关不会自动撤单或平仓。

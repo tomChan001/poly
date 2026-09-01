@@ -3,47 +3,67 @@ import {
   Activity,
   BookOpenCheck,
   ChartNoAxesCombined,
+  Cable,
   Gauge,
+  History,
   RefreshCw,
   Settings2,
   ShieldCheck,
 } from 'lucide-react'
 
-import { getExecutions, getOpportunities } from './api/client'
+import { getExecutions, getOpportunities, getRuntimeStatus, getSystemStatus } from './api/client'
+import { RuntimeStatusBand } from './components/RuntimeStatusBand'
 import { TradingModeBanner } from './components/TradingModeBanner'
 import { AnalyticsPage } from './pages/AnalyticsPage'
+import { HistoryPage } from './pages/HistoryPage'
 import { MappingQueuePage } from './pages/MappingQueuePage'
+import { IntegrationSettingsPage } from './pages/IntegrationSettingsPage'
 import { OpportunitiesPage } from './pages/OpportunitiesPage'
 import { RiskSettingsPage } from './pages/RiskSettingsPage'
 import type { Execution } from './types/execution'
 import type { Opportunity } from './types/opportunity'
+import type { RuntimeStatus } from './types/runtime'
+import type { SystemStatus } from './types/system'
 import './App.css'
 
-type View = 'opportunities' | 'mappings' | 'analytics' | 'settings'
+type View = 'opportunities' | 'mappings' | 'analytics' | 'history' | 'settings' | 'integrations'
 
 const navigation = [
   { id: 'opportunities' as const, label: '机会', icon: Gauge },
   { id: 'mappings' as const, label: '审核', icon: BookOpenCheck },
   { id: 'analytics' as const, label: '运行', icon: ChartNoAxesCombined },
+  { id: 'history' as const, label: '历史', icon: History },
   { id: 'settings' as const, label: '风控', icon: Settings2 },
+  { id: 'integrations' as const, label: '集成', icon: Cable },
 ]
 
 function App() {
   const [view, setView] = useState<View>('opportunities')
   const [opportunities, setOpportunities] = useState<Opportunity[]>([])
   const [executions, setExecutions] = useState<Execution[]>([])
+  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null)
+  const [systemStatus, setSystemStatus] = useState<SystemStatus>({
+    status: 'ok',
+    trading_mode: 'limited_auto',
+    opening_enabled: true,
+    reason: 'configured default',
+  })
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
   const refresh = async () => {
     setLoading(true)
     try {
-      const [latestOpportunities, latestExecutions] = await Promise.all([
+      const [latestOpportunities, latestExecutions, latestSystemStatus, latestRuntimeStatus] = await Promise.all([
         getOpportunities(),
         getExecutions(),
+        getSystemStatus(),
+        getRuntimeStatus(),
       ])
       setOpportunities(latestOpportunities)
       setExecutions(latestExecutions)
+      setSystemStatus(latestSystemStatus)
+      setRuntimeStatus(latestRuntimeStatus)
       setError(null)
     } catch {
       setError('无法读取机会数据')
@@ -113,7 +133,11 @@ function App() {
           </div>
         </header>
 
-        <TradingModeBanner mode="READ ONLY" openingEnabled={false} />
+        <TradingModeBanner
+          mode={systemStatus.trading_mode}
+          openingEnabled={systemStatus.opening_enabled}
+        />
+        <RuntimeStatusBand status={runtimeStatus} />
 
         {error && <div className="error-band">{error}</div>}
         {view === 'opportunities' && (
@@ -127,7 +151,9 @@ function App() {
         {view === 'analytics' && (
           <AnalyticsPage opportunities={opportunities} executions={executions} />
         )}
+        {view === 'history' && <HistoryPage executions={executions} />}
         {view === 'settings' && <RiskSettingsPage />}
+        {view === 'integrations' && <IntegrationSettingsPage />}
       </main>
     </div>
   )

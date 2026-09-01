@@ -24,7 +24,7 @@ async def test_mapping_review_api_approves_complete_exact_mapping() -> None:
     )
     app = create_app(container)
     app.dependency_overrides[get_current_principal] = lambda: Principal(
-        "oidc-reviewer",
+        "local-reviewer",
         frozenset({Role.REVIEWER}),
     )
     transport = httpx.ASGITransport(app=app)
@@ -46,7 +46,7 @@ async def test_mapping_review_api_approves_complete_exact_mapping() -> None:
 
     assert response.status_code == 200
     assert response.json()["status"] == "exact"
-    assert response.json()["reviewer"] == "oidc-reviewer"
+    assert response.json()["reviewer"] == "local-reviewer"
     assert container.rule_store.mappings[mapping.id].status is MappingStatus.EXACT
 
 

@@ -33,6 +33,9 @@ class KalshiTransport:
     async def get_order_by_client_id(self, client_order_id: str) -> dict[str, object] | None:
         return None
 
+    async def get_available_balance(self) -> Decimal:
+        return Decimal("45.67")
+
 
 class PolymarketTransport:
     def __init__(self) -> None:
@@ -48,6 +51,19 @@ class PolymarketTransport:
 
     async def get_order_by_client_id(self, client_order_id: str) -> dict[str, object] | None:
         return None
+
+    async def get_available_balance(self) -> Decimal:
+        return Decimal("89.01")
+
+
+@pytest.mark.asyncio
+async def test_trading_adapters_expose_authenticated_available_balances() -> None:
+    assert await KalshiTradingAdapter(KalshiTransport()).get_available_balance() == Decimal(
+        "45.67"
+    )
+    assert await PolymarketTradingAdapter(
+        PolymarketTransport()
+    ).get_available_balance() == Decimal("89.01")
 
 
 @pytest.mark.asyncio

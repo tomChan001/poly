@@ -24,4 +24,4 @@ def test_initial_migration_makes_audit_events_append_only() -> None:
     migration = load_initial_migration()
 
     assert "BEFORE UPDATE OR DELETE ON audit_event" in migration.AUDIT_TRIGGER_SQL
-    assert "audit_event is append-only" in migration.AUDIT_TRIGGER_SQL
+    assert "audit_event is append-only" in migration.AUDIT_FUNCTION_SQL

@@ -10,6 +10,7 @@ from backend.app.services.execution import (
     ControlledExecutionService,
     ExecutionAuthorizationService,
     ExecutionEvidence,
+    ExecutionRecord,
     FillReport,
     OrderStatus,
     OrderSubmissionResult,
@@ -118,6 +119,42 @@ async def test_two_filled_legs_are_paired_with_stable_client_order_ids() -> None
         ExecutionState.SUBMITTED,
         ExecutionState.PAIRED,
     ]
+
+
+@pytest.mark.asyncio
+async def test_submitted_state_is_persisted_before_any_venue_write() -> None:
+    saved_states: list[ExecutionState] = []
+
+    class RecordingStore:
+        async def save(self, record: ExecutionRecord) -> None:
+            saved_states.append(record.state)
+
+        async def list(self) -> list[ExecutionRecord]:
+            return []
+
+        async def get(self, correlation_id: str) -> ExecutionRecord:
+            raise KeyError(correlation_id)
+
+    class OrderedPort(FakeTradingPort):
+        async def submit_fok(self, request: object) -> OrderSubmissionResult:
+            assert saved_states == [ExecutionState.SUBMITTED]
+            return await super().submit_fok(request)
+
+    ports = {
+        Venue.KALSHI: OrderedPort(filled(Venue.KALSHI)),
+        Venue.POLYMARKET: OrderedPort(filled(Venue.POLYMARKET)),
+    }
+    authorization = ExecutionAuthorizationService().issue(MappingStatus.EXACT, evidence(), NOW)
+    service = ControlledExecutionService(
+        ports,
+        SystemControl(opening_enabled=True),
+        TradingMode.LIMITED_AUTO,
+        RecordingStore(),
+    )
+
+    await service.execute(authorization, evidence(), NOW + timedelta(seconds=1))
+
+    assert saved_states == [ExecutionState.SUBMITTED, ExecutionState.PAIRED]
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,8 @@ class PolymarketOrderTransport(Protocol):
         client_order_id: str,
     ) -> dict[str, object] | None: ...
 
+    async def get_available_balance(self) -> Decimal: ...
+
 
 class PolymarketTradingAdapter:
     def __init__(self, transport: PolymarketOrderTransport) -> None:
@@ -39,6 +41,9 @@ class PolymarketTradingAdapter:
         if response is None:
             return None
         return self._parse(response, client_order_id)
+
+    async def get_available_balance(self) -> Decimal:
+        return await self._transport.get_available_balance()
 
     @staticmethod
     def _payload(request: OrderRequest) -> dict[str, object]:

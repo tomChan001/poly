@@ -65,13 +65,19 @@ class MappingReviewService:
         checklist: dict[str, bool],
         truth_table: list[dict[str, Decimal]],
     ) -> None:
-        if set(checklist) != set(REQUIRED_REVIEW_ITEMS) or not all(checklist.values()):
-            raise ValueError("EXACT review requires a complete checklist")
-        if not truth_table:
-            raise ValueError("EXACT review requires a truth table")
-        for row in truth_table:
-            if set(row) != {"kalshi", "polymarket"}:
-                raise ValueError("truth table requires both venue payouts")
-            if row["kalshi"] + row["polymarket"] != Decimal(1):
-                raise ValueError("truth table payouts must sum to 1")
+        validate_exact_review(checklist, truth_table)
 
+
+def validate_exact_review(
+    checklist: dict[str, bool],
+    truth_table: list[dict[str, Decimal]],
+) -> None:
+    if set(checklist) != set(REQUIRED_REVIEW_ITEMS) or not all(checklist.values()):
+        raise ValueError("EXACT review requires a complete checklist")
+    if not truth_table:
+        raise ValueError("EXACT review requires a truth table")
+    for row in truth_table:
+        if set(row) != {"kalshi", "polymarket"}:
+            raise ValueError("truth table requires both venue payouts")
+        if row["kalshi"] + row["polymarket"] != Decimal(1):
+            raise ValueError("truth table payouts must sum to 1")

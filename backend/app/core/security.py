@@ -2,9 +2,13 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from ipaddress import ip_address
 from typing import Annotated
+from urllib.parse import urlsplit
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
+
+from backend.app.core.config import settings
 
 REDACTED = "[REDACTED]"
 _SENSITIVE_KEYS = {
@@ -53,13 +57,47 @@ def redact_text(message: str) -> str:
     return re.sub(r"(?i)(cookie\s*:\s*)[^\s]+", rf"\1{REDACTED}", message)
 
 
-def get_current_principal() -> Principal:
-    # Production must replace this dependency with an OIDC validator configured
-    # for the deployment issuer and audience. Missing auth fails closed.
+def get_current_principal(request: Request) -> Principal:
+    client = request.client
+    is_loopback = False
+    if client is not None:
+        try:
+            is_loopback = ip_address(client.host).is_loopback
+        except ValueError:
+            is_loopback = False
+
+    # Local setup is restricted to the machine running this desktop service.
+    # The loopback check keeps remote callers out while allowing the local web
+    # configuration screen to work when real trading is the configured mode.
+    if (
+        settings.local_setup_enabled
+        and is_loopback
+        and _has_trusted_local_origin(request)
+        and request.app.state.allow_local_setup
+    ):
+        # The local operator is also the only human reviewer in this
+        # single-machine deployment; order execution itself remains automatic.
+        return Principal("local-setup", frozenset(Role))
+
+    # This is a single-machine control plane. There is deliberately no remote
+    # login fallback: callers outside the local process boundary are rejected.
     raise HTTPException(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail="OIDC verifier is not configured",
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="local access only",
     )
+
+
+def _has_trusted_local_origin(request: Request) -> bool:
+    origin = request.headers.get("origin")
+    if origin is None:
+        # Native local tools do not send Origin. Browser requests do, which
+        # lets this boundary reject cross-site requests targeting localhost.
+        return True
+    try:
+        host = urlsplit(origin).hostname
+        return host == "localhost" or (host is not None and ip_address(host).is_loopback)
+    except ValueError:
+        return False
 
 
 def require_authenticated(

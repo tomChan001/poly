@@ -43,18 +43,18 @@ def _view(record: ExecutionRecord) -> dict[str, object]:
 
 
 @router.get("")
-def list_executions(
+async def list_executions(
     container: Annotated[ApplicationContainer, Depends(get_container)],
 ) -> list[dict[str, object]]:
-    return [_view(record) for record in container.executions.list()]
+    return [_view(record) for record in await container.executions.list()]
 
 
 @router.get("/{correlation_id}")
-def get_execution(
+async def get_execution(
     correlation_id: str,
     container: Annotated[ApplicationContainer, Depends(get_container)],
 ) -> dict[str, object]:
     try:
-        return _view(container.executions.get(correlation_id))
+        return _view(await container.executions.get(correlation_id))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="execution not found") from exc
