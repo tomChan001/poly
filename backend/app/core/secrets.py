@@ -9,6 +9,7 @@ _MAX_CHUNKS = 10_000
 _MANIFEST_PREFIX = "poly-keyring-chunks:v1:"
 _CORRUPTED_MESSAGE = "credential storage is corrupted"
 _OPERATION_ERROR_MESSAGE = "credential storage operation failed"
+_ROLLBACK_ERROR_MESSAGE = "credential storage rollback failed"
 
 
 class SecretStorageError(RuntimeError):
@@ -96,7 +97,7 @@ class KeyringSecretStore:
             await self._set_password(key, manifest)
         except SecretStorageError:
             if old_manifest is None or old_manifest[0] != digest:
-                await self._delete_keys(written_chunk_keys, suppress_errors=True)
+                await self._rollback_keys(written_chunk_keys)
             raise
 
         if old_manifest is not None and old_manifest[0] != digest:
@@ -165,8 +166,6 @@ class KeyringSecretStore:
     async def _delete_keys(
         self,
         keys: list[str],
-        *,
-        suppress_errors: bool = False,
     ) -> None:
         first_error: SecretStorageError | None = None
         for key in keys:
@@ -174,8 +173,17 @@ class KeyringSecretStore:
                 await self._delete_password(key)
             except SecretStorageError as exc:
                 first_error = first_error or exc
-        if first_error is not None and not suppress_errors:
+        if first_error is not None:
             raise first_error
+
+    async def _rollback_keys(self, keys: list[str]) -> None:
+        for _attempt in range(2):
+            try:
+                await self._delete_keys(keys)
+            except SecretStorageError:
+                continue
+            return
+        raise SecretStorageError(_ROLLBACK_ERROR_MESSAGE) from None
 
 
 def _chunk_key(key: str, digest: str, index: int) -> str:

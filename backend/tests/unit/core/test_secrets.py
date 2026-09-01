@@ -54,6 +54,16 @@ def limited_keyring(monkeypatch: pytest.MonkeyPatch) -> LimitedKeyring:
     return backend
 
 
+def test_limited_keyring_reproduces_windows_error_for_long_pem() -> None:
+    backend = LimitedKeyring()
+    pem = "-----BEGIN PRIVATE KEY-----\n" + ("A" * 1640) + "\n-----END PRIVATE KEY-----"
+
+    with pytest.raises(OSError) as caught:
+        backend.set_password(SERVICE, "signing-key", pem)
+
+    assert caught.value.errno == 1783
+
+
 @pytest.mark.asyncio
 async def test_long_pem_round_trips_through_limited_keyring(
     limited_keyring: LimitedKeyring,
@@ -227,6 +237,61 @@ async def test_partial_new_chunk_failure_preserves_old_entries(
 
     assert await store.get("credential") == old_value
     assert limited_keyring.entries == original_entries
+
+
+@pytest.mark.asyncio
+async def test_partial_write_retries_transient_rollback_delete_failure(
+    limited_keyring: LimitedKeyring,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = KeyringSecretStore(SERVICE)
+    old_value = "A" * 1900
+    await store.set("credential", old_value)
+    original_entries = limited_keyring.entries.copy()
+    limited_keyring.fail_on_set_call = limited_keyring.set_calls + 2
+    rollback_failure_pending = True
+
+    def fail_first_new_chunk_delete(service: str, key: str) -> None:
+        nonlocal rollback_failure_pending
+        is_new_chunk = (service, key) not in original_entries and ":chunk:" in key
+        if rollback_failure_pending and is_new_chunk:
+            rollback_failure_pending = False
+            raise RuntimeError("transient rollback delete failure")
+        limited_keyring.delete_password(service, key)
+
+    monkeypatch.setattr(keyring, "delete_password", fail_first_new_chunk_delete)
+
+    with pytest.raises(SecretStorageError):
+        await store.set("credential", "B" * 1900)
+
+    assert await store.get("credential") == old_value
+    assert limited_keyring.entries == original_entries
+
+
+@pytest.mark.asyncio
+async def test_persistent_rollback_failure_is_reported_distinctly(
+    limited_keyring: LimitedKeyring,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = KeyringSecretStore(SERVICE)
+    await store.set("credential", "A" * 1900)
+    original_entries = limited_keyring.entries.copy()
+    limited_keyring.fail_on_set_call = limited_keyring.set_calls + 2
+
+    def fail_new_chunk_delete(service: str, key: str) -> None:
+        if (service, key) not in original_entries and ":chunk:" in key:
+            raise RuntimeError("private rollback backend detail")
+        limited_keyring.delete_password(service, key)
+
+    monkeypatch.setattr(keyring, "delete_password", fail_new_chunk_delete)
+
+    with pytest.raises(
+        SecretStorageError,
+        match="^credential storage rollback failed$",
+    ) as caught:
+        await store.set("credential", "B" * 1900)
+
+    assert "private rollback backend detail" not in str(caught.value)
 
 
 @pytest.mark.asyncio
