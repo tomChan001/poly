@@ -114,7 +114,7 @@ async def test_short_value_remains_in_one_legacy_entry(
         'poly-keyring-chunks:v1:{"purpose":"literal credential value"}',
     ],
 )
-async def test_manifest_prefix_short_values_round_trip_unambiguously(
+async def test_untyped_manifest_prefix_short_values_stay_raw(
     limited_keyring: LimitedKeyring,
     value: str,
 ) -> None:
@@ -122,7 +122,7 @@ async def test_manifest_prefix_short_values_round_trip_unambiguously(
 
     await store.set("credential", value)
 
-    assert limited_keyring.entries[(SERVICE, "credential")] != value
+    assert limited_keyring.entries[(SERVICE, "credential")] == value
     assert await store.get("credential") == value
 
 
@@ -145,13 +145,15 @@ async def test_legacy_manifest_prefix_literals_are_read_raw(
 
 
 @pytest.mark.asyncio
-async def test_legacy_plain_envelope_prefix_literal_is_read_raw(
+async def test_plain_prefix_short_value_stays_raw(
     limited_keyring: LimitedKeyring,
 ) -> None:
     value = "poly-keyring-plain:v1:legacy literal"
-    limited_keyring.entries[(SERVICE, "credential")] = value
     store = KeyringSecretStore(SERVICE)
 
+    await store.set("credential", value)
+
+    assert limited_keyring.entries[(SERVICE, "credential")] == value
     assert await store.get("credential") == value
 
 

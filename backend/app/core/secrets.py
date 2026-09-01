@@ -9,7 +9,6 @@ _CHUNK_SIZE = 900
 _MAX_CHUNKS = 10_000
 _MANIFEST_PREFIX = "poly-keyring-chunks:v1:"
 _MANIFEST_KIND = "chunked-secret"
-_PLAIN_ENVELOPE_PREFIX = "poly-keyring-plain:v1:"
 _CORRUPTED_MESSAGE = "credential storage is corrupted"
 _CLEANUP_WARNING_MESSAGE = "credential storage cleanup failed"
 _OPERATION_ERROR_MESSAGE = "credential storage operation failed"
@@ -55,13 +54,6 @@ class KeyringSecretStore:
         value = await self._get_password(key)
         if value is None:
             return None
-        if value.startswith(
-            (
-                _PLAIN_ENVELOPE_PREFIX + _MANIFEST_PREFIX,
-                _PLAIN_ENVELOPE_PREFIX + _PLAIN_ENVELOPE_PREFIX,
-            )
-        ):
-            return value.removeprefix(_PLAIN_ENVELOPE_PREFIX)
         manifest = _parse_manifest(value)
         if manifest is None:
             return value
@@ -83,10 +75,7 @@ class KeyringSecretStore:
         old_value = await self._get_password(key)
         old_manifest = _parse_manifest(old_value) if old_value is not None else None
         if len(value) <= _CHUNK_SIZE:
-            stored_value = value
-            if value.startswith((_MANIFEST_PREFIX, _PLAIN_ENVELOPE_PREFIX)):
-                stored_value = _PLAIN_ENVELOPE_PREFIX + value
-            await self._set_password(key, stored_value)
+            await self._set_password(key, value)
             if old_manifest is not None:
                 await self._cleanup_manifest_chunks(key, old_manifest)
             return
