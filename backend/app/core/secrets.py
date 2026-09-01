@@ -119,11 +119,7 @@ class KeyringSecretStore:
 
     async def delete(self, key: str) -> None:
         value = await self._get_password(key)
-        try:
-            manifest = _parse_manifest(value) if value is not None else None
-        except SecretStorageError:
-            await self._delete_keys([key])
-            return
+        manifest = _parse_manifest(value) if value is not None else None
         if manifest is not None:
             digest, chunk_count = manifest
             await self._delete_keys(
@@ -226,19 +222,16 @@ def _parse_manifest(value: str) -> tuple[str, int] | None:
         return None
     if not isinstance(parsed, dict):
         return None
-    if "sha256" not in parsed and "chunks" not in parsed:
-        return None
-
     digest = parsed.get("sha256")
     chunks = parsed.get("chunks")
     if not isinstance(digest, str):
-        raise SecretStorageError(_CORRUPTED_MESSAGE)
+        return None
     if len(digest) != 64 or not all(
         character in string.hexdigits for character in digest
     ):
-        raise SecretStorageError(_CORRUPTED_MESSAGE)
+        return None
     if not isinstance(chunks, int) or isinstance(chunks, bool):
-        raise SecretStorageError(_CORRUPTED_MESSAGE)
+        return None
     if not 1 <= chunks <= _MAX_CHUNKS:
-        raise SecretStorageError(_CORRUPTED_MESSAGE)
+        return None
     return digest, chunks

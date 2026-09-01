@@ -283,21 +283,20 @@ async def test_tampered_chunk_digest_fails_closed(
 @pytest.mark.parametrize(
     "manifest",
     [
-        {"sha256": "not-a-digest", "chunks": 1},
-        {"sha256": "a" * 64, "chunks": True},
-        {"sha256": "a" * 64, "chunks": 0},
-        {"sha256": "a" * 64, "chunks": 10001},
+        {"sha256": "a" * 64},
+        {"chunks": 2},
+        {"sha256": "not-a-digest", "chunks": "two"},
     ],
 )
-async def test_invalid_manifest_fails_closed(
+async def test_incomplete_or_invalid_manifest_like_legacy_value_is_read_raw(
     limited_keyring: LimitedKeyring,
     manifest: dict[str, object],
 ) -> None:
-    limited_keyring.entries[(SERVICE, "credential")] = MANIFEST_PREFIX + json.dumps(manifest)
+    value = MANIFEST_PREFIX + json.dumps(manifest)
+    limited_keyring.entries[(SERVICE, "credential")] = value
     store = KeyringSecretStore(SERVICE)
 
-    with pytest.raises(SecretStorageError, match="^credential storage is corrupted$"):
-        await store.get("credential")
+    assert await store.get("credential") == value
 
 
 @pytest.mark.asyncio
