@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Check, RefreshCw, X } from 'lucide-react'
 
 import { getPairs, reviewPair } from '../api/client'
@@ -22,6 +22,8 @@ export function PairSettingsPage() {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [checklist, setChecklist] = useState<Record<string, boolean>>({})
   const [notes, setNotes] = useState('')
+  const draftPairId = useRef<string | null>(null)
+  const draftDirty = useRef(false)
   const [loading, setLoading] = useState(true)
   const [pending, setPending] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
@@ -57,8 +59,11 @@ export function PairSettingsPage() {
 
   useEffect(() => {
     if (!selected) return
+    if (selected.id === draftPairId.current && draftDirty.current) return
     setChecklist(selected.checklist ?? {})
     setNotes(selected.notes)
+    draftPairId.current = selected.id
+    draftDirty.current = false
   }, [selected])
 
   const submitReview = async (status: 'exact' | 'rejected') => {
@@ -78,6 +83,10 @@ export function PairSettingsPage() {
         notes,
       })
       setPairs((current) => current.map((pair) => pair.id === saved.id ? saved : pair))
+      setChecklist(saved.checklist ?? {})
+      setNotes(saved.notes)
+      draftPairId.current = saved.id
+      draftDirty.current = false
       setMessage(status === 'exact' ? '审核已保存，可进入自动执行' : '候选已拒绝')
     } catch (value) {
       setError(value instanceof Error ? value.message : '审核保存失败')
@@ -158,10 +167,15 @@ export function PairSettingsPage() {
                       aria-label={`已核对${label}`}
                       type="checkbox"
                       checked={checklist[key] === true}
-                      onChange={(event) => setChecklist((current) => ({
-                        ...current,
-                        [key]: event.target.checked,
-                      }))}
+                      onChange={(event) => {
+                        const ownsDraft = draftPairId.current === selected.id
+                        setChecklist((current) => ({
+                          ...(ownsDraft ? current : selected.checklist ?? {}),
+                          [key]: event.target.checked,
+                        }))
+                        draftPairId.current = selected.id
+                        draftDirty.current = true
+                      }}
                     />
                     <span>{label}</span>
                   </label>
@@ -173,7 +187,17 @@ export function PairSettingsPage() {
                 <div><b>A</b><code>1</code><code>0</code></div>
                 <div><b>B</b><code>0</code><code>1</code></div>
               </div>
-              <label className="review-notes"><span>审核备注</span><textarea value={notes} onChange={(event) => setNotes(event.target.value)} /></label>
+              <label className="review-notes">
+                <span>审核备注</span>
+                <textarea
+                  value={notes}
+                  onChange={(event) => {
+                    setNotes(event.target.value)
+                    draftPairId.current = selected.id
+                    draftDirty.current = true
+                  }}
+                />
+              </label>
               <footer className="review-actions">
                 <button className="secondary-button danger-button" type="button" disabled={pending} onClick={() => void submitReview('rejected')}><X size={15} />拒绝</button>
                 <button className="primary-button" type="button" disabled={pending || reviewItems.some(([key]) => checklist[key] !== true)} onClick={() => void submitReview('exact')}><Check size={15} />确认 EXACT</button>

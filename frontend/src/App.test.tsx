@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom/vitest'
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, expect, test, vi } from 'vitest'
 
 import App from './App'
@@ -512,7 +512,14 @@ test('shows real runtime state and lets a human review market equivalence', asyn
   for (const checkbox of screen.getAllByRole('checkbox', { name: /^已核对/ })) {
     fireEvent.click(checkbox)
   }
-  fireEvent.click(screen.getByRole('button', { name: '确认 EXACT' }))
+  expect(
+    screen.getAllByRole('checkbox', { name: /^已核对/ })
+      .filter((checkbox) => !(checkbox as HTMLInputElement).checked)
+      .map((checkbox) => checkbox.getAttribute('aria-label')),
+  ).toEqual([])
+  const confirmExact = screen.getByRole('button', { name: '确认 EXACT' })
+  expect(confirmExact).toBeEnabled()
+  fireEvent.click(confirmExact)
 
   expect(await screen.findByText('审核已保存，可进入自动执行')).toBeInTheDocument()
   expect(reviewBody).toMatchObject({
@@ -523,6 +530,115 @@ test('shows real runtime state and lets a human review market equivalence', asyn
     ],
   })
   expect(screen.queryByRole('button', { name: /批准订单|下单/ })).not.toBeInTheDocument()
+})
+
+test('preserves an unsaved review draft across automatic candidate refreshes', async () => {
+  vi.useFakeTimers()
+  try {
+    let pairReads = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.includes('/api/runtime')) {
+          return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+        }
+        if (url.endsWith('/api/pairs')) {
+          pairReads += 1
+          return Promise.resolve({ ok: true, json: async () => [{ ...pendingPair }] })
+        }
+        if (url.includes('/health')) {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({
+              status: 'ok',
+              trading_mode: 'limited_auto',
+              opening_enabled: true,
+              reason: 'configured default',
+            }),
+          })
+        }
+        return Promise.resolve({
+          ok: true,
+          json: async () => (url.includes('/api/executions') ? [] : opportunities),
+        })
+      }),
+    )
+
+    render(<App />)
+    await act(async () => { await Promise.resolve() })
+    fireEvent.click(screen.getByRole('button', { name: '审核' }))
+    await act(async () => { await Promise.resolve() })
+
+    const subject = screen.getByRole('checkbox', { name: '已核对标的主体' })
+    const notes = screen.getByRole('textbox', { name: '审核备注' })
+    fireEvent.click(subject)
+    fireEvent.change(notes, { target: { value: '尚未提交的审核备注' } })
+
+    await act(async () => {
+      vi.advanceTimersByTime(5_000)
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(pairReads).toBe(2)
+    expect(subject).toBeChecked()
+    expect(notes).toHaveValue('尚未提交的审核备注')
+  } finally {
+    vi.useRealTimers()
+  }
+})
+
+test('discards the current draft without prompting when switching candidates', async () => {
+  const confirm = vi.fn()
+  const secondPair = {
+    ...pendingPair,
+    id: 'pair-2',
+    title: '第二个互补市场',
+    checklist: { subject: true },
+    notes: '第二个候选的已保存备注',
+  }
+  vi.stubGlobal('confirm', confirm)
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/runtime')) {
+        return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+      }
+      if (url.endsWith('/api/pairs')) {
+        return Promise.resolve({ ok: true, json: async () => [pendingPair, secondPair] })
+      }
+      if (url.includes('/health')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            status: 'ok',
+            trading_mode: 'limited_auto',
+            opening_enabled: true,
+            reason: 'configured default',
+          }),
+        })
+      }
+      return Promise.resolve({
+        ok: true,
+        json: async () => (url.includes('/api/executions') ? [] : opportunities),
+      })
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '审核' }))
+  fireEvent.click(await screen.findByRole('checkbox', { name: '已核对标的主体' }))
+  fireEvent.change(screen.getByRole('textbox', { name: '审核备注' }), {
+    target: { value: '第一个候选的未保存备注' },
+  })
+  fireEvent.click(screen.getByRole('button', { name: /第二个互补市场/ }))
+
+  expect(screen.getByRole('checkbox', { name: '已核对标的主体' })).toBeChecked()
+  expect(screen.getByRole('textbox', { name: '审核备注' })).toHaveValue('第二个候选的已保存备注')
+  expect(confirm).not.toHaveBeenCalled()
 })
 
 test('keeps the empty oddpool candidate state inside the scroll region', async () => {
