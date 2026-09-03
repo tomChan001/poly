@@ -18,6 +18,37 @@ interface RiskForm {
   maximumArrivalGapSeconds: string
 }
 
+function normalizeDecimal(sign: string, value: string): string {
+  const [integer, decimal = ''] = value.split('.')
+  const normalizedInteger = integer.replace(/^0+(?=\d)/, '') || '0'
+  const normalizedDecimal = decimal.replace(/0+$/, '')
+  const normalized = normalizedDecimal ? `${normalizedInteger}.${normalizedDecimal}` : normalizedInteger
+  return normalized === '0' ? '0' : `${sign}${normalized}`
+}
+
+function expandScientificDecimal(value: string): string {
+  const match = value.trim().match(/^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/)
+  if (!match || (!match[2] && !match[3])) return value
+
+  const [, rawSign, whole = '', fraction = '', rawExponent] = match
+  const exponent = rawExponent ? Number.parseInt(rawExponent, 10) : 0
+  if (!Number.isSafeInteger(exponent)) return value
+
+  const digits = `${whole}${fraction}` || '0'
+  const decimalIndex = whole.length + exponent
+  let result: string
+
+  if (decimalIndex <= 0) {
+    result = `0.${'0'.repeat(-decimalIndex)}${digits}`
+  } else if (decimalIndex >= digits.length) {
+    result = `${digits}${'0'.repeat(decimalIndex - digits.length)}`
+  } else {
+    result = `${digits.slice(0, decimalIndex)}.${digits.slice(decimalIndex)}`
+  }
+
+  return normalizeDecimal(rawSign === '-' ? '-' : '', result)
+}
+
 function moveDecimal(value: string, places: number): string {
   const match = value.trim().match(/^(-?)(\d*)(?:\.(\d*))?$/)
   if (!match || (!match[2] && !match[3])) return value
@@ -35,29 +66,25 @@ function moveDecimal(value: string, places: number): string {
     result = `${digits.slice(0, decimalIndex)}.${digits.slice(decimalIndex)}`
   }
 
-  const [integer, decimal = ''] = result.split('.')
-  const normalizedInteger = integer.replace(/^0+(?=\d)/, '') || '0'
-  const normalizedDecimal = decimal.replace(/0+$/, '')
-  const normalized = normalizedDecimal ? `${normalizedInteger}.${normalizedDecimal}` : normalizedInteger
-  return normalized === '0' ? '0' : `${sign}${normalized}`
+  return normalizeDecimal(sign, result)
 }
 
-const toPercent = (ratio: string) => moveDecimal(ratio, 2)
+const toPercent = (ratio: string) => moveDecimal(expandScientificDecimal(ratio), 2)
 const toRatio = (percent: string) => moveDecimal(percent, -2)
 
 function toForm(policy: RiskPolicy): RiskForm {
   return {
     minimumRoiPercent: toPercent(policy.minimum_roi),
     maximumSettlementDays: String(policy.maximum_settlement_days),
-    maximumBookAgeSeconds: policy.maximum_book_age_seconds,
-    perTradeLimit: policy.per_trade_limit,
-    perEventLimit: policy.per_event_limit,
-    portfolioLimit: policy.portfolio_limit,
-    explicitCost: policy.explicit_cost,
-    riskBuffer: policy.risk_buffer,
-    maximumUnhedgedSeconds: policy.maximum_unhedged_seconds,
-    maximumUnhedgedLoss: policy.maximum_unhedged_loss,
-    maximumArrivalGapSeconds: policy.maximum_arrival_gap_seconds,
+    maximumBookAgeSeconds: expandScientificDecimal(policy.maximum_book_age_seconds),
+    perTradeLimit: expandScientificDecimal(policy.per_trade_limit),
+    perEventLimit: expandScientificDecimal(policy.per_event_limit),
+    portfolioLimit: expandScientificDecimal(policy.portfolio_limit),
+    explicitCost: expandScientificDecimal(policy.explicit_cost),
+    riskBuffer: expandScientificDecimal(policy.risk_buffer),
+    maximumUnhedgedSeconds: expandScientificDecimal(policy.maximum_unhedged_seconds),
+    maximumUnhedgedLoss: expandScientificDecimal(policy.maximum_unhedged_loss),
+    maximumArrivalGapSeconds: expandScientificDecimal(policy.maximum_arrival_gap_seconds),
   }
 }
 

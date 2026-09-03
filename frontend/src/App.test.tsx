@@ -158,6 +158,59 @@ test('loads and saves precise decimal risk limits without discrete step restrict
   }))
 })
 
+test('normalizes backend scientific decimal strings before displaying and saving a risk policy', async () => {
+  let savedBody: Record<string, unknown> | null = null
+  const scientificPolicy = {
+    ...riskPolicy,
+    minimum_roi: '+1E-7',
+    maximum_book_age_seconds: '+1e-7',
+    per_trade_limit: '1.250E+2',
+    per_event_limit: '2.50E+1',
+    portfolio_limit: '1E+2',
+    explicit_cost: '0E-10',
+    risk_buffer: '2.50E-1',
+    maximum_unhedged_seconds: '2E+0',
+    maximum_unhedged_loss: '1.20E+1',
+    maximum_arrival_gap_seconds: '5E-1',
+  }
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/settings/risk')) {
+        if (init?.method === 'PUT') savedBody = JSON.parse(String(init.body)) as Record<string, unknown>
+        return Promise.resolve({ ok: true, json: async () => scientificPolicy })
+      }
+      if (url.includes('/api/runtime')) return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+      if (url.includes('/health')) return Promise.resolve({ ok: true, json: async () => ({ status: 'ok' }) })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '风控' }))
+
+  expect(await screen.findByLabelText('最低保守 ROI')).toHaveValue(0.00001)
+  expect(screen.getByLabelText('行情最大年龄')).toHaveValue(0.0000001)
+  expect(screen.getByLabelText('单笔上限')).toHaveValue(125)
+  expect(screen.getByLabelText('显式成本')).toHaveValue(0)
+
+  fireEvent.click(screen.getByRole('button', { name: '保存策略' }))
+  await waitFor(() => expect(savedBody).toEqual({
+    minimum_roi: '0.0000001',
+    maximum_settlement_days: 30,
+    maximum_book_age_seconds: '0.0000001',
+    per_trade_limit: '125',
+    per_event_limit: '25',
+    portfolio_limit: '100',
+    explicit_cost: '0',
+    risk_buffer: '0.25',
+    maximum_unhedged_seconds: '2',
+    maximum_unhedged_loss: '12',
+    maximum_arrival_gap_seconds: '0.5',
+  }))
+})
+
 test('blocks an empty risk value before saving', async () => {
   let saveRequests = 0
   vi.stubGlobal(
