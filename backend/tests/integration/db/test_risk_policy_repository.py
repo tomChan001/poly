@@ -1,8 +1,9 @@
 import asyncio
 import os
+import re
 from dataclasses import replace
 from decimal import Decimal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import text
@@ -77,12 +78,32 @@ async def test_concurrent_postgres_risk_policy_initialize_seeds_one_default_vers
         "DATABASE_URL",
         "postgresql+asyncpg://poly:poly@localhost:5432/poly",
     )
-    engine = create_async_engine(database_url)
+    schema = f"risk_policy_test_{uuid4().hex}"
+    assert re.fullmatch(r"risk_policy_test_[0-9a-f]{32}", schema)
+    schema_identifier = f'"{schema}"'
+    admin_engine = create_async_engine(database_url)
+    engine = create_async_engine(
+        database_url,
+        connect_args={"server_settings": {"search_path": schema}},
+    )
     sessions = async_sessionmaker(engine, expire_on_commit=False)
-    created_versions: set[UUID] = set()
-    table_ready = False
+    schema_created = False
     try:
+        async with admin_engine.begin() as connection:
+            await connection.execute(text(f"CREATE SCHEMA {schema_identifier}"))
+            created_schema = await connection.scalar(
+                text(
+                    "SELECT schema_name FROM information_schema.schemata "
+                    "WHERE schema_name = :schema"
+                ),
+                {"schema": schema},
+            )
+            assert created_schema == schema
+        schema_created = True
+
         async with engine.begin() as connection:
+            current_schema = await connection.scalar(text("SELECT current_schema()"))
+            assert current_schema == schema
             await connection.execute(
                 text(
                     """
@@ -104,33 +125,71 @@ async def test_concurrent_postgres_risk_policy_initialize_seeds_one_default_vers
                     """
                 )
             )
-            existing_versions = set(
-                (
-                    await connection.execute(
-                        text("SELECT version FROM risk_policy_version")
-                    )
-                ).scalars()
+            await connection.execute(
+                text(
+                    """
+                    CREATE FUNCTION pause_risk_policy_seed()
+                    RETURNS trigger AS $$
+                    BEGIN
+                        PERFORM pg_sleep(0.25);
+                        RETURN NEW;
+                    END;
+                    $$ LANGUAGE plpgsql
+                    """
+                )
             )
-        table_ready = True
+            await connection.execute(
+                text(
+                    """
+                    CREATE TRIGGER pause_risk_policy_seed_insert
+                    BEFORE INSERT ON risk_policy_version
+                    FOR EACH ROW EXECUTE FUNCTION pause_risk_policy_seed()
+                    """
+                )
+            )
+            count = await connection.scalar(text("SELECT count(*) FROM risk_policy_version"))
+            assert count == 0
 
         first_store = PostgresRiskPolicyStore(sessions)
         second_store = PostgresRiskPolicyStore(sessions)
-        first, second = await asyncio.gather(
-            first_store.initialize(), second_store.initialize()
-        )
-        created_versions = {first.version, second.version} - existing_versions
+        first_task = asyncio.create_task(first_store.initialize())
+        await _wait_for_risk_policy_lock(admin_engine, granted=True)
+        second_task = asyncio.create_task(second_store.initialize())
+        await _wait_for_risk_policy_lock(admin_engine, granted=False)
+        first, second = await asyncio.gather(first_task, second_task)
 
-        assert len(created_versions) == 1
         assert first.version == second.version
         assert first_store.current is not None
         assert second_store.current is not None
         assert first_store.current.version == second_store.current.version
+        async with engine.connect() as connection:
+            count = await connection.scalar(text("SELECT count(*) FROM risk_policy_version"))
+        assert count == 1
     finally:
-        if table_ready:
-            async with engine.begin() as connection:
-                for version in created_versions:
-                    await connection.execute(
-                        text("DELETE FROM risk_policy_version WHERE version = :version"),
-                        {"version": version},
-                    )
         await engine.dispose()
+        if schema_created:
+            assert re.fullmatch(r"risk_policy_test_[0-9a-f]{32}", schema)
+            async with admin_engine.begin() as connection:
+                await connection.execute(text(f"DROP SCHEMA {schema_identifier} CASCADE"))
+        await admin_engine.dispose()
+
+
+async def _wait_for_risk_policy_lock(engine, *, granted: bool) -> None:
+    for _ in range(50):
+        async with engine.connect() as connection:
+            count = await connection.scalar(
+                text(
+                    """
+                    SELECT count(*)
+                    FROM pg_locks
+                    WHERE locktype = 'advisory'
+                      AND objid = hashtext('poly-risk-policy-version')
+                      AND granted = :granted
+                    """
+                ),
+                {"granted": granted},
+            )
+        if count:
+            return
+        await asyncio.sleep(0.01)
+    pytest.fail(f"risk policy advisory lock did not reach granted={granted}")
