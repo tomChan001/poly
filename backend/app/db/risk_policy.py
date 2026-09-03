@@ -15,7 +15,10 @@ class PostgresRiskPolicyStore:
         self.current: RiskPolicy | None = None
 
     async def initialize(self) -> RiskPolicy:
-        async with self._sessions() as session:
+        async with self._sessions.begin() as session:
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext('poly-risk-policy-version'))")
+            )
             result = await session.execute(
                 text(
                     "SELECT * FROM risk_policy_version "
@@ -23,48 +26,18 @@ class PostgresRiskPolicyStore:
                 )
             )
             row = result.first()
-        if row is None:
-            return await self.create(RiskPolicyInput.defaults())
-        self.current = self._policy(row._mapping)
-        return self.current
+            if row is None:
+                policy = _snapshot(RiskPolicyInput.defaults())
+                await _insert(session, policy)
+            else:
+                policy = self._policy(row._mapping)
+        self.current = policy
+        return policy
 
     async def create(self, value: RiskPolicyInput) -> RiskPolicy:
-        policy = RiskPolicy(
-            version=uuid4(),
-            created_at=datetime.now(UTC),
-            minimum_roi=value.minimum_roi,
-            maximum_settlement_days=value.maximum_settlement_days,
-            maximum_book_age_seconds=value.maximum_book_age_seconds,
-            per_trade_limit=value.per_trade_limit,
-            per_event_limit=value.per_event_limit,
-            portfolio_limit=value.portfolio_limit,
-            explicit_cost=value.explicit_cost,
-            risk_buffer=value.risk_buffer,
-            maximum_unhedged_seconds=value.maximum_unhedged_seconds,
-            maximum_unhedged_loss=value.maximum_unhedged_loss,
-            maximum_arrival_gap_seconds=value.maximum_arrival_gap_seconds,
-        )
+        policy = _snapshot(value)
         async with self._sessions.begin() as session:
-            await session.execute(
-                text(
-                    """
-                    INSERT INTO risk_policy_version (
-                        version, created_at, minimum_roi, maximum_settlement_days,
-                        maximum_book_age_seconds, per_trade_limit, per_event_limit,
-                        portfolio_limit, explicit_cost, risk_buffer,
-                        maximum_unhedged_seconds, maximum_unhedged_loss,
-                        maximum_arrival_gap_seconds
-                    ) VALUES (
-                        :version, :created_at, :minimum_roi, :maximum_settlement_days,
-                        :maximum_book_age_seconds, :per_trade_limit, :per_event_limit,
-                        :portfolio_limit, :explicit_cost, :risk_buffer,
-                        :maximum_unhedged_seconds, :maximum_unhedged_loss,
-                        :maximum_arrival_gap_seconds
-                    )
-                    """
-                ),
-                _parameters(policy),
-            )
+            await _insert(session, policy)
         self.current = policy
         return policy
 
@@ -116,3 +89,44 @@ def _parameters(policy: RiskPolicy) -> dict[str, object]:
         "maximum_unhedged_loss": policy.maximum_unhedged_loss,
         "maximum_arrival_gap_seconds": policy.maximum_arrival_gap_seconds,
     }
+
+
+def _snapshot(value: RiskPolicyInput) -> RiskPolicy:
+    return RiskPolicy(
+        version=uuid4(),
+        created_at=datetime.now(UTC),
+        minimum_roi=value.minimum_roi,
+        maximum_settlement_days=value.maximum_settlement_days,
+        maximum_book_age_seconds=value.maximum_book_age_seconds,
+        per_trade_limit=value.per_trade_limit,
+        per_event_limit=value.per_event_limit,
+        portfolio_limit=value.portfolio_limit,
+        explicit_cost=value.explicit_cost,
+        risk_buffer=value.risk_buffer,
+        maximum_unhedged_seconds=value.maximum_unhedged_seconds,
+        maximum_unhedged_loss=value.maximum_unhedged_loss,
+        maximum_arrival_gap_seconds=value.maximum_arrival_gap_seconds,
+    )
+
+
+async def _insert(session: AsyncSession, policy: RiskPolicy) -> None:
+    await session.execute(
+        text(
+            """
+            INSERT INTO risk_policy_version (
+                version, created_at, minimum_roi, maximum_settlement_days,
+                maximum_book_age_seconds, per_trade_limit, per_event_limit,
+                portfolio_limit, explicit_cost, risk_buffer,
+                maximum_unhedged_seconds, maximum_unhedged_loss,
+                maximum_arrival_gap_seconds
+            ) VALUES (
+                :version, :created_at, :minimum_roi, :maximum_settlement_days,
+                :maximum_book_age_seconds, :per_trade_limit, :per_event_limit,
+                :portfolio_limit, :explicit_cost, :risk_buffer,
+                :maximum_unhedged_seconds, :maximum_unhedged_loss,
+                :maximum_arrival_gap_seconds
+            )
+            """
+        ),
+        _parameters(policy),
+    )
