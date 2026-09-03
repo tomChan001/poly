@@ -36,6 +36,16 @@ def test_execution_snapshot_defaults_missing_capital_settlement_to_false() -> No
     assert restored.capital_settled is False
     assert _snapshot(restored)["capital_settled"] is False
 
+    snapshot = _snapshot(
+        ExecutionRecord(
+            correlation_id="column-wins",
+            state=ExecutionState.PAIRED,
+            requested_quantity=Decimal(10),
+            capital_settled=True,
+        )
+    )
+    assert _record(snapshot, capital_settled=False).capital_settled is False
+
 
 @pytest.mark.asyncio
 async def test_postgres_recovery_candidate_query_targets_unsettled_records() -> None:
@@ -59,8 +69,49 @@ async def test_postgres_recovery_candidate_query_targets_unsettled_records() -> 
     assert session.statement is not None
     sql = session.statement.text
     assert "state = 'submitted'" in sql
-    assert "capital_settled" in sql
+    assert "capital_settled = FALSE" in sql
+    assert "snapshot ->>" not in sql
     assert "ORDER BY occurred_at DESC" in sql
+
+
+@pytest.mark.asyncio
+async def test_postgres_save_persists_capital_settlement_column() -> None:
+    class RecordingSession:
+        statement = None
+        parameters = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def execute(self, statement, parameters):
+            self.statement = statement
+            self.parameters = parameters
+
+    class RecordingSessions:
+        def __init__(self, session) -> None:
+            self._session = session
+
+        def begin(self):
+            return self._session
+
+    session = RecordingSession()
+    store = PostgresExecutionStore(RecordingSessions(session))
+
+    await store.save(
+        ExecutionRecord(
+            correlation_id="settled-execution",
+            state=ExecutionState.PAIRED,
+            requested_quantity=Decimal(10),
+            capital_settled=True,
+        )
+    )
+
+    assert session.statement is not None
+    assert "capital_settled" in session.statement.text
+    assert session.parameters["capital_settled"] is True
 
 
 @pytest.mark.asyncio
@@ -135,6 +186,7 @@ async def test_postgres_execution_history_survives_repository_recreation() -> No
                         correlation_id VARCHAR(64) PRIMARY KEY,
                         occurred_at TIMESTAMPTZ NOT NULL,
                         state VARCHAR(32) NOT NULL,
+                        capital_settled BOOLEAN NOT NULL DEFAULT FALSE,
                         snapshot JSONB NOT NULL,
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                     )

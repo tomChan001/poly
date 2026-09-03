@@ -31,14 +31,16 @@ class PostgresExecutionStore:
                 text(
                     """
                     INSERT INTO execution_record (
-                        correlation_id, occurred_at, state, snapshot, updated_at
+                        correlation_id, occurred_at, state, capital_settled,
+                        snapshot, updated_at
                     ) VALUES (
-                        :correlation_id, :occurred_at, :state,
+                        :correlation_id, :occurred_at, :state, :capital_settled,
                         CAST(:snapshot AS jsonb), now()
                     )
                     ON CONFLICT (correlation_id) DO UPDATE SET
                         occurred_at = LEAST(execution_record.occurred_at, EXCLUDED.occurred_at),
                         state = EXCLUDED.state,
+                        capital_settled = EXCLUDED.capital_settled,
                         snapshot = EXCLUDED.snapshot,
                         updated_at = now()
                     """
@@ -47,6 +49,7 @@ class PostgresExecutionStore:
                     "correlation_id": record.correlation_id,
                     "occurred_at": occurred_at,
                     "state": record.state.value,
+                    "capital_settled": record.capital_settled,
                     "snapshot": json.dumps(_snapshot(record)),
                 },
             )
@@ -54,40 +57,55 @@ class PostgresExecutionStore:
     async def list(self) -> list[ExecutionRecord]:
         async with self._sessions() as session:
             result = await session.execute(
-                text("SELECT snapshot FROM execution_record ORDER BY occurred_at DESC")
+                text(
+                    "SELECT snapshot, capital_settled "
+                    "FROM execution_record ORDER BY occurred_at DESC"
+                )
             )
-            return [_record(row._mapping["snapshot"]) for row in result]
+            return [
+                _record(
+                    row._mapping["snapshot"],
+                    capital_settled=bool(row._mapping["capital_settled"]),
+                )
+                for row in result
+            ]
 
     async def list_recovery_candidates(self) -> builtins.list[ExecutionRecord]:
         async with self._sessions() as session:
             result = await session.execute(
                 text(
                     """
-                    SELECT snapshot
+                    SELECT snapshot, capital_settled
                     FROM execution_record
-                    WHERE state = 'submitted'
-                       OR (
-                           state IN ('paired', 'partially_hedged', 'exception', 'cancelled')
-                           AND COALESCE(snapshot ->> 'capital_settled', 'false') <> 'true'
-                       )
+                    WHERE state = 'submitted' OR capital_settled = FALSE
                     ORDER BY occurred_at DESC
                     """
                 )
             )
-            return [_record(row._mapping["snapshot"]) for row in result]
+            return [
+                _record(
+                    row._mapping["snapshot"],
+                    capital_settled=bool(row._mapping["capital_settled"]),
+                )
+                for row in result
+            ]
 
     async def get(self, correlation_id: str) -> ExecutionRecord:
         async with self._sessions() as session:
             result = await session.execute(
                 text(
-                    "SELECT snapshot FROM execution_record WHERE correlation_id = :correlation_id"
+                    "SELECT snapshot, capital_settled FROM execution_record "
+                    "WHERE correlation_id = :correlation_id"
                 ),
                 {"correlation_id": correlation_id},
             )
             row = result.first()
             if row is None:
                 raise KeyError(correlation_id)
-            return _record(row._mapping["snapshot"])
+            return _record(
+                row._mapping["snapshot"],
+                capital_settled=bool(row._mapping["capital_settled"]),
+            )
 
 
 def _snapshot(record: ExecutionRecord) -> dict[str, object]:
@@ -126,7 +144,11 @@ def _snapshot(record: ExecutionRecord) -> dict[str, object]:
     }
 
 
-def _record(snapshot: dict[str, object]) -> ExecutionRecord:
+def _record(
+    snapshot: dict[str, object],
+    *,
+    capital_settled: bool | None = None,
+) -> ExecutionRecord:
     raw_legs = snapshot.get("legs")
     raw_transitions = snapshot.get("transitions")
     if not isinstance(raw_legs, dict) or not isinstance(raw_transitions, list):
@@ -171,7 +193,11 @@ def _record(snapshot: dict[str, object]) -> ExecutionRecord:
         matched_quantity=Decimal(str(snapshot["matched_quantity"])),
         unhedged_quantity=Decimal(str(snapshot["unhedged_quantity"])),
         transitions=transitions,
-        capital_settled=_capital_settled(snapshot.get("capital_settled")),
+        capital_settled=(
+            _capital_settled(snapshot.get("capital_settled"))
+            if capital_settled is None
+            else capital_settled
+        ),
     )
 
 
