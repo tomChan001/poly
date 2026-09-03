@@ -6,6 +6,14 @@ import pytest
 from backend.app.services.settings import InMemoryRiskPolicyStore, RiskPolicyInput
 
 
+def test_risk_policy_constructor_makes_seed_current_synchronously() -> None:
+    store = InMemoryRiskPolicyStore(RiskPolicyInput.defaults())
+
+    assert store.current is not None
+    assert store.current.minimum_roi == Decimal("0.03")
+    assert store.current.created_at.tzinfo is UTC
+
+
 @pytest.mark.asyncio
 async def test_risk_policy_updates_create_immutable_versions() -> None:
     store = InMemoryRiskPolicyStore()
