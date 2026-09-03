@@ -146,7 +146,11 @@ class ExecutionSupervisor:
                 ),
                 Decimal(0),
             )
-            await self._fee_reconciliation.compare(estimated, actual)
+            await self._fee_reconciliation.compare(
+                estimated,
+                actual,
+                submission_permission=submission_permission,
+            )
 
         if record.state not in {
             ExecutionState.PARTIALLY_HEDGED,

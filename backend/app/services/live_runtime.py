@@ -284,13 +284,12 @@ class LiveRuntimeService:
             maximum_unhedged_loss,
         )
         for candidate in records:
-            # Recovery uses the same global -> correlation order as openings.
-            # It ignores an OFF permission for reconciliation, but keeps the
-            # scoped permission available to persist any incident fail-close.
-            async with (
-                self._system_control.opening_submission_guard() as permission,
-                self._execution_store.execution_guard(candidate.correlation_id),
-            ):
+            # Recovery keeps the correlation fence while it queries venues,
+            # but never holds the global submission fence across that I/O.
+            # Any OFF/fee/incident side effect happens after this lock exits.
+            record_to_supervise: ExecutionRecord | None = None
+            pending_disable_reason: str | None = None
+            async with self._execution_store.execution_guard(candidate.correlation_id):
                     try:
                         record = await self._execution_store.get(
                             candidate.correlation_id
@@ -301,7 +300,7 @@ class LiveRuntimeService:
                         record = await executor.recover_submitted(
                             record,
                             now,
-                            submission_permission=permission,
+                            supervise=False,
                         )
                     if record.state in {
                         ExecutionState.PAIRED,
@@ -311,11 +310,16 @@ class LiveRuntimeService:
                     }:
                         await self._settle_capital(record)
                     pending_disable_reason = executor.take_pending_disable_reason()
-                    if pending_disable_reason is not None:
-                        await self._system_control.disable_opening_with_permission(
-                            permission,
-                            pending_disable_reason,
-                        )
+                    record_to_supervise = record
+            if pending_disable_reason is not None:
+                await self._system_control.disable_opening_async(pending_disable_reason)
+            if self._execution_supervisor is not None and record_to_supervise is not None:
+                await self._execution_supervisor.finalize(
+                    record_to_supervise,
+                    record_to_supervise.evidence,
+                    now=now,
+                    maximum_unhedged_loss=maximum_unhedged_loss,
+                )
 
     async def _settle_capital(self, record: ExecutionRecord) -> None:
         if record.capital_settled:

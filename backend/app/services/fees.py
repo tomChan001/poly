@@ -2,7 +2,10 @@ from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal
 
 from backend.app.domain.enums import Venue
-from backend.app.services.system_control import SystemControl
+from backend.app.services.system_control import (
+    OpeningSubmissionPermission,
+    SystemControl,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,11 +73,19 @@ class FeeReconciliationService:
         self,
         estimated: Decimal,
         actual: Decimal,
+        *,
+        submission_permission: OpeningSubmissionPermission | None = None,
     ) -> FeeReconciliationResult:
         difference = abs(actual - estimated)
         matches = difference <= self._tolerance
         if not matches:
-            await self._system_control.disable_opening_async(
-                "actual fee differs from estimate"
-            )
+            if submission_permission is None:
+                await self._system_control.disable_opening_async(
+                    "actual fee differs from estimate"
+                )
+            else:
+                await self._system_control.disable_opening_with_permission(
+                    submission_permission,
+                    "actual fee differs from estimate",
+                )
         return FeeReconciliationResult(matches, difference)

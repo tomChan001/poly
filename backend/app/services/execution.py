@@ -422,6 +422,7 @@ class ControlledExecutionService:
         now: datetime,
         *,
         submission_permission: OpeningSubmissionPermission | None = None,
+        supervise: bool = True,
     ) -> ExecutionRecord:
         if record.state is not ExecutionState.SUBMITTED:
             raise ValueError("only submitted executions can be recovered")
@@ -436,7 +437,13 @@ class ControlledExecutionService:
                 if result is None
                 else replace(result, client_order_id=client_order_id)
             )
-        await self._finalize(record, now, record.evidence, submission_permission)
+        await self._finalize(
+            record,
+            now,
+            record.evidence,
+            submission_permission,
+            supervise=supervise,
+        )
         return record
 
     async def _finalize(
@@ -445,6 +452,8 @@ class ControlledExecutionService:
         now: datetime,
         evidence: ExecutionEvidence | None = None,
         submission_permission: OpeningSubmissionPermission | None = None,
+        *,
+        supervise: bool = True,
     ) -> None:
         quantities = [record.legs[venue].filled_quantity for venue in Venue]
         record.matched_quantity = min(quantities)
@@ -471,7 +480,7 @@ class ControlledExecutionService:
             self._pending_disable_reason = "execution outcome unresolved"
         if self._store is not None:
             await self._store.save(record)
-        if self._supervisor is not None:
+        if self._supervisor is not None and supervise:
             await self._supervisor.finalize(
                 record,
                 evidence,
