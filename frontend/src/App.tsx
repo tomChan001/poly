@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
   BookOpenCheck,
@@ -49,8 +49,13 @@ function App() {
   })
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [realOrderingPending, setRealOrderingPending] = useState(false)
+  const [realOrderingError, setRealOrderingError] = useState<string | null>(null)
+  const realOrderingPendingRef = useRef(false)
+  const realOrderingRevisionRef = useRef(0)
 
   const refresh = async () => {
+    const statusRevision = realOrderingRevisionRef.current
     setLoading(true)
     try {
       const [latestOpportunities, latestExecutions, latestSystemStatus, latestRuntimeStatus] = await Promise.all([
@@ -61,8 +66,10 @@ function App() {
       ])
       setOpportunities(latestOpportunities)
       setExecutions(latestExecutions)
-      setSystemStatus(latestSystemStatus)
-      setRuntimeStatus(latestRuntimeStatus)
+      if (statusRevision === realOrderingRevisionRef.current) {
+        setSystemStatus(latestSystemStatus)
+        setRuntimeStatus(latestRuntimeStatus)
+      }
       setError(null)
     } catch {
       setError('无法读取机会数据')
@@ -81,15 +88,30 @@ function App() {
   )
 
   const updateRealOrdering = async (enabled: boolean) => {
-    const result = await setRealOrdering(enabled)
-    setSystemStatus((current) => ({
-      ...current,
-      opening_enabled: result.opening_enabled,
-      reason: result.reason,
-    }))
-    setRuntimeStatus((current) => current === null
-      ? current
-      : { ...current, opening_enabled: result.opening_enabled })
+    if (realOrderingPendingRef.current) return
+
+    realOrderingPendingRef.current = true
+    setRealOrderingPending(true)
+    setRealOrderingError(null)
+    try {
+      const result = await setRealOrdering(enabled)
+      realOrderingRevisionRef.current += 1
+      setSystemStatus((current) => ({
+        ...current,
+        opening_enabled: result.opening_enabled,
+        reason: result.reason,
+      }))
+      setRuntimeStatus((current) => current === null
+        ? current
+        : { ...current, opening_enabled: result.opening_enabled })
+    } catch (requestError) {
+      setRealOrderingError(
+        requestError instanceof Error ? requestError.message : '更新真实下单设置失败',
+      )
+    } finally {
+      realOrderingPendingRef.current = false
+      setRealOrderingPending(false)
+    }
   }
 
   return (
@@ -165,6 +187,8 @@ function App() {
           <IntegrationSettingsPage
             realOrderingEnabled={systemStatus.opening_enabled}
             onRealOrderingChange={updateRealOrdering}
+            realOrderingPending={realOrderingPending}
+            realOrderingError={realOrderingError}
           />
         )}
       </main>

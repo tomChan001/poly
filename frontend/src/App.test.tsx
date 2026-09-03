@@ -568,6 +568,118 @@ test('disables the real-ordering switch while its change is pending', async () =
   expect(await screen.findByText('真实下单已开启')).toBeInTheDocument()
 })
 
+test('keeps a successful real-ordering change when an older health refresh resolves afterward', async () => {
+  let resolveHealth: (value: unknown) => void = () => undefined
+  const staleHealth = new Promise((resolve) => { resolveHealth = resolve })
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === '/api/system-control/opening' && init?.method === 'PUT') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ opening_enabled: true, reason: 'operator enabled real ordering', version: 2 }),
+        })
+      }
+      if (url.includes('/health')) return staleHealth
+      if (url.includes('/api/runtime')) return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: '集成' }))
+  const realOrdering = await screen.findByRole('switch', { name: '真实下单' })
+  fireEvent.click(realOrdering)
+  expect(await screen.findByText('真实下单已开启')).toBeInTheDocument()
+
+  await act(async () => {
+    resolveHealth({
+      ok: true,
+      json: async () => ({ status: 'ok', opening_enabled: false, reason: 'operator disabled real ordering' }),
+    })
+    await Promise.resolve()
+  })
+
+  expect(screen.getByText('真实下单已开启')).toBeInTheDocument()
+  expect(realOrdering).toBeChecked()
+})
+
+test('keeps the real-ordering lock while navigating away during a pending change', async () => {
+  let resolveChange: (value: unknown) => void = () => undefined
+  const pendingChange = new Promise((resolve) => { resolveChange = resolve })
+  const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input)
+    if (url === '/api/system-control/opening' && init?.method === 'PUT') return pendingChange
+    if (url.includes('/health')) return Promise.resolve({ ok: true, json: async () => ({ status: 'ok', opening_enabled: false, reason: 'operator disabled real ordering' }) })
+    if (url.includes('/api/runtime')) return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  })
+  vi.stubGlobal('fetch', fetchMock)
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '集成' }))
+  fireEvent.click(await screen.findByRole('switch', { name: '真实下单' }))
+  fireEvent.click(screen.getByRole('button', { name: '机会' }))
+  fireEvent.click(screen.getByRole('button', { name: '集成' }))
+
+  const realOrdering = await screen.findByRole('switch', { name: '真实下单' })
+  expect(realOrdering).toBeDisabled()
+  fireEvent.click(realOrdering)
+  expect(fetchMock.mock.calls.filter(([input]) => String(input) === '/api/system-control/opening')).toHaveLength(1)
+
+  resolveChange({
+    ok: true,
+    json: async () => ({ opening_enabled: true, reason: 'operator enabled real ordering', version: 2 }),
+  })
+  expect(await screen.findByText('真实下单已开启')).toBeInTheDocument()
+})
+
+test('keeps a real-ordering error across navigation and clears it after a later success', async () => {
+  let changes = 0
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === '/api/system-control/opening' && init?.method === 'PUT') {
+        changes += 1
+        if (changes === 1) {
+          return Promise.resolve({ ok: false, status: 409, json: async () => ({ detail: 'operator lock required' }) })
+        }
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ opening_enabled: true, reason: 'operator enabled real ordering', version: 2 }),
+        })
+      }
+      if (url.includes('/health')) return Promise.resolve({ ok: true, json: async () => ({ status: 'ok', opening_enabled: false, reason: 'operator disabled real ordering' }) })
+      if (url.includes('/api/runtime')) return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '集成' }))
+  const initialSwitch = await screen.findByRole('switch', { name: '真实下单' })
+  fireEvent.click(initialSwitch)
+  const errorAlert = await screen.findByRole('alert')
+  expect(errorAlert).toHaveTextContent('operator lock required')
+  expect(errorAlert).toHaveAttribute('aria-live', 'assertive')
+  expect(initialSwitch).toHaveAttribute(
+    'aria-describedby',
+    'real-ordering-description real-ordering-error',
+  )
+
+  fireEvent.click(screen.getByRole('button', { name: '机会' }))
+  fireEvent.click(screen.getByRole('button', { name: '集成' }))
+  const realOrdering = await screen.findByRole('switch', { name: '真实下单' })
+  expect(realOrdering).not.toBeChecked()
+  expect(screen.getByRole('alert')).toHaveTextContent('operator lock required')
+
+  fireEvent.click(realOrdering)
+  expect(await screen.findByText('真实下单已开启')).toBeInTheDocument()
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+})
+
 test('always saves the canonical Oddpool API address', async () => {
   let savedBody: Record<string, unknown> | null = null
   const legacyOddpoolIntegration = {
