@@ -7,7 +7,6 @@ from enum import StrEnum
 from typing import Protocol
 from uuid import uuid4
 
-from backend.app.core.config import TradingMode
 from backend.app.domain.enums import ExecutionState, MappingStatus, Venue
 from backend.app.domain.models import validate_transition
 from backend.app.services.system_control import SystemControl
@@ -191,7 +190,6 @@ class ExecutionSupervisorPort(Protocol):
         record: ExecutionRecord,
         evidence: ExecutionEvidence | None = None,
         *,
-        mode: TradingMode,
         now: datetime,
         maximum_unhedged_loss: Decimal = Decimal(0),
     ) -> object | None: ...
@@ -216,14 +214,12 @@ class ControlledExecutionService:
         self,
         ports: Mapping[Venue, ExecutionTradingPort],
         system_control: SystemControl,
-        trading_mode: TradingMode,
         store: ExecutionStore | None = None,
         supervisor: ExecutionSupervisorPort | None = None,
         maximum_unhedged_loss: Decimal = Decimal(0),
     ) -> None:
         self._ports = ports
         self._system_control = system_control
-        self._trading_mode = trading_mode
         self._authorizations = ExecutionAuthorizationService()
         self._store = store
         self._supervisor = supervisor
@@ -235,12 +231,9 @@ class ControlledExecutionService:
         current_evidence: ExecutionEvidence,
         now: datetime,
     ) -> ExecutionRecord:
-        if self._trading_mode is not TradingMode.LIMITED_AUTO:
-            raise AuthorizationRejected("real submission requires limited_auto mode")
-        if not self._system_control.opening_enabled:
-            raise AuthorizationRejected("opening kill switch is disabled")
-
         self._authorizations.consume(authorization, current_evidence, now)
+        if not self._system_control.opening_enabled:
+            raise AuthorizationRejected("real ordering is disabled")
         requests = self._requests(authorization)
         record = ExecutionRecord(
             correlation_id=authorization.correlation_id,
@@ -254,6 +247,12 @@ class ControlledExecutionService:
             # process exits after an exchange accepts an order, restart logic
             # can reconcile this record without opening the same pair again.
             await self._store.save(record)
+
+        if not self._system_control.opening_enabled:
+            record.transition(ExecutionState.EXCEPTION, now)
+            if self._store is not None:
+                await self._store.save(record)
+            raise AuthorizationRejected("real ordering is disabled")
 
         results = await asyncio.gather(
             *(self._submit_or_recover(request) for request in requests.values()),
@@ -319,7 +318,6 @@ class ControlledExecutionService:
             await self._supervisor.finalize(
                 record,
                 evidence,
-                mode=self._trading_mode,
                 now=now,
                 maximum_unhedged_loss=self._maximum_unhedged_loss,
             )

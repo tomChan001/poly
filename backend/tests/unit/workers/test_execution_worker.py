@@ -3,7 +3,6 @@ from decimal import Decimal
 
 import pytest
 
-from backend.app.core.config import TradingMode
 from backend.app.domain.enums import MappingStatus, Venue
 from backend.app.services.execution import (
     AuthorizationRejected,
@@ -56,7 +55,6 @@ async def test_worker_discards_authorization_when_refreshed_evidence_changes() -
     service = ControlledExecutionService(
         ports,
         SystemControl(opening_enabled=True),
-        TradingMode.LIMITED_AUTO,
     )
     authorization = ExecutionAuthorizationService().issue(MappingStatus.EXACT, evidence(), NOW)
     worker = ExecutionWorker(service, lambda _: evidence("new-k-book"))

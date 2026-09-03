@@ -4,7 +4,6 @@ from decimal import Decimal
 
 import pytest
 
-from backend.app.core.config import TradingMode
 from backend.app.domain.enums import ExecutionState, MappingStatus, Venue
 from backend.app.services.emergency_hedge import EmergencyHedgeService
 from backend.app.services.execution import (
@@ -120,7 +119,6 @@ async def test_unknown_response_is_recovered_without_resubmission() -> None:
     service = ControlledExecutionService(
         {Venue.KALSHI: kalshi, Venue.POLYMARKET: polymarket},
         SystemControl(opening_enabled=True),
-        TradingMode.LIMITED_AUTO,
     )
 
     execution = await service.execute(
@@ -147,7 +145,6 @@ async def test_unclassified_transport_failure_also_queries_before_deciding() -> 
     service = ControlledExecutionService(
         {Venue.KALSHI: kalshi, Venue.POLYMARKET: polymarket},
         SystemControl(opening_enabled=True),
-        TradingMode.LIMITED_AUTO,
     )
 
     execution = await service.execute(
@@ -181,7 +178,7 @@ async def test_unresolved_order_outcome_disables_new_opening() -> None:
     authorization = ExecutionAuthorizationService().issue(
         MappingStatus.EXACT, evidence(), NOW
     )
-    service = ControlledExecutionService(ports, control, TradingMode.LIMITED_AUTO)
+    service = ControlledExecutionService(ports, control)
 
     execution = await service.execute(
         authorization, evidence(), NOW + timedelta(seconds=1)
@@ -208,7 +205,6 @@ async def test_duplicate_fill_reports_do_not_inflate_matched_quantity() -> None:
     service = ControlledExecutionService(
         ports,
         SystemControl(opening_enabled=True),
-        TradingMode.LIMITED_AUTO,
     )
 
     execution = await service.execute(
@@ -231,7 +227,6 @@ async def test_partial_leg_uses_minimum_filled_quantity() -> None:
     service = ControlledExecutionService(
         ports,
         SystemControl(opening_enabled=True),
-        TradingMode.LIMITED_AUTO,
     )
 
     execution = await service.execute(
@@ -266,7 +261,6 @@ async def test_rejection_matrix(
     service = ControlledExecutionService(
         ports,
         SystemControl(opening_enabled=True),
-        TradingMode.LIMITED_AUTO,
     )
 
     execution = await service.execute(
@@ -293,7 +287,6 @@ async def test_submitted_execution_recovers_after_process_restart_without_resubm
     service = ControlledExecutionService(
         ports,
         control,
-        TradingMode.LIMITED_AUTO,
         supervisor=supervisor,
     )
     submitted = ExecutionRecord(
@@ -313,10 +306,7 @@ async def test_submitted_execution_recovers_after_process_restart_without_resubm
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", [TradingMode.READ_ONLY, TradingMode.SHADOW])
-async def test_partial_fill_persists_incident_and_simulated_emergency_action(
-    mode: TradingMode,
-) -> None:
+async def test_partial_fill_persists_incident_and_real_emergency_action() -> None:
     control = SystemControl(opening_enabled=True)
     incidents = InMemoryIncidentStore()
     outbox = InMemoryOutbox()
@@ -328,13 +318,10 @@ async def test_partial_fill_persists_incident_and_simulated_emergency_action(
         control,
         incidents,
         NotificationService(outbox),
-        emergency_service_factory=lambda selected_mode: EmergencyHedgeService(
-            emergency_ports,
-            trading_mode=selected_mode,
-        ),
+        emergency_service_factory=lambda: EmergencyHedgeService(emergency_ports),
     )
     record = ExecutionRecord(
-        correlation_id=f"fault-{mode.value}",
+        correlation_id="fault-partial",
         state=ExecutionState.PARTIALLY_HEDGED,
         requested_quantity=Decimal(10),
         matched_quantity=Decimal(6),
@@ -348,14 +335,12 @@ async def test_partial_fill_persists_incident_and_simulated_emergency_action(
     first = await supervisor.finalize(
         record,
         evidence(),
-        mode=mode,
         occurred_at=NOW + timedelta(seconds=2),
         maximum_unhedged_loss=Decimal(10),
     )
     second = await supervisor.finalize(
         record,
         evidence(),
-        mode=mode,
         occurred_at=NOW + timedelta(seconds=3),
         maximum_unhedged_loss=Decimal(10),
     )
@@ -365,12 +350,12 @@ async def test_partial_fill_persists_incident_and_simulated_emergency_action(
     assert control.opening_enabled is False
     assert control.reason == "execution incident"
     assert [incident.action for incident in await incidents.list()] == [
-        "simulate_hedge"
+        "hedge"
     ]
     assert [event.event_type for event in outbox.events.values()] == [
         "execution.partially_hedged"
     ]
-    assert sum(port.submissions for port in emergency_ports.values()) == 0
+    assert sum(port.submissions for port in emergency_ports.values()) == 1
 
 
 @pytest.mark.asyncio
@@ -382,12 +367,11 @@ async def test_exception_finalize_is_idempotent() -> None:
         control,
         incidents,
         NotificationService(outbox),
-        emergency_service_factory=lambda selected_mode: EmergencyHedgeService(
+        emergency_service_factory=lambda: EmergencyHedgeService(
             {
                 Venue.KALSHI: RecordingEmergencyPort(),
                 Venue.POLYMARKET: RecordingEmergencyPort(),
             },
-            trading_mode=selected_mode,
         ),
     )
     record = ExecutionRecord(
@@ -399,13 +383,11 @@ async def test_exception_finalize_is_idempotent() -> None:
     first = await supervisor.finalize(
         record,
         evidence(),
-        mode=TradingMode.SHADOW,
         occurred_at=NOW + timedelta(seconds=4),
     )
     second = await supervisor.finalize(
         record,
         evidence(),
-        mode=TradingMode.SHADOW,
         occurred_at=NOW + timedelta(seconds=5),
     )
 
@@ -441,7 +423,6 @@ async def test_limited_auto_partial_fill_submits_one_bound_emergency_order() -> 
     service = ControlledExecutionService(
         primary_ports,
         control,
-        TradingMode.LIMITED_AUTO,
         supervisor=supervisor,
         maximum_unhedged_loss=Decimal(10),
     )
@@ -454,7 +435,6 @@ async def test_limited_auto_partial_fill_submits_one_bound_emergency_order() -> 
     await supervisor.finalize(
         execution,
         current_evidence,
-        mode=TradingMode.LIMITED_AUTO,
         now=NOW + timedelta(seconds=2),
         maximum_unhedged_loss=Decimal(10),
     )
@@ -478,10 +458,7 @@ async def test_concurrent_partial_finalization_claims_one_emergency_action() -> 
         control,
         incidents,
         NotificationService(outbox),
-        emergency_service_factory=lambda mode: EmergencyHedgeService(
-            emergency_ports,
-            trading_mode=mode,
-        ),
+        emergency_service_factory=lambda: EmergencyHedgeService(emergency_ports),
     )
     record = ExecutionRecord(
         correlation_id="concurrent-partial",
@@ -499,14 +476,12 @@ async def test_concurrent_partial_finalization_claims_one_emergency_action() -> 
         supervisor.finalize(
             record,
             evidence(),
-            mode=TradingMode.LIMITED_AUTO,
             now=NOW,
             maximum_unhedged_loss=Decimal(10),
         ),
         supervisor.finalize(
             record,
             evidence(),
-            mode=TradingMode.LIMITED_AUTO,
             now=NOW,
             maximum_unhedged_loss=Decimal(10),
         ),

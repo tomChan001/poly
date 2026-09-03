@@ -2,7 +2,6 @@ from decimal import Decimal
 
 import pytest
 
-from backend.app.core.config import TradingMode
 from backend.app.domain.enums import Venue
 from backend.app.services.emergency_hedge import (
     EmergencyAction,
@@ -166,32 +165,26 @@ async def test_emergency_query_failure_is_cached_as_unknown() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", [TradingMode.READ_ONLY, TradingMode.SHADOW])
-async def test_non_live_modes_simulate_emergency_action_without_submitting(
-    mode: TradingMode,
-) -> None:
+async def test_emergency_action_submits_and_is_not_simulated() -> None:
     ports = {Venue.KALSHI: RecordingPort(), Venue.POLYMARKET: RecordingPort()}
-    service = EmergencyHedgeService(ports, trading_mode=mode)
+    service = EmergencyHedgeService(ports)
 
     result = await service.resolve(exposure(Decimal("1.50")), Decimal(2))
 
     assert result.action is EmergencyAction.HEDGE
-    assert result.simulated is True
-    assert result.resolved is False
-    assert all(port.requests == [] for port in ports.values())
+    assert result.simulated is False
+    assert result.resolved is True
+    assert len(ports[Venue.POLYMARKET].requests) == 1
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", [TradingMode.READ_ONLY, TradingMode.SHADOW])
-async def test_non_live_modes_cache_one_simulated_result_per_execution(
-    mode: TradingMode,
-) -> None:
+async def test_emergency_action_caches_one_real_result_per_execution() -> None:
     ports = {Venue.KALSHI: RecordingPort(), Venue.POLYMARKET: RecordingPort()}
-    service = EmergencyHedgeService(ports, trading_mode=mode)
+    service = EmergencyHedgeService(ports)
 
     first = await service.resolve(exposure(Decimal("1.50")), Decimal(2))
     second = await service.resolve(exposure(Decimal("1.50")), Decimal(2))
 
     assert first is second
-    assert first.simulated is True
-    assert all(port.requests == [] for port in ports.values())
+    assert first.simulated is False
+    assert len(ports[Venue.POLYMARKET].requests) == 1

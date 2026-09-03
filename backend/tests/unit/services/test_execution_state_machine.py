@@ -3,7 +3,6 @@ from decimal import Decimal
 
 import pytest
 
-from backend.app.core.config import TradingMode
 from backend.app.domain.enums import ExecutionState, MappingStatus, Venue
 from backend.app.services.execution import (
     AuthorizationRejected,
@@ -107,7 +106,7 @@ async def test_two_filled_legs_are_paired_with_stable_client_order_ids() -> None
         Venue.POLYMARKET: FakeTradingPort(filled(Venue.POLYMARKET)),
     }
     authorization = ExecutionAuthorizationService().issue(MappingStatus.EXACT, evidence(), NOW)
-    service = ControlledExecutionService(ports, control, TradingMode.LIMITED_AUTO)
+    service = ControlledExecutionService(ports, control)
 
     result = await service.execute(authorization, evidence(), NOW + timedelta(seconds=1))
 
@@ -148,13 +147,47 @@ async def test_submitted_state_is_persisted_before_any_venue_write() -> None:
     service = ControlledExecutionService(
         ports,
         SystemControl(opening_enabled=True),
-        TradingMode.LIMITED_AUTO,
         RecordingStore(),
     )
 
     await service.execute(authorization, evidence(), NOW + timedelta(seconds=1))
 
     assert saved_states == [ExecutionState.SUBMITTED, ExecutionState.PAIRED]
+
+
+@pytest.mark.asyncio
+async def test_disabling_opening_after_submitted_persistence_blocks_venue_writes() -> None:
+    saved_states: list[ExecutionState] = []
+    control = SystemControl(opening_enabled=True)
+
+    class DisablingStore:
+        async def save(self, record: ExecutionRecord) -> None:
+            saved_states.append(record.state)
+            if record.state is ExecutionState.SUBMITTED:
+                control.disable_opening("test switch")
+
+        async def list(self) -> list[ExecutionRecord]:
+            return []
+
+        async def get(self, correlation_id: str) -> ExecutionRecord:
+            raise KeyError(correlation_id)
+
+    ports = {
+        Venue.KALSHI: FakeTradingPort(filled(Venue.KALSHI)),
+        Venue.POLYMARKET: FakeTradingPort(filled(Venue.POLYMARKET)),
+    }
+    authorization = ExecutionAuthorizationService().issue(MappingStatus.EXACT, evidence(), NOW)
+    service = ControlledExecutionService(
+        ports,
+        control,
+        DisablingStore(),
+    )
+
+    with pytest.raises(AuthorizationRejected, match="real ordering is disabled"):
+        await service.execute(authorization, evidence(), NOW + timedelta(seconds=1))
+
+    assert saved_states == [ExecutionState.SUBMITTED, ExecutionState.EXCEPTION]
+    assert all(port.submissions == 0 for port in ports.values())
 
 
 @pytest.mark.asyncio
@@ -165,7 +198,7 @@ async def test_one_sided_fill_disables_opening_and_is_partially_hedged() -> None
         Venue.POLYMARKET: FakeTradingPort(rejected(Venue.POLYMARKET)),
     }
     authorization = ExecutionAuthorizationService().issue(MappingStatus.EXACT, evidence(), NOW)
-    service = ControlledExecutionService(ports, control, TradingMode.LIMITED_AUTO)
+    service = ControlledExecutionService(ports, control)
 
     result = await service.execute(authorization, evidence(), NOW + timedelta(seconds=1))
 
@@ -177,15 +210,38 @@ async def test_one_sided_fill_disables_opening_and_is_partially_hedged() -> None
 
 
 @pytest.mark.asyncio
-async def test_real_submission_requires_both_kill_switch_layers() -> None:
+async def test_real_submission_requires_opening_to_be_enabled() -> None:
     authorization = ExecutionAuthorizationService().issue(MappingStatus.EXACT, evidence(), NOW)
     ports = {
         Venue.KALSHI: FakeTradingPort(filled(Venue.KALSHI)),
         Venue.POLYMARKET: FakeTradingPort(filled(Venue.POLYMARKET)),
     }
-    service = ControlledExecutionService(ports, SystemControl(opening_enabled=True), TradingMode.SHADOW)
+    service = ControlledExecutionService(ports, SystemControl(opening_enabled=False))
 
-    with pytest.raises(AuthorizationRejected, match="limited_auto"):
+    with pytest.raises(AuthorizationRejected, match="real ordering is disabled"):
         await service.execute(authorization, evidence(), NOW + timedelta(seconds=1))
 
+    assert all(port.submissions == 0 for port in ports.values())
+
+
+@pytest.mark.asyncio
+async def test_submitted_recovery_continues_while_opening_is_disabled() -> None:
+    ports = {
+        Venue.KALSHI: FakeTradingPort(filled(Venue.KALSHI)),
+        Venue.POLYMARKET: FakeTradingPort(filled(Venue.POLYMARKET)),
+    }
+    record = ExecutionRecord(
+        correlation_id="in-flight",
+        state=ExecutionState.SUBMITTED,
+        requested_quantity=Decimal(10),
+        evidence=evidence(),
+    )
+    service = ControlledExecutionService(
+        ports,
+        SystemControl(opening_enabled=False),
+    )
+
+    recovered = await service.recover_submitted(record, NOW + timedelta(seconds=1))
+
+    assert recovered.state is ExecutionState.PAIRED
     assert all(port.submissions == 0 for port in ports.values())

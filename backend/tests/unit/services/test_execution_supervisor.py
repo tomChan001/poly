@@ -3,7 +3,6 @@ from decimal import Decimal
 
 import pytest
 
-from backend.app.core.config import TradingMode
 from backend.app.domain.enums import ExecutionState, Venue
 from backend.app.services.execution import (
     ExecutionEvidence,
@@ -21,7 +20,7 @@ from backend.app.services.system_control import SystemControl
 
 
 @pytest.mark.asyncio
-async def test_shadow_partial_fill_records_simulated_incident_and_outbox() -> None:
+async def test_partial_fill_records_real_hedge_incident_and_outbox() -> None:
     control = SystemControl(opening_enabled=True)
     incidents = InMemoryIncidentStore()
     outbox = InMemoryOutbox()
@@ -40,19 +39,17 @@ async def test_shadow_partial_fill_records_simulated_incident_and_outbox() -> No
 
     first = await supervisor.finalize(
         record,
-        mode=TradingMode.SHADOW,
         now=datetime(2026, 8, 26, tzinfo=UTC),
     )
     second = await supervisor.finalize(
         record,
-        mode=TradingMode.SHADOW,
         now=datetime(2026, 8, 26, tzinfo=UTC),
     )
 
     assert first is second
     assert first is not None
-    assert first.action == "simulate_hedge"
-    assert first.simulated is True
+    assert first.action == "hedge"
+    assert first.simulated is False
     assert control.opening_enabled is False
     assert len(incidents.records) == 1
     assert len(outbox.events) == 1
@@ -109,7 +106,6 @@ async def test_paired_execution_reconciles_actual_fees_and_closes_opening() -> N
     incident = await supervisor.finalize(
         record,
         evidence,
-        mode=TradingMode.LIMITED_AUTO,
         now=datetime(2026, 8, 26, tzinfo=UTC),
     )
 

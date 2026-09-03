@@ -4,7 +4,6 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Protocol
 
-from backend.app.core.config import TradingMode
 from backend.app.domain.enums import ExecutionState, Venue
 from backend.app.services.emergency_hedge import EmergencyHedgeService, UnhedgedExposure
 from backend.app.services.execution import (
@@ -70,8 +69,7 @@ class ExecutionSupervisor:
         incidents: IncidentStore,
         notifications: NotificationService,
         *,
-        emergency_service_factory: Callable[[TradingMode], EmergencyHedgeService]
-        | None = None,
+        emergency_service_factory: Callable[[], EmergencyHedgeService] | None = None,
         fee_reconciliation: FeeReconciliationService | None = None,
     ) -> None:
         self._system_control = system_control
@@ -87,17 +85,13 @@ class ExecutionSupervisor:
         ports: Mapping[Venue, ExecutionTradingPort],
     ) -> None:
         bound_ports = dict(ports)
-        self._emergency_service_factory = lambda mode: EmergencyHedgeService(
-            bound_ports,
-            trading_mode=mode,
-        )
+        self._emergency_service_factory = lambda: EmergencyHedgeService(bound_ports)
 
     async def finalize(
         self,
         record: ExecutionRecord,
         evidence: ExecutionEvidence | None = None,
         *,
-        mode: TradingMode,
         now: datetime | None = None,
         occurred_at: datetime | None = None,
         maximum_unhedged_loss: Decimal = Decimal(0),
@@ -124,17 +118,16 @@ class ExecutionSupervisor:
         if timestamp is None:
             raise ValueError("incident timestamp is required")
         key = f"execution:{record.correlation_id}:{record.state.value}"
-        simulated = mode is not TradingMode.LIMITED_AUTO
         action = "investigate"
         if record.state is ExecutionState.PARTIALLY_HEDGED:
-            action = "simulate_hedge" if simulated else "hedge"
+            action = "hedge"
         incident, claimed = await self._incidents.claim(
             ExecutionIncident(
                 idempotency_key=key,
                 correlation_id=record.correlation_id,
                 state=record.state,
                 action=action,
-                simulated=simulated,
+                simulated=False,
                 unhedged_quantity=str(record.unhedged_quantity),
                 occurred_at=timestamp,
             )
@@ -150,7 +143,7 @@ class ExecutionSupervisor:
                 and self._emergency_service_factory is not None
                 and evidence is not None
             ):
-                await self._emergency_service_factory(mode).resolve(
+                await self._emergency_service_factory().resolve(
                     _exposure(record, evidence),
                     maximum_unhedged_loss,
                 )

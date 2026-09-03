@@ -113,11 +113,9 @@ class RecordingExecutionSupervisor:
         _record: ExecutionRecord,
         evidence: ExecutionEvidence | None = None,
         *,
-        mode: TradingMode,
         now: datetime,
         maximum_unhedged_loss: Decimal = Decimal(0),
     ) -> None:
-        assert mode is TradingMode.LIMITED_AUTO
         assert now == NOW
         self.evidence = evidence
         self.maximum_unhedged_loss = maximum_unhedged_loss

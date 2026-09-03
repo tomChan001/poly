@@ -154,7 +154,6 @@ class LiveRuntimeService:
             executor = ControlledExecutionService(
                 ports,
                 self._system_control,
-                self._trading_mode,
                 self._execution_store,
                 self._execution_supervisor,
                 policy.maximum_unhedged_loss,
