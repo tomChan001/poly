@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+
 import httpx
 import pytest
 
@@ -9,6 +11,7 @@ from backend.app.main import create_app
 @pytest.mark.asyncio
 async def test_settings_update_creates_new_version() -> None:
     container = ApplicationContainer()
+    assert container.risk_policies.current is not None
     original_version = str(container.risk_policies.current.version)
     app = create_app(container)
     app.dependency_overrides[get_current_principal] = lambda: Principal(
@@ -38,6 +41,44 @@ async def test_settings_update_creates_new_version() -> None:
     assert response.json()["minimum_roi"] == "0.05"
     assert response.json()["maximum_arrival_gap_seconds"] == "0.5"
     assert response.json()["version"] != original_version
+
+
+@pytest.mark.asyncio
+async def test_risk_policy_update_is_returned_as_the_active_policy_with_utc_timestamp() -> None:
+    container = ApplicationContainer()
+    app = create_app(container)
+    app.dependency_overrides[get_current_principal] = lambda: Principal(
+        "operator",
+        frozenset({Role.OPERATOR}),
+    )
+    payload = {
+        "minimum_roi": "0.08",
+        "maximum_settlement_days": 14,
+        "maximum_book_age_seconds": "1.25",
+        "per_trade_limit": "9",
+        "per_event_limit": "19",
+        "portfolio_limit": "49",
+        "explicit_cost": "0.01",
+        "risk_buffer": "0.2",
+        "maximum_unhedged_seconds": "1.5",
+        "maximum_unhedged_loss": "1.25",
+        "maximum_arrival_gap_seconds": "0.25",
+    }
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        updated = await client.put("/api/settings/risk", json=payload)
+        active = await client.get("/api/settings/risk")
+
+    assert updated.status_code == 200
+    assert active.status_code == 200
+    updated_policy = updated.json()
+    active_policy = active.json()
+    assert active_policy == updated_policy
+    assert {key: active_policy[key] for key in payload} == payload
+    created_at = datetime.fromisoformat(active_policy["created_at"])
+    assert created_at.tzinfo is not None
+    assert created_at.utcoffset() == timedelta(0)
 
 
 @pytest.mark.asyncio

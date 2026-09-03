@@ -16,6 +16,7 @@ from backend.app.db.incidents import PostgresIncidentStore
 from backend.app.db.integration_config import PostgresIntegrationConfigRepository
 from backend.app.db.operational_control import PostgresOperationalControlStore
 from backend.app.db.outbox import PostgresOutbox
+from backend.app.db.risk_policy import PostgresRiskPolicyStore
 from backend.app.domain.enums import Venue
 from backend.app.services.automation_gate import AutomationEvidence, AutomationGate
 from backend.app.services.capital import CapitalLedger
@@ -46,7 +47,11 @@ from backend.app.services.optimizer import QuoteOptimizer
 from backend.app.services.pair_discovery import ConfiguredOddpoolPairDiscoveryService
 from backend.app.services.rules import InMemoryRuleStore, RuleService
 from backend.app.services.runtime_status import RuntimeStatusService
-from backend.app.services.settings import InMemoryRiskPolicyStore, RiskPolicyInput
+from backend.app.services.settings import (
+    InMemoryRiskPolicyStore,
+    RiskPolicyInput,
+    RiskPolicyStore,
+)
 from backend.app.services.system_control import SystemControl
 
 
@@ -62,7 +67,9 @@ class ApplicationContainer:
         self.opportunities = InMemoryOpportunityStore()
         self.fees = FeeEngine()
         self.capital_ledger = CapitalLedger({})
-        self.risk_policies = InMemoryRiskPolicyStore(RiskPolicyInput.defaults())
+        self.risk_policies: RiskPolicyStore = InMemoryRiskPolicyStore(
+            RiskPolicyInput.defaults()
+        )
         self.outbox: OutboxStore = InMemoryOutbox()
         self.notifications = NotificationService(self.outbox)
         self.incidents: IncidentStore = InMemoryIncidentStore()
@@ -98,6 +105,7 @@ class ApplicationContainer:
         http_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
         container._engine = engine
         container._http_client = http_client
+        container.risk_policies = PostgresRiskPolicyStore(sessions)
         container.integration_configs = IntegrationConfigService(
             PostgresIntegrationConfigRepository(
                 sessions

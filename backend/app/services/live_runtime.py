@@ -31,7 +31,7 @@ from backend.app.services.opportunities import (
 from backend.app.services.optimizer import QuoteOptimizer, QuotePolicy
 from backend.app.services.orderbooks import BookSynchronizationError, synchronize_books
 from backend.app.services.runtime_status import RuntimeStatusService
-from backend.app.services.settings import InMemoryRiskPolicyStore, RiskPolicy
+from backend.app.services.settings import RiskPolicy, RiskPolicyStore
 from backend.app.services.system_control import SystemControl
 
 
@@ -80,7 +80,7 @@ class LiveRuntimeService:
         *,
         integrations: IntegrationConfigService,
         pairs: ExecutablePairService,
-        risk_policies: InMemoryRiskPolicyStore,
+        risk_policies: RiskPolicyStore,
         system_control: SystemControl,
         execution_store: ExecutionStore,
         opportunities: InMemoryOpportunityStore,
