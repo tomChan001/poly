@@ -985,3 +985,7 @@ async def test_stale_book_is_retained_as_structured_rejection() -> None:
     assert await history.list() == []
     assert capital.reservations == {}
     assert all(port.submissions == 0 for port in ports.values())
+    runtime_view = await status.view()
+    assert runtime_view.ready is True
+    assert runtime_view.opening_enabled is False
+    assert runtime_view.last_error is None
