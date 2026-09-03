@@ -169,6 +169,36 @@ async def test_concurrent_execution_submission_claims_only_one_worker() -> None:
     assert await store.get("concurrent-submission") is winner
 
 
+@pytest.mark.asyncio
+async def test_execution_guard_serializes_one_correlation_without_blocking_another() -> None:
+    store = InMemoryExecutionStore()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    second_entered = asyncio.Event()
+
+    async def hold_first() -> None:
+        async with store.execution_guard("same"):
+            entered.set()
+            await release.wait()
+
+    async def wait_second() -> None:
+        async with store.execution_guard("same"):
+            second_entered.set()
+
+    first = asyncio.create_task(hold_first())
+    await entered.wait()
+    second = asyncio.create_task(wait_second())
+    async with store.execution_guard("other"):
+        pass
+    await asyncio.sleep(0)
+    assert not second_entered.is_set()
+
+    release.set()
+    await first
+    await second
+    assert second_entered.is_set()
+
+
 def test_authorization_rejects_changed_execution_evidence() -> None:
     authorizations = ExecutionAuthorizationService()
     authorization = authorizations.issue(MappingStatus.EXACT, evidence(), NOW)

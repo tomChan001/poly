@@ -1,5 +1,7 @@
 import builtins
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -20,6 +22,29 @@ from backend.app.services.execution import (
 class PostgresExecutionStore:
     def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
         self._sessions = sessions
+
+    @asynccontextmanager
+    async def execution_guard(self, correlation_id: str) -> AsyncIterator[object]:
+        """Hold the correlation advisory lock through submit/recovery finalization.
+
+        New openings acquire the global submission fence first, then this
+        lock. Recovery intentionally acquires only this lock, so it remains
+        available while opening is OFF and cannot invert the lock order.
+        """
+        async with self._sessions.begin() as session:
+            await session.execute(
+                text(
+                    "SELECT pg_advisory_xact_lock("
+                    "hashtext('poly-execution-correlation:' || :correlation_id))"
+                ),
+                {"correlation_id": correlation_id},
+            )
+            yield _ExecutionLease(self, correlation_id)
+
+    def owns_execution_lease(self, lease: object, correlation_id: str) -> bool:
+        return isinstance(lease, _ExecutionLease) and (
+            lease.owner is self and lease.correlation_id == correlation_id
+        )
 
     async def claim_submission(self, record: ExecutionRecord) -> bool:
         occurred_at = min(
@@ -292,3 +317,9 @@ def _decimal_pair(raw: object) -> tuple[Decimal, Decimal]:
 
 def _capital_settled(raw: object) -> bool:
     return raw is True or raw == "true"
+
+
+class _ExecutionLease:
+    def __init__(self, owner: object, correlation_id: str) -> None:
+        self.owner = owner
+        self.correlation_id = correlation_id

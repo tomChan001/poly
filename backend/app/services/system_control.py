@@ -1,7 +1,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol
 
@@ -43,6 +43,7 @@ class OpeningSubmissionPermission:
 
     allowed: bool
     state: OpeningControlState | None
+    _issuer: object = field(repr=False, compare=False)
 
 
 class InMemoryOpeningControlStore:
@@ -99,6 +100,7 @@ class SystemControl:
         self.changed_at = changed_at
         self._store = store
         self._submission_lock = asyncio.Lock()
+        self._permission_issuer = object()
 
     def snapshot(self) -> OpeningControlState:
         return OpeningControlState(
@@ -163,7 +165,9 @@ class SystemControl:
         if self._store is None:
             async with self._submission_lock:
                 state = self.snapshot()
-                yield OpeningSubmissionPermission(state.opening_enabled, state)
+                yield OpeningSubmissionPermission(
+                    state.opening_enabled, state, self._permission_issuer
+                )
             return
         try:
             async with self._store.opening_submission_guard() as durable_state:
@@ -174,6 +178,7 @@ class SystemControl:
                 yield OpeningSubmissionPermission(
                     durable_state.opening_enabled,
                     durable_state,
+                    self._permission_issuer,
                 )
         except (OSError, SQLAlchemyError) as exc:
             if isinstance(exc, ProgrammingError):
@@ -181,6 +186,13 @@ class SystemControl:
             raise OpeningControlPersistenceError(
                 "opening control persistence unavailable"
             ) from exc
+
+    def owns_submission_permission(self, permission: object) -> bool:
+        """Reject look-alike values passed by callers outside this guard."""
+        return (
+            isinstance(permission, OpeningSubmissionPermission)
+            and permission._issuer is self._permission_issuer
+        )
 
     async def disable_opening_async(
         self,

@@ -1,6 +1,7 @@
 import asyncio
 import builtins
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -10,7 +11,10 @@ from uuid import uuid4
 
 from backend.app.domain.enums import ExecutionState, MappingStatus, Venue
 from backend.app.domain.models import validate_transition
-from backend.app.services.system_control import SystemControl
+from backend.app.services.system_control import (
+    OpeningSubmissionPermission,
+    SystemControl,
+)
 
 
 class AuthorizationRejected(ValueError):
@@ -178,6 +182,12 @@ class ExecutionRecord:
 
 
 class ExecutionStore(Protocol):
+    def execution_guard(
+        self, correlation_id: str
+    ) -> AbstractAsyncContextManager[object]: ...
+
+    def owns_execution_lease(self, lease: object, correlation_id: str) -> bool: ...
+
     async def claim_submission(self, record: ExecutionRecord) -> bool: ...
 
     async def save(self, record: ExecutionRecord) -> None: ...
@@ -209,6 +219,23 @@ class InMemoryExecutionStore:
     def __init__(self) -> None:
         self._records: dict[str, ExecutionRecord] = {}
         self._claim_lock = asyncio.Lock()
+        self._execution_locks: dict[str, asyncio.Lock] = {}
+
+    @asynccontextmanager
+    async def execution_guard(self, correlation_id: str) -> AsyncIterator[object]:
+        """Fence one recovery/submission identity until its terminal save.
+
+        Lock order for new openings is submission fence -> this lock ->
+        capital/venue I/O. Recovery only takes this lock.
+        """
+        lock = self._execution_locks.setdefault(correlation_id, asyncio.Lock())
+        async with lock:
+            yield _ExecutionLease(self, correlation_id)
+
+    def owns_execution_lease(self, lease: object, correlation_id: str) -> bool:
+        return isinstance(lease, _ExecutionLease) and (
+            lease.owner is self and lease.correlation_id == correlation_id
+        )
 
     async def claim_submission(self, record: ExecutionRecord) -> bool:
         async with self._claim_lock:
@@ -244,7 +271,14 @@ class InMemoryExecutionStore:
         return self._records[correlation_id]
 
 
+@dataclass(frozen=True, slots=True)
+class _ExecutionLease:
+    owner: object
+    correlation_id: str
+
+
 class ControlledExecutionService:
+    _venue_timeout_seconds = 10.0
     def __init__(
         self,
         ports: Mapping[Venue, ExecutionTradingPort],
@@ -259,20 +293,88 @@ class ControlledExecutionService:
         self._store = store
         self._supervisor = supervisor
         self._maximum_unhedged_loss = maximum_unhedged_loss
+        self._pending_disable_reason: str | None = None
 
     async def execute(
         self,
         authorization: ExecutionAuthorization,
         current_evidence: ExecutionEvidence,
         now: datetime,
+        *,
+        submission_permission: OpeningSubmissionPermission | None = None,
+        execution_lease: object | None = None,
     ) -> ExecutionRecord:
         self._authorizations.consume(authorization, current_evidence, now)
         # The opening state is durable and may have changed in another
         # process since this runtime's previous cycle.  Refresh before the
         # submission claim so an OFF state cannot create a recovery record.
-        await self._system_control.refresh_async()
-        if not self._system_control.opening_enabled:
+        if submission_permission is None:
+            await self._system_control.refresh_async()
+            if not self._system_control.opening_enabled:
+                raise AuthorizationRejected("real ordering is disabled")
+            async with self._system_control.opening_submission_guard() as permission:
+                record = await self._execute_with_permission(
+                    authorization,
+                    current_evidence,
+                    now,
+                    permission,
+                    execution_lease,
+                )
+            await self._apply_pending_disable()
+            return record
+        return await self._execute_with_permission(
+            authorization,
+            current_evidence,
+            now,
+            submission_permission,
+            execution_lease,
+        )
+
+    def take_pending_disable_reason(self) -> str | None:
+        reason = self._pending_disable_reason
+        self._pending_disable_reason = None
+        return reason
+
+    async def _apply_pending_disable(self) -> None:
+        reason = self.take_pending_disable_reason()
+        if reason is not None:
+            await self._system_control.disable_opening_async(reason)
+
+    async def _execute_with_permission(
+        self,
+        authorization: ExecutionAuthorization,
+        current_evidence: ExecutionEvidence,
+        now: datetime,
+        permission: OpeningSubmissionPermission,
+        execution_lease: object | None,
+    ) -> ExecutionRecord:
+        if not self._system_control.owns_submission_permission(permission):
+            raise AuthorizationRejected("submission permission is not active")
+        if not permission.allowed:
             raise AuthorizationRejected("real ordering is disabled")
+        guard = (
+            None
+            if self._store is None
+            else getattr(self._store, "execution_guard", None)
+        )
+        if guard is not None and execution_lease is None:
+            async with guard(authorization.correlation_id) as lease:
+                return await self._execute_with_permission(
+                    authorization,
+                    current_evidence,
+                    now,
+                    permission,
+                    lease,
+                )
+        owns_lease = (
+            None
+            if self._store is None
+            else getattr(self._store, "owns_execution_lease", None)
+        )
+        if owns_lease is not None and not owns_lease(
+            execution_lease, authorization.correlation_id
+        ):
+            raise AuthorizationRejected("execution lease is not active")
         requests = self._requests(authorization)
         record = ExecutionRecord(
             correlation_id=authorization.correlation_id,
@@ -287,18 +389,18 @@ class ControlledExecutionService:
         if self._store is not None and not await self._store.claim_submission(record):
             raise ExecutionSubmissionClaimed(authorization.correlation_id)
 
-        # Acquiring this guard is the final permission check.  Its durable
-        # lock covers both venue writes, linearizing a concurrent OFF update
-        # with the actual external submissions.
-        async with self._system_control.opening_submission_guard() as permission:
-            if not permission.allowed:
-                record.transition(ExecutionState.EXCEPTION, now)
-                if self._store is not None:
-                    await self._store.save(record)
-                raise AuthorizationRejected("real ordering is disabled")
-            results = await asyncio.gather(
-                *(self._submit_or_recover(request) for request in requests.values()),
-            )
+        # Preserve the synchronous in-process emergency hook used by the
+        # local runtime. Durable OFF updates are serialized by the outer
+        # permission; this catches a local hook that fires after the claim.
+        if not self._system_control.opening_enabled:
+            record.transition(ExecutionState.EXCEPTION, now)
+            if self._store is not None:
+                await self._store.save(record)
+            raise AuthorizationRejected("real ordering is disabled")
+
+        results = await asyncio.gather(
+            *(self._submit_or_recover(request) for request in requests.values()),
+        )
         record.legs = dict(zip(requests, results, strict=True))
         await self._finalize(record, now, current_evidence)
         return record
@@ -344,9 +446,7 @@ class ControlledExecutionService:
         elif record.unhedged_quantity > 0:
             record.transition(ExecutionState.PARTIALLY_HEDGED, now)
             if self._supervisor is None:
-                await self._system_control.disable_opening_async(
-                    "partially hedged execution"
-                )
+                self._pending_disable_reason = "partially hedged execution"
         else:
             record.transition(ExecutionState.EXCEPTION, now)
         if has_unknown_outcome and not (
@@ -354,9 +454,7 @@ class ControlledExecutionService:
             and record.state
             in {ExecutionState.PARTIALLY_HEDGED, ExecutionState.EXCEPTION}
         ):
-            await self._system_control.disable_opening_async(
-                "execution outcome unresolved"
-            )
+            self._pending_disable_reason = "execution outcome unresolved"
         if self._store is not None:
             await self._store.save(record)
         if self._supervisor is not None:
@@ -395,13 +493,18 @@ class ControlledExecutionService:
     async def _submit_or_recover(self, request: OrderRequest) -> OrderSubmissionResult:
         port = self._ports[request.venue]
         try:
-            result = await port.submit_fok(request)
+            result = await asyncio.wait_for(
+                port.submit_fok(request), timeout=self._venue_timeout_seconds
+            )
         except Exception:  # noqa: BLE001 - any post-write failure can hide an accepted order
             # A timeout is not a rejection. Querying by the stable client ID is
             # the only safe recovery path because retrying could double-fill.
             # asyncio cancellation derives from BaseException and is not caught.
             try:
-                recovered = await port.find_by_client_order_id(request.client_order_id)
+                recovered = await asyncio.wait_for(
+                    port.find_by_client_order_id(request.client_order_id),
+                    timeout=self._venue_timeout_seconds,
+                )
             except Exception:  # noqa: BLE001 - unavailable reconciliation remains UNKNOWN
                 recovered = None
             if recovered is None:

@@ -7,10 +7,10 @@ from sqlalchemy import text
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from backend.app.db.submission_fence import lock_submission_fence
 from backend.app.services.system_control import OpeningControlState
 
 _OPENING_CONTROL = "opening"
-_OPENING_CONTROL_LOCK = "poly-opening-control"
 
 
 class PostgresOperationalControlStore:
@@ -77,10 +77,7 @@ class PostgresOperationalControlStore:
 
     @staticmethod
     async def _lock_opening(session: AsyncSession) -> None:
-        await session.execute(
-            text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-            {"key": _OPENING_CONTROL_LOCK},
-        )
+        await lock_submission_fence(session)
 
     @staticmethod
     def _state(row: RowMapping) -> OpeningControlState:

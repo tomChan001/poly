@@ -6,6 +6,7 @@ import pytest
 from backend.app.container import ApplicationContainer
 from backend.app.core.security import Principal, Role, get_current_principal
 from backend.app.main import create_app
+from backend.app.services.settings import InMemoryRiskPolicyStore, RiskPolicyInput
 
 
 @pytest.mark.asyncio
@@ -79,6 +80,34 @@ async def test_risk_policy_update_is_returned_as_the_active_policy_with_utc_time
     created_at = datetime.fromisoformat(active_policy["created_at"])
     assert created_at.tzinfo is not None
     assert created_at.utcoffset() == timedelta(0)
+
+
+@pytest.mark.asyncio
+async def test_get_risk_policy_refreshes_a_stale_process_cache() -> None:
+    durable = InMemoryRiskPolicyStore(RiskPolicyInput.defaults())
+    stale = durable.current
+    updated_input = RiskPolicyInput.defaults()
+    latest = await durable.create(updated_input)
+
+    class StaleCacheStore:
+        current = stale
+
+        async def refresh(self):
+            return latest
+
+    container = ApplicationContainer()
+    container.risk_policies = StaleCacheStore()  # type: ignore[assignment]
+    app = create_app(container)
+    app.dependency_overrides[get_current_principal] = lambda: Principal(
+        "viewer", frozenset({Role.VIEWER})
+    )
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/settings/risk")
+
+    assert response.status_code == 200
+    assert response.json()["version"] == str(latest.version)
 
 
 @pytest.mark.asyncio

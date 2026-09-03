@@ -181,63 +181,76 @@ class LiveRuntimeService:
                 self._execution_supervisor,
                 policy.maximum_unhedged_loss,
             )
-            try:
-                existing = await self._execution_store.get(correlation_id)
-            except KeyError:
-                existing = None
-            if existing is not None:
-                if existing.state is ExecutionState.SUBMITTED:
-                    recovered = await executor.recover_submitted(existing, now)
-                    await self._settle_capital(recovered)
-                self._processed_books.add(identity)
-                continue
-
-            if not self._system_control.opening_enabled:
-                continue
-
-            reservation = await self._capital_ledger.reserve_pair(
-                correlation_id,
-                evaluation.kalshi_reserved_amount,
-                evaluation.polymarket_reserved_amount,
-                event_id=pair.id,
-            )
-            evidence = ExecutionEvidence(
-                quote_evaluation_id=str(uuid4()),
-                rule_versions=evaluation.rule_versions,
-                book_sequences=evaluation.book_sequences,
-                balance_versions=evaluation.balance_versions,
-                risk_policy_version=str(policy.version),
-                capital_reservation_id=reservation.evidence_id,
-                quantity=evaluation.quantity,
-                kalshi_market_id=pair.kalshi_market_id,
-                polymarket_market_id=pair.polymarket_market_id,
-                kalshi_outcome=pair.kalshi_outcome,
-                polymarket_outcome=pair.polymarket_outcome,
-                kalshi_limit_price=evaluation.kalshi_limit_price,
-                polymarket_limit_price=evaluation.polymarket_limit_price,
-                conservative_roi=evaluation.conservative_roi,
-                minimum_roi=policy.minimum_roi,
-                estimated_fees=evaluation.estimated_fees,
-            )
-            authorization = ExecutionAuthorizationService().issue(
-                MappingStatus.EXACT,
-                evidence,
-                now,
-                correlation_id=correlation_id,
-            )
-            try:
-                record = await executor.execute(authorization, evidence, now)
-            except ExecutionSubmissionClaimed:
-                # A concurrent runtime owns this identity and its shared
-                # reservation.  Do not release it or prematurely reconcile;
-                # the next cycle will query the persisted SUBMITTED record.
-                continue
-            except Exception:
-                await self._capital_ledger.release_pair(correlation_id)
-                raise
-            self._processed_books.add(identity)
-            await self._settle_capital(record)
-            executions += 1
+            pending_disable_reason: str | None = None
+            # Lock order is global submission fence -> execution correlation
+            # fence -> capital/venue I/O.  Policy/control writes share the
+            # first lock, while recovery never takes it.
+            async with self._system_control.opening_submission_guard() as permission:
+                if not permission.allowed:
+                    continue
+                fenced_policy = await self._risk_policies.refresh()
+                if fenced_policy is None or fenced_policy.version != policy.version:
+                    # A PUT won the fence after evaluation.  Re-evaluate on
+                    # the next cycle; no stale-policy reservation is created.
+                    continue
+                async with self._execution_store.execution_guard(
+                    correlation_id
+                ) as execution_lease:
+                    try:
+                        await self._execution_store.get(correlation_id)
+                    except KeyError:
+                        pass
+                    else:
+                        self._processed_books.add(identity)
+                        continue
+                    reservation = await self._capital_ledger.reserve_pair(
+                        correlation_id,
+                        evaluation.kalshi_reserved_amount,
+                        evaluation.polymarket_reserved_amount,
+                        event_id=pair.id,
+                    )
+                    evidence = ExecutionEvidence(
+                        quote_evaluation_id=str(uuid4()),
+                        rule_versions=evaluation.rule_versions,
+                        book_sequences=evaluation.book_sequences,
+                        balance_versions=evaluation.balance_versions,
+                        risk_policy_version=str(policy.version),
+                        capital_reservation_id=reservation.evidence_id,
+                        quantity=evaluation.quantity,
+                        kalshi_market_id=pair.kalshi_market_id,
+                        polymarket_market_id=pair.polymarket_market_id,
+                        kalshi_outcome=pair.kalshi_outcome,
+                        polymarket_outcome=pair.polymarket_outcome,
+                        kalshi_limit_price=evaluation.kalshi_limit_price,
+                        polymarket_limit_price=evaluation.polymarket_limit_price,
+                        conservative_roi=evaluation.conservative_roi,
+                        minimum_roi=policy.minimum_roi,
+                        estimated_fees=evaluation.estimated_fees,
+                    )
+                    authorization = ExecutionAuthorizationService().issue(
+                        MappingStatus.EXACT,
+                        evidence,
+                        now,
+                        correlation_id=correlation_id,
+                    )
+                    try:
+                        record = await executor.execute(
+                            authorization,
+                            evidence,
+                            now,
+                            submission_permission=permission,
+                            execution_lease=execution_lease,
+                        )
+                    except ExecutionSubmissionClaimed:
+                        # A concurrent runtime owns this identity and its
+                        # reservation.  Do not release or recover it here.
+                        continue
+                    self._processed_books.add(identity)
+                    await self._settle_capital(record)
+                    pending_disable_reason = executor.take_pending_disable_reason()
+                    executions += 1
+            if pending_disable_reason is not None:
+                await self._system_control.disable_opening_async(pending_disable_reason)
 
         self._runtime_status.record_cycle(executions=executions)
         return executions
@@ -260,16 +273,29 @@ class LiveRuntimeService:
             self._execution_supervisor,
             maximum_unhedged_loss,
         )
-        for record in records:
-            if record.state is ExecutionState.SUBMITTED:
-                record = await executor.recover_submitted(record, now)
-            if record.state in {
-                ExecutionState.PAIRED,
-                ExecutionState.PARTIALLY_HEDGED,
-                ExecutionState.EXCEPTION,
-                ExecutionState.CANCELLED,
-            }:
-                await self._settle_capital(record)
+        for candidate in records:
+            pending_disable_reason: str | None = None
+            async with self._execution_store.execution_guard(
+                candidate.correlation_id
+            ):
+                try:
+                    record = await self._execution_store.get(candidate.correlation_id)
+                except KeyError:
+                    continue
+                if record.state is ExecutionState.SUBMITTED:
+                    record = await executor.recover_submitted(record, now)
+                if record.state in {
+                    ExecutionState.PAIRED,
+                    ExecutionState.PARTIALLY_HEDGED,
+                    ExecutionState.EXCEPTION,
+                    ExecutionState.CANCELLED,
+                }:
+                    await self._settle_capital(record)
+                pending_disable_reason = executor.take_pending_disable_reason()
+            # This is intentionally after releasing execution_guard: recovery
+            # never nests the global submission fence under a correlation lock.
+            if pending_disable_reason is not None:
+                await self._system_control.disable_opening_async(pending_disable_reason)
 
     async def _settle_capital(self, record: ExecutionRecord) -> None:
         if record.capital_settled:

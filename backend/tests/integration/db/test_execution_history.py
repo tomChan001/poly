@@ -86,6 +86,38 @@ async def test_postgres_recovery_candidate_query_targets_unsettled_records() -> 
 
 
 @pytest.mark.asyncio
+async def test_postgres_execution_guard_uses_a_correlation_advisory_lock() -> None:
+    class RecordingSession:
+        def __init__(self) -> None:
+            self.statement = None
+            self.parameters = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def execute(self, statement, parameters):
+            self.statement = statement
+            self.parameters = parameters
+
+    session = RecordingSession()
+
+    class RecordingSessions:
+        def begin(self):
+            return session
+
+    async with PostgresExecutionStore(RecordingSessions()).execution_guard("corr-1"):
+        pass
+
+    assert session.statement is not None
+    assert "pg_advisory_xact_lock" in session.statement.text
+    assert "poly-execution-correlation" in session.statement.text
+    assert session.parameters == {"correlation_id": "corr-1"}
+
+
+@pytest.mark.asyncio
 async def test_postgres_save_persists_capital_settlement_column() -> None:
     class RecordingSession:
         statement = None

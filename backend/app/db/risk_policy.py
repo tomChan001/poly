@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import RowMapping, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from backend.app.db.submission_fence import lock_submission_fence
 from backend.app.services.settings import RiskPolicy, RiskPolicyInput
 
 
@@ -16,9 +17,7 @@ class PostgresRiskPolicyStore:
 
     async def initialize(self) -> RiskPolicy:
         async with self._sessions.begin() as session:
-            await session.execute(
-                text("SELECT pg_advisory_xact_lock(hashtext('poly-risk-policy-version'))")
-            )
+            await lock_submission_fence(session)
             result = await session.execute(
                 text(
                     "SELECT * FROM risk_policy_version "
@@ -50,6 +49,7 @@ class PostgresRiskPolicyStore:
     async def create(self, value: RiskPolicyInput) -> RiskPolicy:
         policy = _snapshot(value)
         async with self._sessions.begin() as session:
+            await lock_submission_fence(session)
             await _insert(session, policy)
         self.current = policy
         return policy

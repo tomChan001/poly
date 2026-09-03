@@ -67,6 +67,6 @@ async def test_postgres_guard_and_save_share_transaction_advisory_lock() -> None
     ]
     assert sessions.transactions == 2
     assert advisory_locks == [
-        {"key": "poly-opening-control"},
-        {"key": "poly-opening-control"},
+        {"key": "poly-submission-fence"},
+        {"key": "poly-submission-fence"},
     ]

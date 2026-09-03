@@ -40,10 +40,10 @@ class RiskPolicyRequest(BaseModel):
 
 
 @router.get("/risk")
-def get_risk_policy(
+async def get_risk_policy(
     container: Annotated[ApplicationContainer, Depends(get_container)],
 ) -> RiskPolicy:
-    policy = container.risk_policies.current
+    policy = await container.risk_policies.refresh()
     if policy is None:  # pragma: no cover - the container always seeds a safe policy
         raise RuntimeError("risk policy has not been initialized")
     return policy
