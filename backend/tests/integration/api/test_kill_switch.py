@@ -4,7 +4,6 @@ from fastapi import FastAPI
 from sqlalchemy.exc import SQLAlchemyError
 
 from backend.app.container import ApplicationContainer
-from backend.app.core.config import TradingMode
 from backend.app.core.security import Principal, Role, get_current_principal
 from backend.app.main import create_app
 from backend.app.services.system_control import OpeningControlState, SystemControl
@@ -154,16 +153,11 @@ async def test_kill_switch_reason_cannot_be_blank() -> None:
 
 
 @pytest.mark.asyncio
-async def test_operator_can_enable_opening_without_mode_or_automation_evidence(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from backend.app.core import config
-
+async def test_operator_can_enable_opening_without_automation_evidence() -> None:
     container = ApplicationContainer()
     store = RecordingControlStore()
     container.system_control = SystemControl(store=store)
     container.automation_evidence = None
-    monkeypatch.setattr(config.settings, "trading_mode", TradingMode.READ_ONLY)
 
     transport = httpx.ASGITransport(app=app_for(container, Role.OPERATOR))
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

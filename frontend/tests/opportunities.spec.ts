@@ -45,15 +45,17 @@ const runtime = {
   executions_started: 1,
 }
 
-async function routeStatus(page: import('@playwright/test').Page) {
+async function routeStatus(
+  page: import('@playwright/test').Page,
+  openingEnabled = true,
+) {
   await page.route('**/api/runtime', (route) => route.fulfill({ json: runtime }))
   await page.route('**/health', (route) => route.fulfill({
-    json: {
-      status: 'ok',
-      trading_mode: 'limited_auto',
-      opening_enabled: true,
-      reason: 'configured default',
-    },
+      json: {
+        status: 'ok',
+        opening_enabled: openingEnabled,
+        reason: 'configured default',
+      },
   }))
 }
 
@@ -65,19 +67,38 @@ const viewports = [
 for (const viewport of viewports) {
   test(`integration settings fit the ${viewport.name} viewport`, async ({ page }, testInfo) => {
     await page.setViewportSize(viewport)
-    await routeStatus(page)
+    await routeStatus(page, false)
+    await page.route('**/api/system-control/opening', async (route) => {
+      expect(route.request().method()).toBe('PUT')
+      expect(route.request().postDataJSON()).toEqual({
+        enabled: true,
+        reason: 'operator enabled real ordering',
+      })
+      await route.fulfill({
+        json: {
+          opening_enabled: true,
+          reason: 'operator enabled real ordering',
+          version: 2,
+        },
+      })
+    })
     await page.route('**/api/opportunities', (route) => route.fulfill({ json: [opportunity] }))
     await page.route('**/api/executions', (route) => route.fulfill({ json: [] }))
     await page.route('**/api/integrations', (route) => route.fulfill({ json: [] }))
     await page.goto('/')
     await page.getByRole('button', { name: '集成' }).click()
 
+    await expect(page.getByText('行情评估运行中')).toBeVisible()
+    await expect(page.getByText('真实下单已关闭')).toBeVisible()
     await expect(page.getByRole('heading', { name: '集成配置' })).toBeVisible()
     await expect(page.getByText('Google / Magic 登录不需要密码，也不会在这里收集密码。')).toBeVisible()
     await expect(page.getByLabel('Polymarket 账户类型')).toHaveValue('magic_proxy')
     await expect(page.getByLabel('钱包私钥（仅写入）')).toHaveAttribute('type', 'password')
     await expect(page.getByRole('button', { name: '测试连接（不会下单）' })).toBeVisible()
     await expect(page.getByRole('heading', { name: 'Polymarket' })).toBeVisible()
+    await page.getByRole('switch', { name: '真实下单' }).click()
+    await expect(page.getByRole('switch', { name: '真实下单' })).toBeChecked()
+    await expect(page.getByText('真实下单已开启')).toBeVisible()
 
     const geometry = await page.evaluate(() => {
       const controls = Array.from(document.querySelectorAll<HTMLElement>('button, input, select'))
@@ -140,9 +161,8 @@ for (const viewport of viewports) {
 
     await expect(page.getByRole('heading', { name: '跨市场控制台' })).toBeVisible()
     await expect(page.getByText(opportunity.event)).toBeVisible()
-    await expect(page.getByText('LIMITED AUTO')).toBeVisible()
-    await expect(page.getByText('真实订单已启用')).toBeVisible()
-    await expect(page.getByText('ON')).toBeVisible()
+    await expect(page.getByText('行情评估运行中')).toBeVisible()
+    await expect(page.getByText('真实下单已开启')).toBeVisible()
 
     const geometry = await page.evaluate(() => {
       const visibleControls = Array.from(

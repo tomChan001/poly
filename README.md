@@ -4,7 +4,8 @@ Kalshi 与 Polymarket 的受控跨平台执行系统。Oddpool 只用于发现�
 
 ## 安全默认值
 
-- 新安装默认 `TRADING_MODE=read_only` 且 `OPENING_ENABLED=false`；没有完整自动化证据时，启动门禁会把数据库开仓开关保持为关闭。
+- 新安装默认 `OPENING_ENABLED=false`。持久化的“真实下单”开关是新开仓的唯一人工许可；关闭时，发现、审核、原生行情读取和机会评估仍会继续。
+- 风险事故可以自动关闭真实下单。故障处置完成并核对完状态后，operator 可通过“集成”页面重新开启；不需要交易模式或自动化证据门槛。
 - 只有人工审核为 `EXACT` 且规则版本未变化的映射能进入执行评估。
 - 前端只提供凭证的只写录入框，不保存凭证，也无法从 API 读回明文。
 - PostgreSQL 只保存平台地址、账户标识和配置版本；Token、私钥和 passphrase 写入操作系统凭证库。
@@ -83,4 +84,4 @@ npm run lint
 npm run build
 ```
 
-上述自动化验证全部使用 fake trading ports 或只读接口，不发送真实订单。真实 canary 仍需单独授权和记录，不能由测试通过替代。
+上述自动化验证全部使用 fake trading ports 或只读接口，不发送真实订单。生产环境的真实下单仍由 operator 通过持久化开关明确许可，不能由测试通过替代。

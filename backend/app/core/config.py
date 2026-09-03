@@ -1,20 +1,9 @@
-from enum import StrEnum
-
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-
-class TradingMode(StrEnum):
-    READ_ONLY = "read_only"
-    SHADOW = "shadow"
-    LIMITED_AUTO = "limited_auto"
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    # A fresh install is observational only. Enabling automated order opening
-    # requires both explicit deployment configuration and runtime evidence.
-    trading_mode: TradingMode = TradingMode.READ_ONLY
     opening_enabled: bool = False
     database_url: str = "postgresql+asyncpg://poly:poly@localhost:5432/poly"
     credential_service_name: str = "poly-controlled-execution"

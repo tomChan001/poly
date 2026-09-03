@@ -48,14 +48,14 @@ for (const viewport of viewports) {
     await page.route('**/health', (route) => route.fulfill({
       json: {
         status: 'ok',
-        trading_mode: 'limited_auto',
         opening_enabled: true,
         reason: 'configured default',
       },
     }))
 
     await page.goto('/')
-    await expect(page.getByText('自动执行运行中')).toBeVisible()
+    await expect(page.getByText('行情评估运行中')).toBeVisible()
+    await expect(page.getByText('真实下单已开启')).toBeVisible()
     await page.getByRole('button', { name: '审核' }).click()
     await expect(page.getByRole('heading', { name: '市场对审核' })).toBeVisible()
     await expect(page.getByRole('heading', { name: pair.title })).toBeVisible()

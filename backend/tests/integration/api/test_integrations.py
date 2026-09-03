@@ -5,7 +5,7 @@ import pytest
 
 from backend.app.adapters.polymarket.account import PolymarketAccountResolver
 from backend.app.container import ApplicationContainer
-from backend.app.core.config import TradingMode, settings
+from backend.app.core.config import settings
 from backend.app.core.secrets import (
     InMemorySecretStore,
     SecretStorageError,
@@ -338,11 +338,10 @@ async def test_oidc_is_not_a_supported_integration() -> None:
 
 
 @pytest.mark.asyncio
-async def test_explicit_local_setup_allows_loopback_in_real_trading_mode(
+async def test_explicit_local_setup_allows_trusted_loopback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "local_setup_enabled", True)
-    monkeypatch.setattr(settings, "trading_mode", TradingMode.LIMITED_AUTO)
     local_transport = httpx.ASGITransport(
         app=create_app(ApplicationContainer(), allow_local_setup=True),
         client=("127.0.0.1", 41000),

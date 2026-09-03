@@ -107,7 +107,6 @@ def create_app(
         # returning both prevents a hard-coded banner from drifting from reality.
         return {
             "status": "ok",
-            "trading_mode": settings.trading_mode.value,
             "opening_enabled": application_container.system_control.opening_enabled,
             "reason": application_container.system_control.reason,
         }
