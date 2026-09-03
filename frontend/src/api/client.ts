@@ -78,8 +78,8 @@ export function getRuntimeStatus(): Promise<RuntimeStatus> {
 }
 
 
-export function getRiskPolicy(): Promise<RiskPolicy> {
-  return apiRequest<RiskPolicy>('/api/settings/risk')
+export function getRiskPolicy(signal?: AbortSignal): Promise<RiskPolicy> {
+  return apiRequest<RiskPolicy>('/api/settings/risk', { signal })
 }
 
 

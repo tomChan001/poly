@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { Save } from 'lucide-react'
 
 import { getRiskPolicy, saveRiskPolicy } from '../api/client'
@@ -98,10 +98,13 @@ const validationRules: ValidationRule[] = [
   { name: 'maximumArrivalGapSeconds', label: '最大行情到达间隔', positive: true },
 ]
 
+const plainDecimalPattern = /^-?(?:\d+(?:\.\d*)?|\.\d+)$/
+
 function validateForm(form: RiskForm): string | null {
   for (const rule of validationRules) {
     const raw = form[rule.name].trim()
     if (!raw) return `${rule.label} 不能为空`
+    if (!plainDecimalPattern.test(raw)) return `${rule.label} 必须使用普通十进制表示`
 
     const value = Number(raw)
     if (!Number.isFinite(value)) return `${rule.label}必须是有限数字`
@@ -166,23 +169,36 @@ export function RiskSettingsPage() {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
+  const loadControllerRef = useRef<AbortController | null>(null)
 
   const loadPolicy = useCallback(async () => {
+    loadControllerRef.current?.abort()
+    const controller = new AbortController()
+    loadControllerRef.current = controller
     setLoading(true)
     setError(null)
     try {
-      const loadedPolicy = await getRiskPolicy()
+      const loadedPolicy = await getRiskPolicy(controller.signal)
+      if (controller.signal.aborted || loadControllerRef.current !== controller) return
       setPolicy(loadedPolicy)
       setForm(toForm(loadedPolicy))
     } catch (reason) {
+      if (controller.signal.aborted || loadControllerRef.current !== controller) return
       setError(`加载失败：${reason instanceof Error ? reason.message : '未知错误'}`)
     } finally {
-      setLoading(false)
+      if (loadControllerRef.current === controller) {
+        loadControllerRef.current = null
+        setLoading(false)
+      }
     }
   }, [])
 
   useEffect(() => {
     void loadPolicy()
+    return () => {
+      loadControllerRef.current?.abort()
+      loadControllerRef.current = null
+    }
   }, [loadPolicy])
 
   const updateField = (name: keyof RiskForm, value: string) => {

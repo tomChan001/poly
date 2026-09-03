@@ -212,6 +212,61 @@ test('blocks an out-of-range risk value before saving', async () => {
   expect(saveRequests).toBe(0)
 })
 
+test('rejects scientific notation in risk decimal fields before saving', async () => {
+  let saveRequests = 0
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/settings/risk')) {
+        if (init?.method === 'PUT') saveRequests += 1
+        return Promise.resolve({ ok: true, json: async () => riskPolicy })
+      }
+      if (url.includes('/api/runtime')) return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+      if (url.includes('/health')) return Promise.resolve({ ok: true, json: async () => ({ status: 'ok' }) })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '风控' }))
+  const minimumRoi = await screen.findByLabelText('最低保守 ROI')
+
+  fireEvent.change(minimumRoi, { target: { value: '3e-1' } })
+  fireEvent.click(screen.getByRole('button', { name: '保存策略' }))
+  expect(await screen.findByText('最低保守 ROI 必须使用普通十进制表示')).toBeInTheDocument()
+  expect(saveRequests).toBe(0)
+
+  fireEvent.change(minimumRoi, { target: { value: '5e0' } })
+  fireEvent.click(screen.getByRole('button', { name: '保存策略' }))
+  expect(await screen.findByText('最低保守 ROI 必须使用普通十进制表示')).toBeInTheDocument()
+  expect(saveRequests).toBe(0)
+})
+
+test('aborts a pending risk-policy load when leaving the page', async () => {
+  const riskRequest: { signal: AbortSignal | null } = { signal: null }
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/settings/risk')) {
+        riskRequest.signal = init?.signal ?? null
+        return new Promise(() => undefined)
+      }
+      if (url.includes('/api/runtime')) return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+      if (url.includes('/health')) return Promise.resolve({ ok: true, json: async () => ({ status: 'ok' }) })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '风控' }))
+  await waitFor(() => expect(riskRequest.signal).not.toBeNull())
+
+  fireEvent.click(screen.getByRole('button', { name: '机会' }))
+  expect(riskRequest.signal?.aborted).toBe(true)
+})
+
 test('retries a transient risk policy load failure', async () => {
   let riskRequests = 0
   vi.stubGlobal(
