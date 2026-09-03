@@ -19,6 +19,7 @@ def test_initial_schema_contains_all_durable_business_tables() -> None:
         "state_transition",
         "audit_event",
         "outbox_event",
+        "execution_incident",
         "system_control",
         "risk_policy_version",
     }

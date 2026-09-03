@@ -292,7 +292,12 @@ class ControlledExecutionService:
         record.matched_quantity = min(quantities)
         record.unhedged_quantity = max(quantities) - record.matched_quantity
 
-        if all(quantity == record.requested_quantity for quantity in quantities):
+        has_unknown_outcome = any(
+            leg.status is OrderStatus.UNKNOWN for leg in record.legs.values()
+        )
+        if has_unknown_outcome:
+            record.transition(ExecutionState.EXCEPTION, now)
+        elif all(quantity == record.requested_quantity for quantity in quantities):
             record.transition(ExecutionState.PAIRED, now)
         elif record.unhedged_quantity > 0:
             record.transition(ExecutionState.PARTIALLY_HEDGED, now)
@@ -302,9 +307,7 @@ class ControlledExecutionService:
                 )
         else:
             record.transition(ExecutionState.EXCEPTION, now)
-        if any(
-            leg.status is OrderStatus.UNKNOWN for leg in record.legs.values()
-        ) and not (
+        if has_unknown_outcome and not (
             self._supervisor is not None
             and record.state
             in {ExecutionState.PARTIALLY_HEDGED, ExecutionState.EXCEPTION}

@@ -17,6 +17,7 @@ from backend.app.services.execution import (
     OrderSubmissionResult,
 )
 from backend.app.services.execution_supervisor import (
+    ExecutionIncident,
     ExecutionSupervisor,
     InMemoryIncidentStore,
 )
@@ -318,7 +319,10 @@ async def test_partial_fill_persists_incident_and_real_emergency_action() -> Non
         control,
         incidents,
         NotificationService(outbox),
-        emergency_service_factory=lambda: EmergencyHedgeService(emergency_ports),
+        emergency_service_factory=lambda: EmergencyHedgeService(
+            emergency_ports,
+            remediation_store=incidents,
+        ),
     )
     record = ExecutionRecord(
         correlation_id="fault-partial",
@@ -372,6 +376,7 @@ async def test_exception_finalize_is_idempotent() -> None:
                 Venue.KALSHI: RecordingEmergencyPort(),
                 Venue.POLYMARKET: RecordingEmergencyPort(),
             },
+            remediation_store=incidents,
         ),
     )
     record = ExecutionRecord(
@@ -446,6 +451,63 @@ async def test_limited_auto_partial_fill_submits_one_bound_emergency_order() -> 
 
 
 @pytest.mark.asyncio
+async def test_restarted_supervisor_reconciles_started_remediation_without_resubmit() -> None:
+    control = SystemControl(opening_enabled=True)
+    incidents = InMemoryIncidentStore()
+    outbox = InMemoryOutbox()
+    emergency_ports = {
+        Venue.KALSHI: RecordingEmergencyPort(),
+        Venue.POLYMARKET: RecordingEmergencyPort(),
+    }
+    record = ExecutionRecord(
+        correlation_id="restart-remediation",
+        state=ExecutionState.PARTIALLY_HEDGED,
+        requested_quantity=Decimal(10),
+        matched_quantity=Decimal(6),
+        unhedged_quantity=Decimal(4),
+        legs={
+            Venue.KALSHI: result(Venue.KALSHI, (Decimal(10),)),
+            Venue.POLYMARKET: result(Venue.POLYMARKET, (Decimal(6),)),
+        },
+    )
+    key = "execution:restart-remediation:partially_hedged"
+    await incidents.claim(
+        ExecutionIncident(
+            idempotency_key=key,
+            correlation_id=record.correlation_id,
+            state=record.state,
+            action="hedge",
+            simulated=False,
+            unhedged_quantity="4",
+            occurred_at=NOW,
+        )
+    )
+    await incidents.start_remediation(
+        key,
+        "restart-remediation-emergency-hedge",
+        Venue.POLYMARKET,
+    )
+    restarted = ExecutionSupervisor(
+        control,
+        incidents,
+        NotificationService(outbox),
+    )
+    restarted.bind_emergency_ports(emergency_ports)
+
+    incident = await restarted.finalize(
+        record,
+        evidence(),
+        now=NOW,
+        maximum_unhedged_loss=Decimal(10),
+    )
+
+    assert incident is not None
+    assert control.opening_enabled is False
+    assert sum(port.submissions for port in emergency_ports.values()) == 0
+    assert sum(port.lookups for port in emergency_ports.values()) == 1
+
+
+@pytest.mark.asyncio
 async def test_concurrent_partial_finalization_claims_one_emergency_action() -> None:
     control = SystemControl(opening_enabled=True)
     incidents = InMemoryIncidentStore()
@@ -458,7 +520,10 @@ async def test_concurrent_partial_finalization_claims_one_emergency_action() -> 
         control,
         incidents,
         NotificationService(outbox),
-        emergency_service_factory=lambda: EmergencyHedgeService(emergency_ports),
+        emergency_service_factory=lambda: EmergencyHedgeService(
+            emergency_ports,
+            remediation_store=incidents,
+        ),
     )
     record = ExecutionRecord(
         correlation_id="concurrent-partial",

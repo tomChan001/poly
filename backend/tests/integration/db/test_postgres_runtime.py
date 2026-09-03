@@ -20,7 +20,8 @@ from backend.app.db.integration_config import PostgresIntegrationConfigRepositor
 from backend.app.db.operational_control import PostgresOperationalControlStore
 from backend.app.db.outbox import PostgresOutbox
 from backend.app.db.risk_policy import PostgresRiskPolicyStore
-from backend.app.domain.enums import ExecutionState
+from backend.app.domain.enums import ExecutionState, Venue
+from backend.app.services.emergency_hedge import RemediationStatus
 from backend.app.services.execution_supervisor import ExecutionIncident
 from backend.app.services.integration_config import (
     ODDPOOL_BASE_URL,
@@ -122,6 +123,28 @@ async def test_initial_migration_runs_on_postgres_and_protects_audit_events() ->
                 "maximum_unhedged_seconds",
                 "maximum_unhedged_loss",
                 "maximum_arrival_gap_seconds",
+            }
+
+            incident_columns = set(
+                await connection.fetchval(
+                    """
+                    SELECT array_agg(column_name)
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = 'execution_incident'
+                    """
+                )
+            )
+            assert incident_columns == {
+                "idempotency_key",
+                "correlation_id",
+                "state",
+                "action",
+                "simulated",
+                "unhedged_quantity",
+                "occurred_at",
+                "remediation_status",
+                "remediation_client_order_id",
+                "remediation_venue",
             }
 
             engine = create_async_engine(migration_url)
@@ -230,7 +253,7 @@ async def test_initial_migration_runs_on_postgres_and_protects_audit_events() ->
                     correlation_id="durable",
                     state=ExecutionState.EXCEPTION,
                     action="investigate",
-                    simulated=True,
+                    simulated=False,
                     unhedged_quantity="0",
                     occurred_at=datetime.now(UTC),
                 )
@@ -252,6 +275,42 @@ async def test_initial_migration_runs_on_postgres_and_protects_audit_events() ->
                 )
                 assert sum(claimed for _stored, claimed in claims) == 1
                 assert all(stored == concurrent_incident for stored, _claimed in claims)
+
+                remediation_incident = ExecutionIncident(
+                    idempotency_key="execution:remediation:partially_hedged",
+                    correlation_id="remediation",
+                    state=ExecutionState.PARTIALLY_HEDGED,
+                    action="hedge",
+                    simulated=False,
+                    unhedged_quantity="4",
+                    occurred_at=datetime.now(UTC),
+                )
+                await incident_store.claim(remediation_incident)
+                starts = await asyncio.gather(
+                    *(
+                        incident_store.start_remediation(
+                            remediation_incident.idempotency_key,
+                            "remediation-emergency-hedge",
+                            Venue.POLYMARKET,
+                        )
+                        for _ in range(8)
+                    )
+                )
+                assert sum(started for _stored, started in starts) == 1
+                assert all(
+                    stored.status is RemediationStatus.STARTED
+                    for stored, _started in starts
+                )
+                unknown = await incident_store.complete_remediation(
+                    remediation_incident.idempotency_key,
+                    RemediationStatus.UNKNOWN,
+                )
+                resolved = await PostgresIncidentStore(sessions).complete_remediation(
+                    remediation_incident.idempotency_key,
+                    RemediationStatus.RESOLVED,
+                )
+                assert unknown.status is RemediationStatus.UNKNOWN
+                assert resolved.status is RemediationStatus.RESOLVED
 
                 notification = await NotificationService(
                     PostgresOutbox(sessions)

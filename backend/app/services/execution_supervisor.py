@@ -5,7 +5,14 @@ from decimal import Decimal
 from typing import Protocol
 
 from backend.app.domain.enums import ExecutionState, Venue
-from backend.app.services.emergency_hedge import EmergencyHedgeService, UnhedgedExposure
+from backend.app.services.emergency_hedge import (
+    EmergencyHedgeService,
+    EmergencyRemediation,
+    EmergencyRemediationStore,
+    InMemoryEmergencyRemediationStore,
+    RemediationStatus,
+    UnhedgedExposure,
+)
 from backend.app.services.execution import (
     ExecutionEvidence,
     ExecutionRecord,
@@ -27,7 +34,7 @@ class ExecutionIncident:
     occurred_at: datetime
 
 
-class IncidentStore(Protocol):
+class IncidentStore(EmergencyRemediationStore, Protocol):
     async def get(self, idempotency_key: str) -> ExecutionIncident | None: ...
 
     async def add_if_absent(self, incident: ExecutionIncident) -> ExecutionIncident: ...
@@ -41,6 +48,7 @@ class IncidentStore(Protocol):
 class InMemoryIncidentStore:
     def __init__(self) -> None:
         self.records: dict[str, ExecutionIncident] = {}
+        self._remediations = InMemoryEmergencyRemediationStore()
 
     async def get(self, idempotency_key: str) -> ExecutionIncident | None:
         return self.records.get(idempotency_key)
@@ -60,6 +68,31 @@ class InMemoryIncidentStore:
 
     async def list(self) -> list[ExecutionIncident]:
         return list(self.records.values())
+
+    async def get_remediation(
+        self,
+        idempotency_key: str,
+    ) -> EmergencyRemediation | None:
+        return await self._remediations.get_remediation(idempotency_key)
+
+    async def start_remediation(
+        self,
+        idempotency_key: str,
+        client_order_id: str,
+        venue: Venue,
+    ) -> tuple[EmergencyRemediation, bool]:
+        return await self._remediations.start_remediation(
+            idempotency_key,
+            client_order_id,
+            venue,
+        )
+
+    async def complete_remediation(
+        self,
+        idempotency_key: str,
+        status: RemediationStatus,
+    ) -> EmergencyRemediation:
+        return await self._remediations.complete_remediation(idempotency_key, status)
 
 
 class ExecutionSupervisor:
@@ -85,7 +118,10 @@ class ExecutionSupervisor:
         ports: Mapping[Venue, ExecutionTradingPort],
     ) -> None:
         bound_ports = dict(ports)
-        self._emergency_service_factory = lambda: EmergencyHedgeService(bound_ports)
+        self._emergency_service_factory = lambda: EmergencyHedgeService(
+            bound_ports,
+            remediation_store=self._incidents,
+        )
 
     async def finalize(
         self,
@@ -121,7 +157,7 @@ class ExecutionSupervisor:
         action = "investigate"
         if record.state is ExecutionState.PARTIALLY_HEDGED:
             action = "hedge"
-        incident, claimed = await self._incidents.claim(
+        incident, _claimed = await self._incidents.claim(
             ExecutionIncident(
                 idempotency_key=key,
                 correlation_id=record.correlation_id,
@@ -132,10 +168,6 @@ class ExecutionSupervisor:
                 occurred_at=timestamp,
             )
         )
-        if not claimed:
-            await self._enqueue(incident)
-            return incident
-
         try:
             await self._system_control.disable_opening_async("execution incident")
             if (
@@ -146,6 +178,7 @@ class ExecutionSupervisor:
                 await self._emergency_service_factory().resolve(
                     _exposure(record, evidence),
                     maximum_unhedged_loss,
+                    remediation_key=incident.idempotency_key,
                 )
         finally:
             # Escalation must survive a venue or control-store failure. A retry

@@ -6,6 +6,8 @@ from backend.app.domain.enums import Venue
 from backend.app.services.emergency_hedge import (
     EmergencyAction,
     EmergencyHedgeService,
+    InMemoryEmergencyRemediationStore,
+    RemediationStatus,
     UnhedgedExposure,
 )
 from backend.app.services.execution import (
@@ -35,6 +37,15 @@ class RecordingPort:
         return None
 
 
+def emergency_service(
+    ports: dict[Venue, RecordingPort],
+) -> EmergencyHedgeService:
+    return EmergencyHedgeService(
+        ports,
+        remediation_store=InMemoryEmergencyRemediationStore(),
+    )
+
+
 def exposure(hedge_loss: Decimal) -> UnhedgedExposure:
     return UnhedgedExposure(
         correlation_id="corr-1",
@@ -54,7 +65,7 @@ def exposure(hedge_loss: Decimal) -> UnhedgedExposure:
 @pytest.mark.asyncio
 async def test_hedges_missing_leg_when_loss_is_within_limit() -> None:
     ports = {Venue.KALSHI: RecordingPort(), Venue.POLYMARKET: RecordingPort()}
-    service = EmergencyHedgeService(ports)
+    service = emergency_service(ports)
 
     result = await service.resolve(exposure(Decimal("1.50")), Decimal(2))
 
@@ -67,7 +78,7 @@ async def test_hedges_missing_leg_when_loss_is_within_limit() -> None:
 @pytest.mark.asyncio
 async def test_closes_filled_leg_when_hedge_loss_exceeds_limit() -> None:
     ports = {Venue.KALSHI: RecordingPort(), Venue.POLYMARKET: RecordingPort()}
-    service = EmergencyHedgeService(ports)
+    service = emergency_service(ports)
 
     result = await service.resolve(exposure(Decimal("2.01")), Decimal(2))
 
@@ -79,7 +90,7 @@ async def test_closes_filled_leg_when_hedge_loss_exceeds_limit() -> None:
 @pytest.mark.asyncio
 async def test_emergency_action_is_idempotent_per_execution() -> None:
     ports = {Venue.KALSHI: RecordingPort(), Venue.POLYMARKET: RecordingPort()}
-    service = EmergencyHedgeService(ports)
+    service = emergency_service(ports)
 
     first = await service.resolve(exposure(Decimal("1.50")), Decimal(2))
     second = await service.resolve(exposure(Decimal("1.50")), Decimal(2))
@@ -121,7 +132,7 @@ async def test_emergency_timeout_is_queried_and_never_resubmitted() -> None:
 
     timeout_port = TimeoutAfterAcceptingPort()
     ports = {Venue.KALSHI: RecordingPort(), Venue.POLYMARKET: timeout_port}
-    service = EmergencyHedgeService(ports)
+    service = emergency_service(ports)
 
     first = await service.resolve(exposure(Decimal("1.50")), Decimal(2))
     second = await service.resolve(exposure(Decimal("1.50")), Decimal(2))
@@ -152,7 +163,7 @@ async def test_emergency_query_failure_is_cached_as_unknown() -> None:
 
     unresolved_port = UnresolvedEmergencyPort()
     ports = {Venue.KALSHI: RecordingPort(), Venue.POLYMARKET: unresolved_port}
-    service = EmergencyHedgeService(ports)
+    service = emergency_service(ports)
 
     first = await service.resolve(exposure(Decimal("1.50")), Decimal(2))
     second = await service.resolve(exposure(Decimal("1.50")), Decimal(2))
@@ -165,9 +176,106 @@ async def test_emergency_query_failure_is_cached_as_unknown() -> None:
 
 
 @pytest.mark.asyncio
+async def test_emergency_generic_submit_failure_is_queried_before_marking_unknown() -> None:
+    class GenericFailurePort(RecordingPort):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lookups = 0
+
+        async def submit_fok(self, request: OrderRequest) -> OrderSubmissionResult:
+            self.requests.append(request)
+            raise RuntimeError("connection closed after write")
+
+        async def find_by_client_order_id(
+            self,
+            client_order_id: str,
+        ) -> OrderSubmissionResult | None:
+            self.lookups += 1
+            return None
+
+    failed_port = GenericFailurePort()
+    ports = {Venue.KALSHI: RecordingPort(), Venue.POLYMARKET: failed_port}
+    service = emergency_service(ports)
+
+    result = await service.resolve(exposure(Decimal("1.50")), Decimal(2))
+
+    assert result.order.status is OrderStatus.UNKNOWN
+    assert result.resolved is False
+    assert len(failed_port.requests) == 1
+    assert failed_port.lookups == 1
+
+
+@pytest.mark.asyncio
+async def test_started_remediation_is_reconciled_without_a_second_submission() -> None:
+    class MissingOrderPort(RecordingPort):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lookups = 0
+
+        async def find_by_client_order_id(
+            self,
+            client_order_id: str,
+        ) -> OrderSubmissionResult | None:
+            self.lookups += 1
+            return None
+
+    missing_order_port = MissingOrderPort()
+    ports = {Venue.KALSHI: RecordingPort(), Venue.POLYMARKET: missing_order_port}
+    remediations = InMemoryEmergencyRemediationStore()
+    remediation_key = "execution:corr-1:partially_hedged"
+    await remediations.start_remediation(
+        remediation_key,
+        "corr-1-emergency-hedge",
+        Venue.POLYMARKET,
+    )
+    service = EmergencyHedgeService(ports, remediation_store=remediations)
+
+    result = await service.resolve(
+        exposure(Decimal("1.50")),
+        Decimal(2),
+        remediation_key=remediation_key,
+    )
+
+    assert result.order.status is OrderStatus.UNKNOWN
+    assert missing_order_port.requests == []
+    assert missing_order_port.lookups == 1
+    remediation = await remediations.get_remediation(remediation_key)
+    assert remediation is not None
+    assert remediation.status is RemediationStatus.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_emergency_submission_persists_intent_before_venue_write() -> None:
+    remediations = InMemoryEmergencyRemediationStore()
+    remediation_key = "execution:corr-1:partially_hedged"
+
+    class IntentCheckingPort(RecordingPort):
+        async def submit_fok(self, request: OrderRequest) -> OrderSubmissionResult:
+            remediation = await remediations.get_remediation(remediation_key)
+            assert remediation is not None
+            assert remediation.status is RemediationStatus.STARTED
+            return await super().submit_fok(request)
+
+    intent_port = IntentCheckingPort()
+    ports = {Venue.KALSHI: RecordingPort(), Venue.POLYMARKET: intent_port}
+    service = EmergencyHedgeService(ports, remediation_store=remediations)
+
+    result = await service.resolve(
+        exposure(Decimal("1.50")),
+        Decimal(2),
+        remediation_key=remediation_key,
+    )
+
+    assert result.resolved is True
+    remediation = await remediations.get_remediation(remediation_key)
+    assert remediation is not None
+    assert remediation.status is RemediationStatus.RESOLVED
+
+
+@pytest.mark.asyncio
 async def test_emergency_action_submits_and_is_not_simulated() -> None:
     ports = {Venue.KALSHI: RecordingPort(), Venue.POLYMARKET: RecordingPort()}
-    service = EmergencyHedgeService(ports)
+    service = emergency_service(ports)
 
     result = await service.resolve(exposure(Decimal("1.50")), Decimal(2))
 
@@ -180,7 +288,7 @@ async def test_emergency_action_submits_and_is_not_simulated() -> None:
 @pytest.mark.asyncio
 async def test_emergency_action_caches_one_real_result_per_execution() -> None:
     ports = {Venue.KALSHI: RecordingPort(), Venue.POLYMARKET: RecordingPort()}
-    service = EmergencyHedgeService(ports)
+    service = emergency_service(ports)
 
     first = await service.resolve(exposure(Decimal("1.50")), Decimal(2))
     second = await service.resolve(exposure(Decimal("1.50")), Decimal(2))

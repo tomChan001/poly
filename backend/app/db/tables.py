@@ -229,6 +229,25 @@ class OutboxEvent(IdTimestampMixin, Base):
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class ExecutionIncidentRecord(Base):
+    __tablename__ = "execution_incident"
+
+    idempotency_key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    correlation_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    simulated: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    unhedged_quantity: Mapped[str] = mapped_column(String(128), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    remediation_status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        server_default="pending",
+    )
+    remediation_client_order_id: Mapped[str | None] = mapped_column(String(255))
+    remediation_venue: Mapped[str | None] = mapped_column(String(32))
+
+
 class SystemControl(Base):
     __tablename__ = "system_control"
 

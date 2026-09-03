@@ -191,6 +191,39 @@ async def test_disabling_opening_after_submitted_persistence_blocks_venue_writes
 
 
 @pytest.mark.asyncio
+async def test_second_guard_never_submits_when_exception_persistence_fails() -> None:
+    saved_states: list[ExecutionState] = []
+    control = SystemControl(opening_enabled=True)
+
+    class FailingExceptionStore:
+        async def save(self, record: ExecutionRecord) -> None:
+            saved_states.append(record.state)
+            if record.state is ExecutionState.SUBMITTED:
+                control.disable_opening("test switch")
+                return
+            raise OSError("execution persistence unavailable")
+
+        async def list(self) -> list[ExecutionRecord]:
+            return []
+
+        async def get(self, correlation_id: str) -> ExecutionRecord:
+            raise KeyError(correlation_id)
+
+    ports = {
+        Venue.KALSHI: FakeTradingPort(filled(Venue.KALSHI)),
+        Venue.POLYMARKET: FakeTradingPort(filled(Venue.POLYMARKET)),
+    }
+    authorization = ExecutionAuthorizationService().issue(MappingStatus.EXACT, evidence(), NOW)
+    service = ControlledExecutionService(ports, control, FailingExceptionStore())
+
+    with pytest.raises(OSError, match="execution persistence unavailable"):
+        await service.execute(authorization, evidence(), NOW + timedelta(seconds=1))
+
+    assert saved_states == [ExecutionState.SUBMITTED, ExecutionState.EXCEPTION]
+    assert all(port.submissions == 0 for port in ports.values())
+
+
+@pytest.mark.asyncio
 async def test_one_sided_fill_disables_opening_and_is_partially_hedged() -> None:
     control = SystemControl(opening_enabled=True)
     ports = {
@@ -245,3 +278,25 @@ async def test_submitted_recovery_continues_while_opening_is_disabled() -> None:
 
     assert recovered.state is ExecutionState.PAIRED
     assert all(port.submissions == 0 for port in ports.values())
+
+
+@pytest.mark.asyncio
+async def test_unknown_leg_cannot_be_marked_paired_even_when_its_fills_match() -> None:
+    unknown_with_fill = OrderSubmissionResult(
+        "client-kalshi",
+        OrderStatus.UNKNOWN,
+        (FillReport("unknown-fill", Decimal(10), Decimal("0.50"), Decimal("0.01")),),
+    )
+    control = SystemControl(opening_enabled=True)
+    ports = {
+        Venue.KALSHI: FakeTradingPort(unknown_with_fill),
+        Venue.POLYMARKET: FakeTradingPort(filled(Venue.POLYMARKET)),
+    }
+    authorization = ExecutionAuthorizationService().issue(MappingStatus.EXACT, evidence(), NOW)
+    service = ControlledExecutionService(ports, control)
+
+    result = await service.execute(authorization, evidence(), NOW + timedelta(seconds=1))
+
+    assert result.state is ExecutionState.EXCEPTION
+    assert control.opening_enabled is False
+    assert control.reason == "execution outcome unresolved"

@@ -78,3 +78,14 @@ def test_risk_policy_migration_tolerates_table_created_by_current_metadata(monke
     migration.upgrade()
 
     assert calls == [{"if_not_exists": True}]
+
+
+def test_incident_remediation_migration_backfills_existing_incidents(monkeypatch) -> None:
+    migration = load_migration("0008_incident_remediation.py")
+    statements: list[str] = []
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+
+    migration.upgrade()
+
+    assert any("remediation_status" in statement for statement in statements)
+    assert any("DEFAULT 'pending'" in statement for statement in statements)

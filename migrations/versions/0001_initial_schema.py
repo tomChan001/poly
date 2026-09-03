@@ -34,6 +34,7 @@ EXPECTED_TABLES = {
     "state_transition",
     "audit_event",
     "outbox_event",
+    "execution_incident",
     "system_control",
     "risk_policy_version",
 }

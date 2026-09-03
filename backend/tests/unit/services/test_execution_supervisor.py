@@ -112,3 +112,40 @@ async def test_paired_execution_reconciles_actual_fees_and_closes_opening() -> N
     assert incident is None
     assert control.opening_enabled is False
     assert control.reason == "actual fee differs from estimate"
+
+
+@pytest.mark.asyncio
+async def test_claimed_incident_retries_fail_closed_remediation_after_restart() -> None:
+    class FailingOnceControl(SystemControl):
+        def __init__(self) -> None:
+            super().__init__(opening_enabled=True)
+            self.attempts = 0
+
+        async def disable_opening_async(self, reason: str, **kwargs: object) -> object:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise OSError("control store unavailable")
+            return await super().disable_opening_async(reason, **kwargs)
+
+    control = FailingOnceControl()
+    incidents = InMemoryIncidentStore()
+    notifications = NotificationService(InMemoryOutbox())
+    record = ExecutionRecord(
+        correlation_id="crashed-remediation",
+        state=ExecutionState.EXCEPTION,
+        requested_quantity=Decimal(10),
+    )
+    first_supervisor = ExecutionSupervisor(control, incidents, notifications)
+
+    with pytest.raises(OSError, match="control store unavailable"):
+        await first_supervisor.finalize(record, now=datetime(2026, 8, 26, tzinfo=UTC))
+
+    restarted_supervisor = ExecutionSupervisor(control, incidents, notifications)
+    incident = await restarted_supervisor.finalize(
+        record,
+        now=datetime(2026, 8, 26, tzinfo=UTC),
+    )
+
+    assert incident is not None
+    assert control.attempts == 2
+    assert control.opening_enabled is False
