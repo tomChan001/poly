@@ -392,10 +392,13 @@ async def _await_thread_completion(
 ) -> Any:
     """Do not abandon a potentially-writing SDK thread on cancellation."""
     task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        # A thread cannot be cancelled. Wait for the write boundary before
-        # releasing an upstream submission fence, then preserve cancellation.
-        await asyncio.shield(task)
-        raise
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # A thread cannot be cancelled. Both a timeout's cancellation and
+            # repeated caller cancellation must wait for its write boundary.
+            # If the thread won the race, return its real result rather than
+            # turning a successful post into an UNKNOWN outcome.
+            if task.done():
+                return task.result()
