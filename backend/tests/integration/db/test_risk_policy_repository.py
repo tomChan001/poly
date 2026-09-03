@@ -61,6 +61,10 @@ async def test_postgres_risk_policy_history_survives_store_recreation() -> None:
         assert await recreated.get(second.version) == second
         assert await recreated.initialize() == second
         assert recreated.current == second
+
+        runner_store = PostgresRiskPolicyStore(sessions)
+        assert await runner_store.refresh() == second
+        assert runner_store.current == second
     finally:
         if table_ready:
             async with engine.begin() as connection:

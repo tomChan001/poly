@@ -58,6 +58,8 @@ class RiskPolicyStore(Protocol):
 
     async def initialize(self) -> RiskPolicy: ...
 
+    async def refresh(self) -> RiskPolicy | None: ...
+
     async def create(self, value: RiskPolicyInput) -> RiskPolicy: ...
 
     async def get(self, version: UUID) -> RiskPolicy: ...
@@ -73,6 +75,9 @@ class InMemoryRiskPolicyStore:
     async def initialize(self) -> RiskPolicy:
         if self.current is None:
             return self._create(RiskPolicyInput.defaults())
+        return self.current
+
+    async def refresh(self) -> RiskPolicy | None:
         return self.current
 
     async def create(self, value: RiskPolicyInput) -> RiskPolicy:

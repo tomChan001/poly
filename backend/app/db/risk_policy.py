@@ -34,6 +34,19 @@ class PostgresRiskPolicyStore:
         self.current = policy
         return policy
 
+    async def refresh(self) -> RiskPolicy | None:
+        """Load the current durable version without seeding an empty database."""
+        async with self._sessions() as session:
+            result = await session.execute(
+                text(
+                    "SELECT * FROM risk_policy_version "
+                    "ORDER BY created_at DESC, version DESC LIMIT 1"
+                )
+            )
+            row = result.first()
+        self.current = None if row is None else self._policy(row._mapping)
+        return self.current
+
     async def create(self, value: RiskPolicyInput) -> RiskPolicy:
         policy = _snapshot(value)
         async with self._sessions.begin() as session:

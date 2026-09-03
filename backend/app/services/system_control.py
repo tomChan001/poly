@@ -1,8 +1,11 @@
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +20,10 @@ class OpeningControlState:
 class OpeningControlStore(Protocol):
     async def load_opening(self) -> OpeningControlState | None: ...
 
+    def opening_submission_guard(
+        self,
+    ) -> AbstractAsyncContextManager[OpeningControlState | None]: ...
+
     async def save_opening(
         self,
         *,
@@ -28,6 +35,50 @@ class OpeningControlStore(Protocol):
 
 class OpeningControlPersistenceError(RuntimeError):
     """The durable opening-control store cannot accept an update."""
+
+
+@dataclass(frozen=True, slots=True)
+class OpeningSubmissionPermission:
+    """The durable state observed while a submission lock is held."""
+
+    allowed: bool
+    state: OpeningControlState | None
+
+
+class InMemoryOpeningControlStore:
+    """Test/local durable-control substitute with guard and write serialization."""
+
+    def __init__(self, state: OpeningControlState | None = None) -> None:
+        self._state = state
+        self._lock = asyncio.Lock()
+
+    async def load_opening(self) -> OpeningControlState | None:
+        async with self._lock:
+            return self._state
+
+    async def save_opening(
+        self,
+        *,
+        enabled: bool,
+        reason: str,
+        changed_by: str,
+    ) -> OpeningControlState:
+        async with self._lock:
+            version = 1 if self._state is None else self._state.version + 1
+            self._state = OpeningControlState(
+                enabled,
+                reason,
+                version,
+                changed_by,
+            )
+            return self._state
+
+    @asynccontextmanager
+    async def opening_submission_guard(
+        self,
+    ) -> AsyncIterator[OpeningControlState | None]:
+        async with self._lock:
+            yield self._state
 
 
 class SystemControl:
@@ -47,6 +98,7 @@ class SystemControl:
         self.changed_by = changed_by
         self.changed_at = changed_at
         self._store = store
+        self._submission_lock = asyncio.Lock()
 
     def snapshot(self) -> OpeningControlState:
         return OpeningControlState(
@@ -80,13 +132,53 @@ class SystemControl:
         return state
 
     async def load_async(self) -> OpeningControlState:
+        return await self.refresh_async()
+
+    async def refresh_async(self) -> OpeningControlState:
         if self._store is None:
             return self.snapshot()
-        state = await self._store.load_opening()
+        try:
+            state = await self._store.load_opening()
+        except (OSError, SQLAlchemyError) as exc:
+            if isinstance(exc, ProgrammingError):
+                raise
+            raise OpeningControlPersistenceError(
+                "opening control persistence unavailable"
+            ) from exc
         if state is None:
             return self.snapshot()
         self._apply(state)
         return state
+
+    @asynccontextmanager
+    async def opening_submission_guard(
+        self,
+    ) -> AsyncIterator[OpeningSubmissionPermission]:
+        """Hold the durable opening-control lock across an external write.
+
+        Callers must submit only when the yielded permission is allowed.  A
+        durable store re-reads its state after acquiring its cross-process lock;
+        without one, this instance lock serializes local state changes.
+        """
+        if self._store is None:
+            async with self._submission_lock:
+                state = self.snapshot()
+                yield OpeningSubmissionPermission(state.opening_enabled, state)
+            return
+        try:
+            async with self._store.opening_submission_guard() as durable_state:
+                if durable_state is not None:
+                    self._apply(durable_state)
+                yield OpeningSubmissionPermission(
+                    durable_state is not None and durable_state.opening_enabled,
+                    durable_state,
+                )
+        except (OSError, SQLAlchemyError) as exc:
+            if isinstance(exc, ProgrammingError):
+                raise
+            raise OpeningControlPersistenceError(
+                "opening control persistence unavailable"
+            ) from exc
 
     async def disable_opening_async(
         self,
@@ -116,6 +208,8 @@ class SystemControl:
         # TimeoutError and connection failures such as ConnectionRefusedError
         # are OSErrors; programming and cancellation errors remain visible.
         except (OSError, SQLAlchemyError) as exc:
+            if isinstance(exc, ProgrammingError):
+                raise
             raise OpeningControlPersistenceError(
                 "opening control persistence unavailable"
             ) from exc

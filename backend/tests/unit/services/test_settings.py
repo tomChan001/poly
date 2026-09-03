@@ -40,3 +40,13 @@ async def test_risk_policy_initialize_reuses_the_current_version() -> None:
     assert second is first
     assert second.version == first.version
 
+
+@pytest.mark.asyncio
+async def test_risk_policy_refresh_returns_current_version_without_creating_one() -> None:
+    store = InMemoryRiskPolicyStore()
+
+    assert await store.refresh() is None
+
+    created = await store.initialize()
+    assert await store.refresh() is created
+

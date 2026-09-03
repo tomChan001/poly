@@ -2,7 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from backend.app.api.routes.executions import router as executions_router
 from backend.app.api.routes.integrations import router as integrations_router
@@ -14,6 +14,7 @@ from backend.app.api.routes.settings import router as settings_router
 from backend.app.api.routes.system_control import router as system_control_router
 from backend.app.container import ApplicationContainer
 from backend.app.core.config import settings
+from backend.app.services.system_control import OpeningControlPersistenceError
 
 
 async def _live_runtime_loop(
@@ -102,13 +103,20 @@ def create_app(
     application.include_router(system_control_router)
 
     @application.get("/health")
-    def health() -> dict[str, object]:
+    async def health() -> dict[str, object]:
         # The UI must display the same two switches used by order execution;
         # returning both prevents a hard-coded banner from drifting from reality.
+        try:
+            state = await application_container.system_control.refresh_async()
+        except OpeningControlPersistenceError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="opening control persistence unavailable",
+            ) from exc
         return {
             "status": "ok",
-            "opening_enabled": application_container.system_control.opening_enabled,
-            "reason": application_container.system_control.reason,
+            "opening_enabled": state.opening_enabled,
+            "reason": state.reason,
         }
 
     return application

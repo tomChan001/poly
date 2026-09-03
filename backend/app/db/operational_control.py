@@ -1,3 +1,5 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import cast
 
@@ -8,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from backend.app.services.system_control import OpeningControlState
 
 _OPENING_CONTROL = "opening"
+_OPENING_CONTROL_LOCK = "poly-opening-control"
 
 
 class PostgresOperationalControlStore:
@@ -23,6 +26,18 @@ class PostgresOperationalControlStore:
             row = result.first()
             return None if row is None else self._state(row._mapping)
 
+    @asynccontextmanager
+    async def opening_submission_guard(self) -> AsyncIterator[OpeningControlState | None]:
+        """Serialize external opens with durable opening-control updates."""
+        async with self._sessions.begin() as session:
+            await self._lock_opening(session)
+            result = await session.execute(
+                text("SELECT * FROM system_control WHERE name = :name"),
+                {"name": _OPENING_CONTROL},
+            )
+            row = result.first()
+            yield None if row is None else self._state(row._mapping)
+
     async def save_opening(
         self,
         *,
@@ -32,6 +47,7 @@ class PostgresOperationalControlStore:
     ) -> OpeningControlState:
         changed_at = datetime.now(UTC)
         async with self._sessions.begin() as session:
+            await self._lock_opening(session)
             result = await session.execute(
                 text(
                     """
@@ -58,6 +74,13 @@ class PostgresOperationalControlStore:
                 },
             )
             return self._state(result.one()._mapping)
+
+    @staticmethod
+    async def _lock_opening(session: AsyncSession) -> None:
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+            {"key": _OPENING_CONTROL_LOCK},
+        )
 
     @staticmethod
     def _state(row: RowMapping) -> OpeningControlState:
