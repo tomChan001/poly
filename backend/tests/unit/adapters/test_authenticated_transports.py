@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import sys
+import threading
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, cast
@@ -13,7 +14,61 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from backend.app.adapters.integration_probe import HttpIntegrationConnectionProbe
 from backend.app.adapters.kalshi.http_transport import KalshiHttpTransport
-from backend.app.adapters.polymarket.sdk_transport import PolymarketSdkTransport
+from backend.app.adapters.polymarket.sdk_transport import (
+    PolymarketSdkTransport,
+    _await_thread_completion,
+)
+
+
+@pytest.mark.asyncio
+async def test_thread_write_timeout_waits_for_successful_thread_result() -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def post() -> str:
+        started.set()
+        release.wait()
+        return "posted"
+
+    task = asyncio.create_task(
+        asyncio.wait_for(_await_thread_completion(post), timeout=0.01)
+    )
+    try:
+        await asyncio.to_thread(started.wait)
+        await asyncio.sleep(0.03)
+        assert not task.done()
+        release.set()
+        assert await task == "posted"
+    finally:
+        release.set()
+        if not task.done():
+            await task
+
+
+@pytest.mark.asyncio
+async def test_thread_write_survives_repeated_cancellation_until_release() -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def post() -> str:
+        started.set()
+        release.wait()
+        return "posted"
+
+    task = asyncio.create_task(_await_thread_completion(post))
+    try:
+        await asyncio.to_thread(started.wait)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        assert await task == "posted"
+    finally:
+        release.set()
+        if not task.done():
+            await task
 from backend.app.services.integration_config import (
     ConnectionTestResult,
     IntegrationConfigRecord,

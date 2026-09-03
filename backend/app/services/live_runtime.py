@@ -184,7 +184,8 @@ class LiveRuntimeService:
             pending_disable_reason: str | None = None
             # Lock order is global submission fence -> execution correlation
             # fence -> capital/venue I/O.  Policy/control writes share the
-            # first lock, while recovery never takes it.
+            # first lock. Recovery uses only the correlation lock for venue
+            # queries and performs its control side effects after releasing it.
             async with self._system_control.opening_submission_guard() as permission:
                 if not permission.allowed:
                     continue
@@ -245,7 +246,7 @@ class LiveRuntimeService:
                         # A concurrent runtime owns this identity and its
                         # reservation.  Do not release or recover it here.
                         continue
-                    except Exception:
+                    except BaseException:
                         # Before a durable claim, this runtime owns the only
                         # reservation and must release it. Once claimed, the
                         # recovery record owns the reservation even if a later

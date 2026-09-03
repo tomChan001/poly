@@ -239,13 +239,17 @@ class SystemControl:
         if not self.owns_submission_permission(permission):
             raise OpeningControlPersistenceError("submission permission is not active")
         if self._store is None:
-            return self.set_opening(False, reason, changed_by)
-        state = await self._store.save_opening_while_guarded(
-            enabled=False,
-            reason=reason,
-            changed_by=changed_by,
-        )
-        self._apply(state)
+            state = self.set_opening(False, reason, changed_by)
+        else:
+            state = await self._store.save_opening_while_guarded(
+                enabled=False,
+                reason=reason,
+                changed_by=changed_by,
+            )
+            self._apply(state)
+        # OFF is terminal for this submission scope: a caller that has just
+        # failed closed cannot reuse its old permission for another write.
+        permission._scope.active = False
         return state
 
     async def disable_opening_async(

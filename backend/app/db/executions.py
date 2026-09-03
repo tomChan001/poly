@@ -32,8 +32,9 @@ class PostgresExecutionStore:
         """Hold the correlation advisory lock through submit/recovery finalization.
 
         New openings acquire the global submission fence first, then this
-        lock. Recovery intentionally acquires only this lock, so it remains
-        available while opening is OFF and cannot invert the lock order.
+        lock. Recovery holds only this lock while querying venues; its
+        supervisor/control side effects run after release, so no correlation
+        lock is ever held while acquiring the global fence.
         """
         async with self._sessions.begin() as session:
             await session.execute(

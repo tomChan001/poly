@@ -47,6 +47,7 @@ async def test_fee_mismatch_closes_durable_control_inside_submission_guard() -> 
             actual=Decimal("0.03"),
             submission_permission=permission,
         )
+        assert not control.owns_submission_permission(permission)
 
     assert result.matches is False
     assert control.opening_enabled is False
