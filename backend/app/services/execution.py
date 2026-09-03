@@ -267,6 +267,10 @@ class ControlledExecutionService:
         now: datetime,
     ) -> ExecutionRecord:
         self._authorizations.consume(authorization, current_evidence, now)
+        # The opening state is durable and may have changed in another
+        # process since this runtime's previous cycle.  Refresh before the
+        # submission claim so an OFF state cannot create a recovery record.
+        await self._system_control.refresh_async()
         if not self._system_control.opening_enabled:
             raise AuthorizationRejected("real ordering is disabled")
         requests = self._requests(authorization)
@@ -283,15 +287,18 @@ class ControlledExecutionService:
         if self._store is not None and not await self._store.claim_submission(record):
             raise ExecutionSubmissionClaimed(authorization.correlation_id)
 
-        if not self._system_control.opening_enabled:
-            record.transition(ExecutionState.EXCEPTION, now)
-            if self._store is not None:
-                await self._store.save(record)
-            raise AuthorizationRejected("real ordering is disabled")
-
-        results = await asyncio.gather(
-            *(self._submit_or_recover(request) for request in requests.values()),
-        )
+        # Acquiring this guard is the final permission check.  Its durable
+        # lock covers both venue writes, linearizing a concurrent OFF update
+        # with the actual external submissions.
+        async with self._system_control.opening_submission_guard() as permission:
+            if not permission.allowed:
+                record.transition(ExecutionState.EXCEPTION, now)
+                if self._store is not None:
+                    await self._store.save(record)
+                raise AuthorizationRejected("real ordering is disabled")
+            results = await asyncio.gather(
+                *(self._submit_or_recover(request) for request in requests.values()),
+            )
         record.legs = dict(zip(requests, results, strict=True))
         await self._finalize(record, now, current_evidence)
         return record

@@ -41,7 +41,11 @@ from backend.app.services.opportunities import (
 from backend.app.services.optimizer import QuoteOptimizer
 from backend.app.services.runtime_status import RuntimeStatusService
 from backend.app.services.settings import InMemoryRiskPolicyStore, RiskPolicyInput
-from backend.app.services.system_control import SystemControl
+from backend.app.services.system_control import (
+    InMemoryOpeningControlStore,
+    OpeningControlState,
+    SystemControl,
+)
 
 NOW = datetime(2026, 8, 19, 2, 0, tzinfo=UTC)
 PRIVATE_KEY = "0x59c6995e998f97a5a0044966f094538c5f7d2b32a3d47ec9d7c2b4e1f7e3b5d1"
@@ -221,6 +225,19 @@ class ClosingOpportunityStore(InMemoryOpportunityStore):
     def replace(self, records: list[OpportunityRecord]) -> None:
         super().replace(records)
         self._control.disable_opening("closed after evaluation")
+
+
+class RefreshingRiskPolicies:
+    """Represents a runner retaining an old cache while another API updates it."""
+
+    def __init__(self, stale, refreshed) -> None:
+        self.current = stale
+        self._refreshed = refreshed
+        self.refreshes = 0
+
+    async def refresh(self):
+        self.refreshes += 1
+        return self._refreshed
 
 
 class FailOnceSettledSaveStore(InMemoryExecutionStore):
@@ -564,6 +581,163 @@ async def test_concurrent_live_cycles_submit_each_book_once() -> None:
     assert len(capital.consumed_pairs) == 1
     assert capital.reservations == {}
     assert market_data.maximum_active_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_live_cycle_uses_the_risk_policy_snapshot_refreshed_this_cycle() -> None:
+    integrations = await configured_integrations()
+    pairs = ExecutablePairService(InMemoryExecutablePairRepository())
+    pair = await pairs.create(
+        ExecutablePairInput(
+            title="Fresh policy pair",
+            kalshi_market_id="K-FRESH-POLICY",
+            kalshi_outcome="no",
+            kalshi_rule_text="K rule",
+            kalshi_rule_url="https://kalshi.test/rule",
+            polymarket_market_id="P-FRESH-POLICY",
+            polymarket_outcome="yes",
+            polymarket_rule_text="P rule",
+            polymarket_rule_url="https://poly.test/rule",
+            minimum_quantity=Decimal(10),
+            quantity_step=Decimal(1),
+            enabled=True,
+            kalshi_category="standard",
+            polymarket_category="standard",
+        )
+    )
+    await pairs.review(
+        pair.id,
+        status=MappingStatus.EXACT,
+        checklist={item: True for item in REQUIRED_REVIEW_ITEMS},
+        truth_table=[{"kalshi": Decimal(1), "polymarket": Decimal(0)}],
+        notes="exact",
+        reviewer="human",
+    )
+    source = InMemoryRiskPolicyStore(RiskPolicyInput.defaults())
+    stale = source.current
+    updated_input = RiskPolicyInput.defaults()
+    updated_input.minimum_roi = Decimal("0.99")
+    refreshed = await source.create(updated_input)
+    risk = RefreshingRiskPolicies(stale, refreshed)
+    control = SystemControl(opening_enabled=False)
+    opportunities = InMemoryOpportunityStore()
+    ports = {
+        Venue.KALSHI: FakeTradingPort(Venue.KALSHI),
+        Venue.POLYMARKET: FakeTradingPort(Venue.POLYMARKET),
+    }
+    runtime = LiveRuntimeService(
+        integrations=integrations,
+        pairs=pairs,
+        risk_policies=risk,
+        system_control=control,
+        execution_store=InMemoryExecutionStore(),
+        opportunities=opportunities,
+        runtime_status=RuntimeStatusService(integrations, control),
+        market_data_factory=lambda _bundle: FakeMarketData(),
+        trading_ports_factory=lambda _bundle: ports,
+        optimizer=QuoteOptimizer(fee_engine()),
+        capital_ledger=CapitalLedger({}),
+    )
+
+    await runtime.run_once(NOW)
+
+    [opportunity] = opportunities.list_ranked()
+    assert risk.refreshes == 1
+    assert opportunity.risk_policy_version == str(refreshed.version)
+    assert opportunity.rejection_reasons == ("ROI_BELOW_THRESHOLD",)
+    assert all(port.submissions == 0 for port in ports.values())
+
+
+@pytest.mark.asyncio
+async def test_two_runtimes_leave_the_winners_reservation_on_a_lost_claim() -> None:
+    integrations = await configured_integrations()
+    pairs = ExecutablePairService(InMemoryExecutablePairRepository())
+    pair = await pairs.create(
+        ExecutablePairInput(
+            title="Cross process claim pair",
+            kalshi_market_id="K-CROSS-PROCESS",
+            kalshi_outcome="no",
+            kalshi_rule_text="K rule",
+            kalshi_rule_url="https://kalshi.test/rule",
+            polymarket_market_id="P-CROSS-PROCESS",
+            polymarket_outcome="yes",
+            polymarket_rule_text="P rule",
+            polymarket_rule_url="https://poly.test/rule",
+            minimum_quantity=Decimal(10),
+            quantity_step=Decimal(1),
+            enabled=True,
+            kalshi_category="standard",
+            polymarket_category="standard",
+        )
+    )
+    await pairs.review(
+        pair.id,
+        status=MappingStatus.EXACT,
+        checklist={item: True for item in REQUIRED_REVIEW_ITEMS},
+        truth_table=[{"kalshi": Decimal(1), "polymarket": Decimal(0)}],
+        notes="exact",
+        reviewer="human",
+    )
+    opening_store = InMemoryOpeningControlStore(
+        OpeningControlState(True, "operator enabled", version=1)
+    )
+    refresh_barrier = asyncio.Barrier(2)
+
+    class ConcurrentControl(SystemControl):
+        async def refresh_async(self):
+            state = await super().refresh_async()
+            await refresh_barrier.wait()
+            return state
+
+    first_control = ConcurrentControl(store=opening_store)
+    second_control = ConcurrentControl(store=opening_store)
+    history = InMemoryExecutionStore()
+    capital = CapitalLedger({})
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingTradingPort(FakeTradingPort):
+        async def submit_fok(self, request: OrderRequest) -> OrderSubmissionResult:
+            started.set()
+            await release.wait()
+            return await super().submit_fok(request)
+
+    ports = {
+        Venue.KALSHI: BlockingTradingPort(Venue.KALSHI),
+        Venue.POLYMARKET: BlockingTradingPort(Venue.POLYMARKET),
+    }
+
+    def runtime(control: SystemControl) -> LiveRuntimeService:
+        return LiveRuntimeService(
+            integrations=integrations,
+            pairs=pairs,
+            risk_policies=InMemoryRiskPolicyStore(RiskPolicyInput.defaults()),
+            system_control=control,
+            execution_store=history,
+            opportunities=InMemoryOpportunityStore(),
+            runtime_status=RuntimeStatusService(integrations, control),
+            market_data_factory=lambda _bundle: FakeMarketData(),
+            trading_ports_factory=lambda _bundle: ports,
+            optimizer=QuoteOptimizer(fee_engine()),
+            capital_ledger=capital,
+        )
+
+    first = asyncio.create_task(runtime(first_control).run_once(NOW))
+    second = asyncio.create_task(runtime(second_control).run_once(NOW))
+    await started.wait()
+    await asyncio.sleep(0)
+    correlation_id = str(
+        uuid5(NAMESPACE_URL, f"live-execution:{pair.id}:k-seq-1:p-seq-1")
+    )
+
+    assert capital.get_pair(correlation_id) is not None
+    release.set()
+    results = await asyncio.gather(first, second)
+
+    assert sorted(results) == [0, 1]
+    assert all(port.submissions == 1 for port in ports.values())
+    assert correlation_id in capital.consumed_pairs
+    assert capital.reservations == {}
 
 
 @pytest.mark.asyncio

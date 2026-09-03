@@ -51,6 +51,19 @@ async def test_refresh_observes_shared_durable_opening_state() -> None:
 
 
 @pytest.mark.asyncio
+async def test_empty_durable_control_fails_closed_even_when_local_cache_is_open() -> None:
+    store = InMemoryOpeningControlStore()
+    control = SystemControl(opening_enabled=True, reason="stale local cache", store=store)
+
+    state = await control.refresh_async()
+
+    assert state.opening_enabled is False
+    assert state.reason == "durable control not initialized"
+    async with control.opening_submission_guard() as permission:
+        assert permission.allowed is False
+
+
+@pytest.mark.asyncio
 async def test_in_memory_store_serializes_disable_with_submission_guard() -> None:
     store = InMemoryOpeningControlStore()
     control = SystemControl(store=store)

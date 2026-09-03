@@ -146,7 +146,7 @@ class SystemControl:
                 "opening control persistence unavailable"
             ) from exc
         if state is None:
-            return self.snapshot()
+            return self._apply_uninitialized_durable_state()
         self._apply(state)
         return state
 
@@ -167,10 +167,12 @@ class SystemControl:
             return
         try:
             async with self._store.opening_submission_guard() as durable_state:
-                if durable_state is not None:
+                if durable_state is None:
+                    durable_state = self._apply_uninitialized_durable_state()
+                else:
                     self._apply(durable_state)
                 yield OpeningSubmissionPermission(
-                    durable_state is not None and durable_state.opening_enabled,
+                    durable_state.opening_enabled,
                     durable_state,
                 )
         except (OSError, SQLAlchemyError) as exc:
@@ -222,3 +224,13 @@ class SystemControl:
         self.version = state.version
         self.changed_by = state.changed_by
         self.changed_at = state.changed_at
+
+    def _apply_uninitialized_durable_state(self) -> OpeningControlState:
+        state = OpeningControlState(
+            opening_enabled=False,
+            reason="durable control not initialized",
+            version=self.version,
+            changed_by="system",
+        )
+        self._apply(state)
+        return state

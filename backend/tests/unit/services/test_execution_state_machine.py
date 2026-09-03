@@ -17,7 +17,11 @@ from backend.app.services.execution import (
     OrderStatus,
     OrderSubmissionResult,
 )
-from backend.app.services.system_control import SystemControl
+from backend.app.services.system_control import (
+    InMemoryOpeningControlStore,
+    OpeningControlState,
+    SystemControl,
+)
 
 NOW = datetime(2026, 8, 18, 2, 0, tzinfo=UTC)
 
@@ -351,6 +355,74 @@ async def test_real_submission_requires_opening_to_be_enabled() -> None:
         await service.execute(authorization, evidence(), NOW + timedelta(seconds=1))
 
     assert all(port.submissions == 0 for port in ports.values())
+
+
+@pytest.mark.asyncio
+async def test_execution_refreshes_durable_control_before_claiming_submission() -> None:
+    opening_store = InMemoryOpeningControlStore(
+        OpeningControlState(True, "enabled", version=1)
+    )
+    runner_control = SystemControl(opening_enabled=True, store=opening_store)
+    operator_control = SystemControl(opening_enabled=True, store=opening_store)
+    await operator_control.disable_opening_async("operator closed")
+    claims = 0
+
+    class ClaimRecordingStore(InMemoryExecutionStore):
+        async def claim_submission(self, record: ExecutionRecord) -> bool:
+            nonlocal claims
+            claims += 1
+            return await super().claim_submission(record)
+
+    ports = {
+        Venue.KALSHI: FakeTradingPort(filled(Venue.KALSHI)),
+        Venue.POLYMARKET: FakeTradingPort(filled(Venue.POLYMARKET)),
+    }
+    authorization = ExecutionAuthorizationService().issue(MappingStatus.EXACT, evidence(), NOW)
+
+    with pytest.raises(AuthorizationRejected, match="real ordering is disabled"):
+        await ControlledExecutionService(
+            ports, runner_control, ClaimRecordingStore()
+        ).execute(authorization, evidence(), NOW + timedelta(seconds=1))
+
+    assert claims == 0
+    assert all(port.submissions == 0 for port in ports.values())
+
+
+@pytest.mark.asyncio
+async def test_disable_waits_for_guarded_venue_writes_to_finish() -> None:
+    opening_store = InMemoryOpeningControlStore(
+        OpeningControlState(True, "enabled", version=1)
+    )
+    runner_control = SystemControl(opening_enabled=True, store=opening_store)
+    operator_control = SystemControl(opening_enabled=True, store=opening_store)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingTradingPort(FakeTradingPort):
+        async def submit_fok(self, request: object) -> OrderSubmissionResult:
+            started.set()
+            await release.wait()
+            return await super().submit_fok(request)
+
+    ports = {
+        Venue.KALSHI: BlockingTradingPort(filled(Venue.KALSHI)),
+        Venue.POLYMARKET: BlockingTradingPort(filled(Venue.POLYMARKET)),
+    }
+    authorization = ExecutionAuthorizationService().issue(MappingStatus.EXACT, evidence(), NOW)
+    execution = asyncio.create_task(
+        ControlledExecutionService(ports, runner_control, InMemoryExecutionStore()).execute(
+            authorization, evidence(), NOW + timedelta(seconds=1)
+        )
+    )
+    await started.wait()
+    disable = asyncio.create_task(operator_control.disable_opening_async("operator closed"))
+    await asyncio.sleep(0)
+
+    assert not disable.done()
+    release.set()
+    await execution
+    await disable
+    assert all(port.submissions == 1 for port in ports.values())
 
 
 @pytest.mark.asyncio

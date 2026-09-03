@@ -18,6 +18,7 @@ from backend.app.services.execution import (
     ExecutionEvidence,
     ExecutionRecord,
     ExecutionStore,
+    ExecutionSubmissionClaimed,
     ExecutionSupervisorPort,
     ExecutionTradingPort,
 )
@@ -113,9 +114,17 @@ class LiveRuntimeService:
             return await self._run_once(now)
 
     async def _run_once(self, now: datetime) -> int:
+        # Each cycle must take fresh durable snapshots before evaluating a
+        # market.  Failures intentionally escape to the runtime loop, which
+        # records the error and starts no new opening from stale state.
+        await self._system_control.refresh_async()
+        policy = await self._risk_policies.refresh()
+        # Snapshot recovery candidates before any evaluation can claim a new
+        # SUBMITTED record.  A competing runtime that loses that later claim
+        # must not reconcile the winner in this same cycle.
+        records = await self._execution_store.list_recovery_candidates()
         bundle = await self._integrations.runtime_bundle()
         pairs = await self._pairs.list_executable()
-        policy = self._risk_policies.current
         observed: list[OpportunityRecord] = []
         evaluated: list[tuple[ExecutablePair, PairEvaluation]] = []
         ports: dict[Venue, BalanceTradingPort] | None = None
@@ -136,7 +145,6 @@ class LiveRuntimeService:
         # on it. If it fails, do not reserve capital or submit any orders.
         self._opportunities.replace(observed)
 
-        records = await self._execution_store.list_recovery_candidates()
         if records:
             if ports is None:
                 ports = await _resolve(self._trading_ports_factory(bundle))
@@ -187,9 +195,6 @@ class LiveRuntimeService:
             if not self._system_control.opening_enabled:
                 continue
 
-            # Mark before the first network write. A retry after an ambiguous
-            # response must reconcile the stable client IDs, never resubmit.
-            self._processed_books.add(identity)
             reservation = await self._capital_ledger.reserve_pair(
                 correlation_id,
                 evaluation.kalshi_reserved_amount,
@@ -222,9 +227,15 @@ class LiveRuntimeService:
             )
             try:
                 record = await executor.execute(authorization, evidence, now)
+            except ExecutionSubmissionClaimed:
+                # A concurrent runtime owns this identity and its shared
+                # reservation.  Do not release it or prematurely reconcile;
+                # the next cycle will query the persisted SUBMITTED record.
+                continue
             except Exception:
                 await self._capital_ledger.release_pair(correlation_id)
                 raise
+            self._processed_books.add(identity)
             await self._settle_capital(record)
             executions += 1
 
