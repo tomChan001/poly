@@ -204,31 +204,31 @@ class LiveRuntimeService:
                     else:
                         self._processed_books.add(identity)
                         continue
-                    reservation = await self._capital_ledger.reserve_pair(
-                        correlation_id,
-                        evaluation.kalshi_reserved_amount,
-                        evaluation.polymarket_reserved_amount,
-                        event_id=pair.id,
-                    )
-                    evidence = ExecutionEvidence(
-                        quote_evaluation_id=str(uuid4()),
-                        rule_versions=evaluation.rule_versions,
-                        book_sequences=evaluation.book_sequences,
-                        balance_versions=evaluation.balance_versions,
-                        risk_policy_version=str(policy.version),
-                        capital_reservation_id=reservation.evidence_id,
-                        quantity=evaluation.quantity,
-                        kalshi_market_id=pair.kalshi_market_id,
-                        polymarket_market_id=pair.polymarket_market_id,
-                        kalshi_outcome=pair.kalshi_outcome,
-                        polymarket_outcome=pair.polymarket_outcome,
-                        kalshi_limit_price=evaluation.kalshi_limit_price,
-                        polymarket_limit_price=evaluation.polymarket_limit_price,
-                        conservative_roi=evaluation.conservative_roi,
-                        minimum_roi=policy.minimum_roi,
-                        estimated_fees=evaluation.estimated_fees,
-                    )
                     try:
+                        reservation = await self._capital_ledger.reserve_pair(
+                            correlation_id,
+                            evaluation.kalshi_reserved_amount,
+                            evaluation.polymarket_reserved_amount,
+                            event_id=pair.id,
+                        )
+                        evidence = ExecutionEvidence(
+                            quote_evaluation_id=str(uuid4()),
+                            rule_versions=evaluation.rule_versions,
+                            book_sequences=evaluation.book_sequences,
+                            balance_versions=evaluation.balance_versions,
+                            risk_policy_version=str(policy.version),
+                            capital_reservation_id=reservation.evidence_id,
+                            quantity=evaluation.quantity,
+                            kalshi_market_id=pair.kalshi_market_id,
+                            polymarket_market_id=pair.polymarket_market_id,
+                            kalshi_outcome=pair.kalshi_outcome,
+                            polymarket_outcome=pair.polymarket_outcome,
+                            kalshi_limit_price=evaluation.kalshi_limit_price,
+                            polymarket_limit_price=evaluation.polymarket_limit_price,
+                            conservative_roi=evaluation.conservative_roi,
+                            minimum_roi=policy.minimum_roi,
+                            estimated_fees=evaluation.estimated_fees,
+                        )
                         authorization = ExecutionAuthorizationService().issue(
                             MappingStatus.EXACT,
                             evidence,
