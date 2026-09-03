@@ -10,6 +10,103 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
+test('loads and saves the active risk policy', async () => {
+  let savedBody: Record<string, unknown> | null = null
+  const initialPolicy = riskPolicy
+  const savedPolicy = {
+    ...riskPolicy,
+    version: 'risk-v2',
+    created_at: '2026-09-03T03:30:00Z',
+    minimum_roi: '0.05',
+  }
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/settings/risk')) {
+        if (init?.method === 'PUT') {
+          savedBody = JSON.parse(String(init.body)) as Record<string, unknown>
+          return Promise.resolve({ ok: true, json: async () => savedPolicy })
+        }
+        return Promise.resolve({ ok: true, json: async () => initialPolicy })
+      }
+      if (url.includes('/api/runtime')) {
+        return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+      }
+      if (url.includes('/health')) {
+        return Promise.resolve({ ok: true, json: async () => ({ status: 'ok' }) })
+      }
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '风控' }))
+
+  expect(await screen.findByLabelText('最低保守 ROI')).toHaveValue(3)
+  expect(screen.getByLabelText('最长预计结算')).toHaveValue(30)
+  expect(screen.getByLabelText('显式成本')).toHaveValue(0)
+  expect(screen.getByLabelText('最大行情到达间隔')).toHaveValue(0.5)
+  expect(screen.getByText('策略版本 risk-v1')).toBeInTheDocument()
+  expect(screen.getByText(/创建于.*2026年9月3日/)).toBeInTheDocument()
+
+  fireEvent.change(screen.getByLabelText('最低保守 ROI'), { target: { value: '5' } })
+  fireEvent.click(screen.getByRole('button', { name: '保存策略' }))
+
+  await waitFor(() => expect(savedBody).not.toBeNull())
+  expect(savedBody).toEqual({
+    minimum_roi: '0.05',
+    maximum_settlement_days: 30,
+    maximum_book_age_seconds: '2',
+    per_trade_limit: '10',
+    per_event_limit: '25',
+    portfolio_limit: '100',
+    explicit_cost: '0',
+    risk_buffer: '0.25',
+    maximum_unhedged_seconds: '2',
+    maximum_unhedged_loss: '2',
+    maximum_arrival_gap_seconds: '0.5',
+  })
+  expect(await screen.findByText('已生成新策略版本')).toBeInTheDocument()
+  expect(screen.getByText('策略版本 risk-v2')).toBeInTheDocument()
+  expect(screen.getByLabelText('最低保守 ROI')).toHaveValue(5)
+})
+
+test('keeps risk edits visible when saving the policy fails', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/settings/risk')) {
+        if (init?.method === 'PUT') {
+          return Promise.resolve({
+            ok: false,
+            status: 500,
+            json: async () => ({ detail: 'database unavailable' }),
+          })
+        }
+        return Promise.resolve({ ok: true, json: async () => riskPolicy })
+      }
+      if (url.includes('/api/runtime')) {
+        return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+      }
+      if (url.includes('/health')) {
+        return Promise.resolve({ ok: true, json: async () => ({ status: 'ok' }) })
+      }
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '风控' }))
+  const roi = await screen.findByLabelText('最低保守 ROI')
+  fireEvent.change(roi, { target: { value: '5.5' } })
+  fireEvent.click(screen.getByRole('button', { name: '保存策略' }))
+
+  expect(await screen.findByText('保存失败：database unavailable')).toBeInTheDocument()
+  expect(roi).toHaveValue(5.5)
+})
+
 test('opens the integration menu with write-only credential inputs', async () => {
   vi.stubGlobal(
     'fetch',
@@ -246,6 +343,22 @@ const polymarketIntegration = {
   secret_status: {
     private_key: { configured: true, fingerprint: 'sha256:123456789abc' },
   },
+}
+
+const riskPolicy = {
+  version: 'risk-v1',
+  created_at: '2026-09-03T02:00:00Z',
+  minimum_roi: '0.03',
+  maximum_settlement_days: 30,
+  maximum_book_age_seconds: '2',
+  per_trade_limit: '10',
+  per_event_limit: '25',
+  portfolio_limit: '100',
+  explicit_cost: '0',
+  risk_buffer: '0.25',
+  maximum_unhedged_seconds: '2',
+  maximum_unhedged_loss: '2',
+  maximum_arrival_gap_seconds: '0.5',
 }
 
 const opportunities = [

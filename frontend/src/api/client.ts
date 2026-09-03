@@ -8,6 +8,7 @@ import type {
 } from '../types/integration'
 import type { Opportunity } from '../types/opportunity'
 import type { SystemStatus } from '../types/system'
+import type { RiskPolicy, RiskPolicyUpdate } from '../types/risk'
 import type {
   ExecutablePair,
   PairReviewInput,
@@ -55,6 +56,20 @@ async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
 
 export function getRuntimeStatus(): Promise<RuntimeStatus> {
   return apiRequest<RuntimeStatus>('/api/runtime')
+}
+
+
+export function getRiskPolicy(): Promise<RiskPolicy> {
+  return apiRequest<RiskPolicy>('/api/settings/risk')
+}
+
+
+export function saveRiskPolicy(value: RiskPolicyUpdate): Promise<RiskPolicy> {
+  return apiRequest<RiskPolicy>('/api/settings/risk', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(value),
+  })
 }
 
 
