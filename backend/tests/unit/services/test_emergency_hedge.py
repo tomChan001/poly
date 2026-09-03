@@ -144,7 +144,7 @@ async def test_emergency_timeout_is_queried_and_never_resubmitted() -> None:
 
 
 @pytest.mark.asyncio
-async def test_emergency_query_failure_is_cached_as_unknown() -> None:
+async def test_emergency_query_failure_remains_unknown_without_resubmitting() -> None:
     class UnresolvedEmergencyPort(RecordingPort):
         def __init__(self) -> None:
             super().__init__()
@@ -168,11 +168,11 @@ async def test_emergency_query_failure_is_cached_as_unknown() -> None:
     first = await service.resolve(exposure(Decimal("1.50")), Decimal(2))
     second = await service.resolve(exposure(Decimal("1.50")), Decimal(2))
 
-    assert first is second
     assert first.order.status is OrderStatus.UNKNOWN
+    assert second.order.status is OrderStatus.UNKNOWN
     assert first.resolved is False
     assert len(unresolved_port.requests) == 1
-    assert unresolved_port.lookups == 1
+    assert unresolved_port.lookups == 2
 
 
 @pytest.mark.asyncio
@@ -242,6 +242,61 @@ async def test_started_remediation_is_reconciled_without_a_second_submission() -
     remediation = await remediations.get_remediation(remediation_key)
     assert remediation is not None
     assert remediation.status is RemediationStatus.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_unknown_remediation_reconciles_again_when_venue_becomes_consistent() -> None:
+    class EventuallyVisiblePort(RecordingPort):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lookups = 0
+
+        async def find_by_client_order_id(
+            self,
+            client_order_id: str,
+        ) -> OrderSubmissionResult | None:
+            self.lookups += 1
+            if self.lookups == 1:
+                return None
+            return OrderSubmissionResult(
+                client_order_id,
+                OrderStatus.FILLED,
+                (
+                    FillReport(
+                        "eventually-visible-fill",
+                        Decimal(4),
+                        Decimal("0.24"),
+                        Decimal("0.01"),
+                    ),
+                ),
+            )
+
+    eventually_visible_port = EventuallyVisiblePort()
+    ports = {Venue.KALSHI: RecordingPort(), Venue.POLYMARKET: eventually_visible_port}
+    remediations = InMemoryEmergencyRemediationStore()
+    remediation_key = "execution:corr-1:partially_hedged"
+    await remediations.start_remediation(
+        remediation_key,
+        "corr-1-emergency-hedge",
+        Venue.POLYMARKET,
+    )
+
+    first = await EmergencyHedgeService(
+        ports,
+        remediation_store=remediations,
+    ).resolve(exposure(Decimal("1.50")), Decimal(2), remediation_key=remediation_key)
+    second = await EmergencyHedgeService(
+        ports,
+        remediation_store=remediations,
+    ).resolve(exposure(Decimal("1.50")), Decimal(2), remediation_key=remediation_key)
+
+    assert first.order.status is OrderStatus.UNKNOWN
+    assert second.resolved is True
+    assert eventually_visible_port.requests == []
+    assert eventually_visible_port.lookups == 2
+    remediation = await remediations.get_remediation(remediation_key)
+    assert remediation is not None
+    assert remediation.status is RemediationStatus.RESOLVED
 
 
 @pytest.mark.asyncio

@@ -157,6 +157,11 @@ class ExecutionSupervisor:
         action = "investigate"
         if record.state is ExecutionState.PARTIALLY_HEDGED:
             action = "hedge"
+        control_error: Exception | None = None
+        try:
+            await self._system_control.disable_opening_async("execution incident")
+        except Exception as exc:  # noqa: BLE001 - local fail-close already applied
+            control_error = exc
         incident, _claimed = await self._incidents.claim(
             ExecutionIncident(
                 idempotency_key=key,
@@ -169,7 +174,6 @@ class ExecutionSupervisor:
             )
         )
         try:
-            await self._system_control.disable_opening_async("execution incident")
             if (
                 record.state is ExecutionState.PARTIALLY_HEDGED
                 and self._emergency_service_factory is not None
@@ -184,11 +188,17 @@ class ExecutionSupervisor:
             # Escalation must survive a venue or control-store failure. A retry
             # observes the claimed incident and heals a missing outbox row.
             await self._enqueue(incident)
+        if control_error is not None:
+            raise control_error
         return incident
 
     async def _enqueue(self, incident: ExecutionIncident) -> None:
+        remediation = await self._incidents.get_remediation(incident.idempotency_key)
+        remediation_status = (
+            "not_required" if remediation is None else remediation.status.value
+        )
         await self._notifications.enqueue_async(
-            incident.idempotency_key,
+            f"{incident.idempotency_key}:{remediation_status}",
             f"execution.{incident.state.value}",
             {
                 "correlation_id": incident.correlation_id,
@@ -196,6 +206,13 @@ class ExecutionSupervisor:
                 "action": incident.action,
                 "simulated": incident.simulated,
                 "unhedged_quantity": incident.unhedged_quantity,
+                "remediation_status": remediation_status,
+                "remediation_venue": (
+                    None if remediation is None else remediation.venue.value
+                ),
+                "remediation_client_order_id": (
+                    None if remediation is None else remediation.client_order_id
+                ),
             },
         )
 

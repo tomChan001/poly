@@ -182,7 +182,10 @@ class EmergencyHedgeService:
                 order = await port.submit_fok(request)
             except Exception:  # noqa: BLE001 - every post-write failure is ambiguous
                 order = await self._reconcile(port, request.client_order_id)
-        elif remediation.status is RemediationStatus.STARTED:
+        elif remediation.status in {
+            RemediationStatus.STARTED,
+            RemediationStatus.UNKNOWN,
+        }:
             # A prior process may have submitted after persisting the intent.
             # It is never safe to issue another emergency order from this state.
             order = await self._reconcile(port, remediation.client_order_id)
@@ -208,7 +211,8 @@ class EmergencyHedgeService:
         )
         # Recording before returning makes retries after an API timeout observe
         # one stable disposition instead of sending a second emergency order.
-        self._results[exposure.correlation_id] = result
+        if _disposition(result) is not RemediationStatus.UNKNOWN:
+            self._results[exposure.correlation_id] = result
         return result
 
     async def _reconcile(

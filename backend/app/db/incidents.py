@@ -77,7 +77,9 @@ class PostgresIncidentStore:
                 {"key": idempotency_key},
             )
             row = result.first()
-            return None if row is None else self._remediation(row._mapping)
+            if row is None or row._mapping["remediation_status"] == "pending":
+                return None
+            return self._remediation(row._mapping)
 
     async def start_remediation(
         self,

@@ -554,4 +554,7 @@ async def test_concurrent_partial_finalization_claims_one_emergency_action() -> 
 
     assert sum(port.submissions for port in emergency_ports.values()) == 1
     assert len(await incidents.list()) == 1
-    assert len(outbox.events) == 1
+    assert set(outbox.events) == {
+        "execution:concurrent-partial:partially_hedged:unknown",
+        "execution:concurrent-partial:partially_hedged:failed",
+    }

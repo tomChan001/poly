@@ -87,5 +87,18 @@ def test_incident_remediation_migration_backfills_existing_incidents(monkeypatch
 
     migration.upgrade()
 
-    assert any("remediation_status" in statement for statement in statements)
-    assert any("DEFAULT 'pending'" in statement for statement in statements)
+    assert statements == [
+        (
+            "ALTER TABLE execution_incident "
+            "ADD COLUMN IF NOT EXISTS remediation_status VARCHAR(32) "
+            "NOT NULL DEFAULT 'pending'"
+        ),
+        (
+            "ALTER TABLE execution_incident "
+            "ADD COLUMN IF NOT EXISTS remediation_client_order_id VARCHAR(255)"
+        ),
+        (
+            "ALTER TABLE execution_incident "
+            "ADD COLUMN IF NOT EXISTS remediation_venue VARCHAR(32)"
+        ),
+    ]
