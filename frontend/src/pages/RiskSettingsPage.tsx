@@ -197,23 +197,25 @@ export function RiskSettingsPage() {
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
   const loadControllerRef = useRef<AbortController | null>(null)
+  const loadRevisionRef = useRef(0)
 
   const loadPolicy = useCallback(async () => {
     loadControllerRef.current?.abort()
     const controller = new AbortController()
     loadControllerRef.current = controller
+    const revision = ++loadRevisionRef.current
     setLoading(true)
     setError(null)
     try {
       const loadedPolicy = await getRiskPolicy(controller.signal)
-      if (controller.signal.aborted || loadControllerRef.current !== controller) return
+      if (controller.signal.aborted || loadControllerRef.current !== controller || loadRevisionRef.current !== revision) return
       setPolicy(loadedPolicy)
       setForm(toForm(loadedPolicy))
     } catch (reason) {
-      if (controller.signal.aborted || loadControllerRef.current !== controller) return
+      if (controller.signal.aborted || loadControllerRef.current !== controller || loadRevisionRef.current !== revision) return
       setError(`加载失败：${reason instanceof Error ? reason.message : '未知错误'}`)
     } finally {
-      if (loadControllerRef.current === controller) {
+      if (loadControllerRef.current === controller && loadRevisionRef.current === revision) {
         loadControllerRef.current = null
         setLoading(false)
       }
@@ -223,6 +225,7 @@ export function RiskSettingsPage() {
   useEffect(() => {
     void loadPolicy()
     return () => {
+      loadRevisionRef.current += 1
       loadControllerRef.current?.abort()
       loadControllerRef.current = null
     }
@@ -246,6 +249,10 @@ export function RiskSettingsPage() {
       return
     }
 
+    loadRevisionRef.current += 1
+    loadControllerRef.current?.abort()
+    loadControllerRef.current = null
+    setLoading(false)
     setSaving(true)
     setError(null)
     try {
@@ -266,7 +273,7 @@ export function RiskSettingsPage() {
     void savePolicy()
   }
 
-  const disabled = loading || saving || !form
+  const disabled = saving || !form
 
   return (
     <div className="page">
@@ -314,6 +321,7 @@ export function RiskSettingsPage() {
           <div className="form-actions">
             {error && <span className="form-error" role="alert">{error}</span>}
             {saved && <span className="saved-state">已生成新策略版本</span>}
+            {form && <button type="button" className="secondary-button" onClick={() => void loadPolicy()} disabled={saving}>重新加载</button>}
             <button type="submit" className="primary-button"><Save size={16} />{saving ? '保存中…' : '保存策略'}</button>
           </div>
         </fieldset>

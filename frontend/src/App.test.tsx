@@ -347,6 +347,141 @@ test('retries a transient risk policy load failure', async () => {
   expect(riskRequests).toBe(2)
 })
 
+test('fences a stale risk-policy reload when a save begins', async () => {
+  const savedPolicy = {
+    ...riskPolicy,
+    version: 'risk-v2',
+    minimum_roi: '0.05',
+  }
+  let riskRequests = 0
+  const reloadRequest: { signal: AbortSignal | null } = { signal: null }
+  let resolveReload: ((value: { ok: true; json: () => Promise<typeof riskPolicy> }) => void) | null = null
+  let resolveSave: ((value: { ok: true; json: () => Promise<typeof riskPolicy> }) => void) | null = null
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/settings/risk')) {
+        if (init?.method === 'PUT') {
+          return new Promise<{ ok: true; json: () => Promise<typeof riskPolicy> }>((resolve) => {
+            resolveSave = resolve
+          })
+        }
+        riskRequests += 1
+        if (riskRequests === 1) return Promise.resolve({ ok: true, json: async () => riskPolicy })
+        reloadRequest.signal = init?.signal ?? null
+        return new Promise<{ ok: true; json: () => Promise<typeof riskPolicy> }>((resolve) => {
+          resolveReload = resolve
+        })
+      }
+      if (url.includes('/api/runtime')) return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+      if (url.includes('/health')) return Promise.resolve({ ok: true, json: async () => ({ status: 'ok' }) })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '风控' }))
+  const minimumRoi = await screen.findByLabelText('最低保守 ROI')
+
+  fireEvent.click(screen.getByRole('button', { name: '重新加载' }))
+  await waitFor(() => expect(reloadRequest.signal).not.toBeNull())
+  expect(minimumRoi).toBeEnabled()
+  fireEvent.change(minimumRoi, { target: { value: '5' } })
+  fireEvent.click(screen.getByRole('button', { name: '保存策略' }))
+
+  await waitFor(() => expect(resolveSave).not.toBeNull())
+  expect(reloadRequest.signal?.aborted).toBe(true)
+  await act(async () => {
+    resolveSave?.({ ok: true, json: async () => savedPolicy })
+  })
+  expect(await screen.findByText('策略版本 risk-v2')).toBeInTheDocument()
+
+  await act(async () => {
+    resolveReload?.({ ok: true, json: async () => riskPolicy })
+  })
+  expect(screen.getByText('策略版本 risk-v2')).toBeInTheDocument()
+  expect(screen.getByLabelText('最低保守 ROI')).toHaveValue(5)
+  expect(document.querySelector('form')).toHaveAttribute('aria-busy', 'false')
+})
+
+test('keeps only the latest risk-policy reload result', async () => {
+  const firstReloadPolicy = { ...riskPolicy, version: 'risk-v2', minimum_roi: '0.04' }
+  const latestReloadPolicy = { ...riskPolicy, version: 'risk-v3', minimum_roi: '0.05' }
+  let riskRequests = 0
+  const reloadSignals: AbortSignal[] = []
+  const reloadResolvers: Array<(value: { ok: true; json: () => Promise<typeof riskPolicy> }) => void> = []
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/settings/risk')) {
+        riskRequests += 1
+        if (riskRequests === 1) return Promise.resolve({ ok: true, json: async () => riskPolicy })
+        reloadSignals.push(init?.signal as AbortSignal)
+        return new Promise<{ ok: true; json: () => Promise<typeof riskPolicy> }>((resolve) => {
+          reloadResolvers.push(resolve)
+        })
+      }
+      if (url.includes('/api/runtime')) return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+      if (url.includes('/health')) return Promise.resolve({ ok: true, json: async () => ({ status: 'ok' }) })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '风控' }))
+  await screen.findByLabelText('最低保守 ROI')
+
+  fireEvent.click(screen.getByRole('button', { name: '重新加载' }))
+  fireEvent.click(screen.getByRole('button', { name: '重新加载' }))
+  await waitFor(() => expect(reloadResolvers).toHaveLength(2))
+  expect(reloadSignals[0].aborted).toBe(true)
+
+  await act(async () => {
+    reloadResolvers[1]({ ok: true, json: async () => latestReloadPolicy })
+  })
+  expect(await screen.findByText('策略版本 risk-v3')).toBeInTheDocument()
+  await act(async () => {
+    reloadResolvers[0]({ ok: true, json: async () => firstReloadPolicy })
+  })
+  expect(screen.getByText('策略版本 risk-v3')).toBeInTheDocument()
+  expect(screen.getByLabelText('最低保守 ROI')).toHaveValue(5)
+})
+
+test('allows an explicit risk-policy reload after a failed save', async () => {
+  const reloadedPolicy = { ...riskPolicy, version: 'risk-v2', minimum_roi: '0.04' }
+  let riskRequests = 0
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/settings/risk')) {
+        if (init?.method === 'PUT') {
+          return Promise.resolve({ ok: false, status: 500, json: async () => ({ detail: 'database unavailable' }) })
+        }
+        riskRequests += 1
+        return Promise.resolve({ ok: true, json: async () => riskRequests === 1 ? riskPolicy : reloadedPolicy })
+      }
+      if (url.includes('/api/runtime')) return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+      if (url.includes('/health')) return Promise.resolve({ ok: true, json: async () => ({ status: 'ok' }) })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '风控' }))
+  const minimumRoi = await screen.findByLabelText('最低保守 ROI')
+  fireEvent.change(minimumRoi, { target: { value: '5.5' } })
+  fireEvent.click(screen.getByRole('button', { name: '保存策略' }))
+
+  expect(await screen.findByText('保存失败：database unavailable')).toBeInTheDocument()
+  expect(minimumRoi).toHaveValue(5.5)
+  fireEvent.click(screen.getByRole('button', { name: '重新加载' }))
+  expect(await screen.findByText('策略版本 risk-v2')).toBeInTheDocument()
+  expect(screen.getByLabelText('最低保守 ROI')).toHaveValue(4)
+})
+
 test('shows readable FastAPI validation details when saving fails', async () => {
   vi.stubGlobal(
     'fetch',
