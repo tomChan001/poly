@@ -21,6 +21,10 @@ class OrderOutcomeUnknown(RuntimeError):
     """The venue may have accepted the order even though no response arrived."""
 
 
+class ExecutionSubmissionClaimed(RuntimeError):
+    """Another worker owns submission; do not recover or release its reservation."""
+
+
 class OrderStatus(StrEnum):
     FILLED = "filled"
     PARTIAL = "partial"
@@ -174,6 +178,8 @@ class ExecutionRecord:
 
 
 class ExecutionStore(Protocol):
+    async def claim_submission(self, record: ExecutionRecord) -> bool: ...
+
     async def save(self, record: ExecutionRecord) -> None: ...
 
     async def list(self) -> list[ExecutionRecord]: ...
@@ -202,6 +208,14 @@ class ExecutionSupervisorPort(Protocol):
 class InMemoryExecutionStore:
     def __init__(self) -> None:
         self._records: dict[str, ExecutionRecord] = {}
+        self._claim_lock = asyncio.Lock()
+
+    async def claim_submission(self, record: ExecutionRecord) -> bool:
+        async with self._claim_lock:
+            if record.correlation_id in self._records:
+                return False
+            self._records.setdefault(record.correlation_id, record)
+            return True
 
     async def save(self, record: ExecutionRecord) -> None:
         self._records[record.correlation_id] = record
@@ -263,11 +277,11 @@ class ControlledExecutionService:
             evidence=current_evidence,
         )
         record.transition(ExecutionState.SUBMITTED, now)
-        if self._store is not None:
-            # Persist the recovery identity before either venue request. If the
-            # process exits after an exchange accepts an order, restart logic
-            # can reconcile this record without opening the same pair again.
-            await self._store.save(record)
+        # Atomically claim the recovery identity before either venue request.
+        # A losing worker must leave the winner's record and capital reservation
+        # untouched; a later recovery cycle reconciles it.
+        if self._store is not None and not await self._store.claim_submission(record):
+            raise ExecutionSubmissionClaimed(authorization.correlation_id)
 
         if not self._system_control.opening_enabled:
             record.transition(ExecutionState.EXCEPTION, now)

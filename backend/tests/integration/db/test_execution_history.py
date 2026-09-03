@@ -1,8 +1,10 @@
+import asyncio
 import os
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import uuid4
 
+import asyncpg
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -17,6 +19,15 @@ from backend.app.services.execution import (
     OrderSubmissionResult,
     StateTransition,
 )
+
+
+async def require_postgres(engine) -> None:
+    try:
+        async with engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+    except (OSError, asyncpg.PostgresError) as error:
+        await engine.dispose()
+        pytest.skip(f"PostgreSQL is unavailable: {error}")
 
 
 def test_execution_snapshot_defaults_missing_capital_settlement_to_false() -> None:
@@ -115,12 +126,115 @@ async def test_postgres_save_persists_capital_settlement_column() -> None:
 
 
 @pytest.mark.asyncio
+async def test_postgres_claim_submission_inserts_snapshot_without_overwriting() -> None:
+    class Result:
+        def scalar_one_or_none(self) -> str:
+            return "claimed-execution"
+
+    class RecordingSession:
+        statement = None
+        parameters = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def execute(self, statement, parameters):
+            self.statement = statement
+            self.parameters = parameters
+            return Result()
+
+    class RecordingSessions:
+        def __init__(self, session) -> None:
+            self._session = session
+
+        def begin(self):
+            return self._session
+
+    session = RecordingSession()
+    record = ExecutionRecord(
+        correlation_id="claimed-execution",
+        state=ExecutionState.SUBMITTED,
+        requested_quantity=Decimal(10),
+        capital_settled=True,
+    )
+
+    claimed = await PostgresExecutionStore(RecordingSessions(session)).claim_submission(
+        record
+    )
+
+    assert claimed is True
+    assert session.statement is not None
+    assert "ON CONFLICT (correlation_id) DO NOTHING" in session.statement.text
+    assert "RETURNING correlation_id" in session.statement.text
+    assert "DO UPDATE" not in session.statement.text
+    assert session.parameters["state"] == "submitted"
+    assert session.parameters["capital_settled"] is True
+    assert '"requested_quantity": "10"' in session.parameters["snapshot"]
+    assert '"capital_settled": true' in session.parameters["snapshot"]
+
+
+@pytest.mark.asyncio
+async def test_postgres_concurrent_submission_claims_only_one_store() -> None:
+    database_url = os.getenv(
+        "DATABASE_URL",
+        "postgresql+asyncpg://poly:poly@localhost:5432/poly",
+    )
+    engine = create_async_engine(database_url)
+    await require_postgres(engine)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    correlation_id = f"concurrent-claim-{uuid4()}"
+    record = ExecutionRecord(
+        correlation_id=correlation_id,
+        state=ExecutionState.SUBMITTED,
+        requested_quantity=Decimal(10),
+        capital_settled=False,
+    )
+
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS execution_record (
+                        correlation_id VARCHAR(64) PRIMARY KEY,
+                        occurred_at TIMESTAMPTZ NOT NULL,
+                        state VARCHAR(32) NOT NULL,
+                        capital_settled BOOLEAN NOT NULL DEFAULT FALSE,
+                        snapshot JSONB NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+            )
+        first, second = await asyncio.gather(
+            PostgresExecutionStore(sessions).claim_submission(record),
+            PostgresExecutionStore(sessions).claim_submission(record),
+        )
+
+        assert sorted((first, second)) == [False, True]
+        persisted = await PostgresExecutionStore(sessions).get(correlation_id)
+        assert persisted.state is ExecutionState.SUBMITTED
+        assert persisted.capital_settled is False
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("DELETE FROM execution_record WHERE correlation_id = :correlation_id"),
+                {"correlation_id": correlation_id},
+            )
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_postgres_execution_history_survives_repository_recreation() -> None:
     database_url = os.getenv(
         "DATABASE_URL",
         "postgresql+asyncpg://poly:poly@localhost:5432/poly",
     )
     engine = create_async_engine(database_url)
+    await require_postgres(engine)
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     correlation_id = f"history-{uuid4()}"
     occurred_at = datetime(2026, 8, 19, 1, 2, 3, tzinfo=UTC)

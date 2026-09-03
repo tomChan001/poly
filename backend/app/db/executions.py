@@ -21,6 +21,36 @@ class PostgresExecutionStore:
     def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
         self._sessions = sessions
 
+    async def claim_submission(self, record: ExecutionRecord) -> bool:
+        occurred_at = min(
+            (transition.occurred_at for transition in record.transitions),
+            default=datetime.now(UTC),
+        )
+        async with self._sessions.begin() as session:
+            result = await session.execute(
+                text(
+                    """
+                    INSERT INTO execution_record (
+                        correlation_id, occurred_at, state, capital_settled,
+                        snapshot, updated_at
+                    ) VALUES (
+                        :correlation_id, :occurred_at, :state, :capital_settled,
+                        CAST(:snapshot AS jsonb), now()
+                    )
+                    ON CONFLICT (correlation_id) DO NOTHING
+                    RETURNING correlation_id
+                    """
+                ),
+                {
+                    "correlation_id": record.correlation_id,
+                    "occurred_at": occurred_at,
+                    "state": record.state.value,
+                    "capital_settled": record.capital_settled,
+                    "snapshot": json.dumps(_snapshot(record)),
+                },
+            )
+            return result.scalar_one_or_none() is not None
+
     async def save(self, record: ExecutionRecord) -> None:
         occurred_at = min(
             (transition.occurred_at for transition in record.transitions),

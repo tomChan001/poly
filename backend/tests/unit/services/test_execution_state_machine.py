@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -10,6 +11,7 @@ from backend.app.services.execution import (
     ExecutionAuthorizationService,
     ExecutionEvidence,
     ExecutionRecord,
+    ExecutionSubmissionClaimed,
     FillReport,
     InMemoryExecutionStore,
     OrderStatus,
@@ -44,13 +46,21 @@ class FakeTradingPort:
     def __init__(self, result: OrderSubmissionResult) -> None:
         self.result = result
         self.submissions = 0
+        self.lookups = 0
 
     async def submit_fok(self, request: object) -> OrderSubmissionResult:
         self.submissions += 1
         return self.result
 
     async def find_by_client_order_id(self, client_order_id: str) -> OrderSubmissionResult | None:
+        self.lookups += 1
         return self.result
+
+
+class YieldingTradingPort(FakeTradingPort):
+    async def submit_fok(self, request: object) -> OrderSubmissionResult:
+        await asyncio.sleep(0)
+        return await super().submit_fok(request)
 
 
 def filled(venue: Venue, quantity: Decimal = Decimal(10)) -> OrderSubmissionResult:
@@ -110,6 +120,51 @@ async def test_recovery_candidates_skip_settled_terminal_records() -> None:
     }
 
 
+@pytest.mark.asyncio
+async def test_concurrent_execution_submission_claims_only_one_worker() -> None:
+    store = InMemoryExecutionStore()
+    ports = {
+        Venue.KALSHI: YieldingTradingPort(filled(Venue.KALSHI)),
+        Venue.POLYMARKET: YieldingTradingPort(filled(Venue.POLYMARKET)),
+    }
+    first_service = ControlledExecutionService(
+        ports,
+        SystemControl(opening_enabled=True),
+        store,
+    )
+    second_service = ControlledExecutionService(
+        ports,
+        SystemControl(opening_enabled=True),
+        store,
+    )
+    authorizations = ExecutionAuthorizationService()
+    first = authorizations.issue(
+        MappingStatus.EXACT,
+        evidence(),
+        NOW,
+        correlation_id="concurrent-submission",
+    )
+    second = authorizations.issue(
+        MappingStatus.EXACT,
+        evidence(),
+        NOW,
+        correlation_id="concurrent-submission",
+    )
+
+    outcomes = await asyncio.gather(
+        first_service.execute(first, evidence(), NOW + timedelta(seconds=1)),
+        second_service.execute(second, evidence(), NOW + timedelta(seconds=1)),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(outcome, ExecutionSubmissionClaimed) for outcome in outcomes) == 1
+    assert sum(isinstance(outcome, ExecutionRecord) for outcome in outcomes) == 1
+    assert all(port.submissions == 1 for port in ports.values())
+    assert all(port.lookups == 0 for port in ports.values())
+    winner = next(outcome for outcome in outcomes if isinstance(outcome, ExecutionRecord))
+    assert await store.get("concurrent-submission") is winner
+
+
 def test_authorization_rejects_changed_execution_evidence() -> None:
     authorizations = ExecutionAuthorizationService()
     authorization = authorizations.issue(MappingStatus.EXACT, evidence(), NOW)
@@ -157,6 +212,10 @@ async def test_submitted_state_is_persisted_before_any_venue_write() -> None:
     saved_states: list[ExecutionState] = []
 
     class RecordingStore:
+        async def claim_submission(self, record: ExecutionRecord) -> bool:
+            saved_states.append(record.state)
+            return True
+
         async def save(self, record: ExecutionRecord) -> None:
             saved_states.append(record.state)
 
@@ -193,10 +252,13 @@ async def test_disabling_opening_after_submitted_persistence_blocks_venue_writes
     control = SystemControl(opening_enabled=True)
 
     class DisablingStore:
+        async def claim_submission(self, record: ExecutionRecord) -> bool:
+            saved_states.append(record.state)
+            control.disable_opening("test switch")
+            return True
+
         async def save(self, record: ExecutionRecord) -> None:
             saved_states.append(record.state)
-            if record.state is ExecutionState.SUBMITTED:
-                control.disable_opening("test switch")
 
         async def list(self) -> list[ExecutionRecord]:
             return []
@@ -228,11 +290,13 @@ async def test_second_guard_never_submits_when_exception_persistence_fails() -> 
     control = SystemControl(opening_enabled=True)
 
     class FailingExceptionStore:
+        async def claim_submission(self, record: ExecutionRecord) -> bool:
+            saved_states.append(record.state)
+            control.disable_opening("test switch")
+            return True
+
         async def save(self, record: ExecutionRecord) -> None:
             saved_states.append(record.state)
-            if record.state is ExecutionState.SUBMITTED:
-                control.disable_opening("test switch")
-                return
             raise OSError("execution persistence unavailable")
 
         async def list(self) -> list[ExecutionRecord]:
