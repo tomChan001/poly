@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
+from sqlalchemy.exc import SQLAlchemyError
+
 
 @dataclass(frozen=True, slots=True)
 class OpeningControlState:
@@ -22,6 +24,10 @@ class OpeningControlStore(Protocol):
         reason: str,
         changed_by: str,
     ) -> OpeningControlState: ...
+
+
+class OpeningControlPersistenceError(RuntimeError):
+    """The durable opening-control store cannot accept an update."""
 
 
 class SystemControl:
@@ -99,11 +105,18 @@ class SystemControl:
     ) -> OpeningControlState:
         if self._store is None:
             return self.set_opening(enabled, reason, changed_by)
-        state = await self._store.save_opening(
-            enabled=enabled,
-            reason=reason,
-            changed_by=changed_by,
-        )
+        if not enabled:
+            self.set_opening(False, reason, changed_by)
+        try:
+            state = await self._store.save_opening(
+                enabled=enabled,
+                reason=reason,
+                changed_by=changed_by,
+            )
+        except SQLAlchemyError as exc:
+            raise OpeningControlPersistenceError(
+                "opening control persistence unavailable"
+            ) from exc
         self._apply(state)
         return state
 

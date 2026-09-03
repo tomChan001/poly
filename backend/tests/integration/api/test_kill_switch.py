@@ -1,6 +1,7 @@
 import httpx
 import pytest
 from fastapi import FastAPI
+from sqlalchemy.exc import SQLAlchemyError
 
 from backend.app.container import ApplicationContainer
 from backend.app.core.config import TradingMode
@@ -34,7 +35,7 @@ class RecordingControlStore:
         return self.state
 
 
-class FailingControlStore:
+class UnavailableControlStore:
     async def load_opening(self) -> OpeningControlState | None:
         return None
 
@@ -45,7 +46,32 @@ class FailingControlStore:
         reason: str,
         changed_by: str,
     ) -> OpeningControlState:
-        raise RuntimeError("opening control persistence unavailable")
+        raise SQLAlchemyError("database connection unavailable")
+
+
+class RetryingControlStore:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def load_opening(self) -> OpeningControlState | None:
+        return None
+
+    async def save_opening(
+        self,
+        *,
+        enabled: bool,
+        reason: str,
+        changed_by: str,
+    ) -> OpeningControlState:
+        self.calls += 1
+        if self.calls == 1:
+            raise SQLAlchemyError("database connection unavailable")
+        return OpeningControlState(
+            opening_enabled=False,
+            reason="durably closed",
+            version=9,
+            changed_by="durable-store",
+        )
 
 
 def app_for(container: ApplicationContainer, role: Role | None) -> FastAPI:
@@ -142,14 +168,92 @@ async def test_operator_can_enable_opening_without_mode_or_automation_evidence(
 
 
 @pytest.mark.asyncio
-async def test_opening_control_persistence_failure_is_propagated() -> None:
+async def test_disabling_opening_fails_closed_when_persistence_is_unavailable() -> None:
     container = ApplicationContainer()
-    container.system_control = SystemControl(store=FailingControlStore())
-    transport = httpx.ASGITransport(app=app_for(container, Role.OPERATOR))
+    container.system_control = SystemControl(
+        opening_enabled=True,
+        reason="active opening",
+        version=4,
+        store=UnavailableControlStore(),
+    )
+    transport = httpx.ASGITransport(
+        app=app_for(container, Role.OPERATOR),
+        raise_app_exceptions=False,
+    )
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        with pytest.raises(RuntimeError, match="opening control persistence unavailable"):
-            await client.put(
-                "/api/system-control/opening",
-                json={"enabled": True, "reason": "operator authorized"},
-            )
+        response = await client.put(
+            "/api/system-control/opening",
+            json={"enabled": False, "reason": "manual shutdown"},
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "opening control persistence unavailable"}
+    assert container.system_control.opening_enabled is False
+    assert container.system_control.reason == "manual shutdown"
+    assert container.system_control.version == 5
+    assert container.system_control.changed_by == "user-1"
+
+
+@pytest.mark.asyncio
+async def test_enabling_opening_keeps_it_closed_when_persistence_is_unavailable() -> None:
+    container = ApplicationContainer()
+    container.system_control = SystemControl(
+        opening_enabled=False,
+        reason="safe default",
+        version=4,
+        store=UnavailableControlStore(),
+    )
+    transport = httpx.ASGITransport(
+        app=app_for(container, Role.OPERATOR),
+        raise_app_exceptions=False,
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.put(
+            "/api/system-control/opening",
+            json={"enabled": True, "reason": "operator authorized"},
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "opening control persistence unavailable"}
+    assert container.system_control.opening_enabled is False
+    assert container.system_control.reason == "safe default"
+    assert container.system_control.version == 4
+
+
+@pytest.mark.asyncio
+async def test_successful_retry_uses_the_durable_closing_state() -> None:
+    container = ApplicationContainer()
+    store = RetryingControlStore()
+    container.system_control = SystemControl(
+        opening_enabled=True,
+        reason="active opening",
+        version=4,
+        store=store,
+    )
+    transport = httpx.ASGITransport(
+        app=app_for(container, Role.OPERATOR),
+        raise_app_exceptions=False,
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        failed_response = await client.put(
+            "/api/system-control/opening",
+            json={"enabled": False, "reason": "manual shutdown"},
+        )
+        retry_response = await client.put(
+            "/api/system-control/opening",
+            json={"enabled": False, "reason": "retry shutdown"},
+        )
+
+    assert failed_response.status_code == 503
+    assert retry_response.status_code == 200
+    assert retry_response.json() == {
+        "opening_enabled": False,
+        "reason": "durably closed",
+        "version": 9,
+    }
+    assert container.system_control.reason == "durably closed"
+    assert container.system_control.version == 9
+    assert container.system_control.changed_by == "durable-store"

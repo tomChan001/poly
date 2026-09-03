@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
 
 from backend.app.api.dependencies import get_container
@@ -11,6 +11,7 @@ from backend.app.core.security import (
     require_authenticated,
     require_role,
 )
+from backend.app.services.system_control import OpeningControlPersistenceError
 
 router = APIRouter(
     prefix="/api/system-control",
@@ -40,11 +41,17 @@ async def set_opening_control(
 ) -> dict[str, object]:
     # This database switch never cancels or closes existing positions. Those
     # actions require the evidence-driven partially-hedged runbook.
-    state = await container.system_control.set_opening_async(
-        request.enabled,
-        request.reason,
-        changed_by=principal.subject,
-    )
+    try:
+        state = await container.system_control.set_opening_async(
+            request.enabled,
+            request.reason,
+            changed_by=principal.subject,
+        )
+    except OpeningControlPersistenceError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="opening control persistence unavailable",
+        ) from exc
     return {
         "opening_enabled": state.opening_enabled,
         "reason": state.reason,
