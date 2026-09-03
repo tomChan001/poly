@@ -223,16 +223,21 @@ class ClosingOpportunityStore(InMemoryOpportunityStore):
         self._control.disable_opening("closed after evaluation")
 
 
-class FailOnceCapitalLedger(CapitalLedger):
+class FailOnceSettledSaveStore(InMemoryExecutionStore):
     def __init__(self) -> None:
-        super().__init__({})
-        self.fail_conversions = 1
+        super().__init__()
+        self.fail_settled_save = True
+        self.list_calls = 0
 
-    async def convert_pair(self, correlation_id: str):
-        if self.fail_conversions:
-            self.fail_conversions -= 1
-            raise RuntimeError("capital settlement unavailable")
-        return await super().convert_pair(correlation_id)
+    async def list(self) -> list[ExecutionRecord]:
+        self.list_calls += 1
+        return await super().list()
+
+    async def save(self, record: ExecutionRecord) -> None:
+        if record.capital_settled and self.fail_settled_save:
+            self.fail_settled_save = False
+            raise RuntimeError("capital settlement persistence unavailable")
+        await super().save(record)
 
 
 async def configured_integrations() -> IntegrationConfigService:
@@ -702,12 +707,12 @@ async def test_terminal_settlement_failure_retries_without_resubmitting_orders()
         reviewer="human",
     )
     control = SystemControl(opening_enabled=True)
-    history = InMemoryExecutionStore()
+    history = FailOnceSettledSaveStore()
     ports = {
         Venue.KALSHI: FakeTradingPort(Venue.KALSHI),
         Venue.POLYMARKET: FakeTradingPort(Venue.POLYMARKET),
     }
-    capital = FailOnceCapitalLedger()
+    capital = CapitalLedger({})
     runtime = LiveRuntimeService(
         integrations=integrations,
         pairs=pairs,
@@ -722,12 +727,15 @@ async def test_terminal_settlement_failure_retries_without_resubmitting_orders()
         capital_ledger=capital,
     )
 
-    with pytest.raises(RuntimeError, match="capital settlement unavailable"):
+    with pytest.raises(RuntimeError, match="capital settlement persistence unavailable"):
         await runtime.run_once(NOW)
     [record] = await history.list()
     assert record.state is ExecutionState.PAIRED
+    assert record.capital_settled is False
     assert all(port.submissions == 1 for port in ports.values())
-    assert len(capital.reservations) == 2
+    assert capital.reservations == {}
+    assert len(capital.consumed_pairs) == 1
+    history.list_calls = 0
 
     executions = await runtime.run_once(NOW)
 
@@ -735,6 +743,8 @@ async def test_terminal_settlement_failure_retries_without_resubmitting_orders()
     assert all(port.submissions == 1 for port in ports.values())
     assert capital.reservations == {}
     assert len(capital.consumed_pairs) == 1
+    assert (await history.get(record.correlation_id)).capital_settled is True
+    assert history.list_calls == 0
 
 
 @pytest.mark.asyncio

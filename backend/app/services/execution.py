@@ -1,4 +1,5 @@
 import asyncio
+import builtins
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta
@@ -164,6 +165,7 @@ class ExecutionRecord:
     matched_quantity: Decimal = Decimal(0)
     unhedged_quantity: Decimal = Decimal(0)
     transitions: list[StateTransition] = field(default_factory=list)
+    capital_settled: bool = False
 
     def transition(self, target: ExecutionState, occurred_at: datetime) -> None:
         validate_transition(self.state, target)
@@ -175,6 +177,8 @@ class ExecutionStore(Protocol):
     async def save(self, record: ExecutionRecord) -> None: ...
 
     async def list(self) -> list[ExecutionRecord]: ...
+
+    async def list_recovery_candidates(self) -> builtins.list[ExecutionRecord]: ...
 
     async def get(self, correlation_id: str) -> ExecutionRecord: ...
 
@@ -204,6 +208,23 @@ class InMemoryExecutionStore:
 
     async def list(self) -> list[ExecutionRecord]:
         return list(self._records.values())
+
+    async def list_recovery_candidates(self) -> builtins.list[ExecutionRecord]:
+        return [
+            record
+            for record in self._records.values()
+            if record.state is ExecutionState.SUBMITTED
+            or (
+                record.state
+                in {
+                    ExecutionState.PAIRED,
+                    ExecutionState.PARTIALLY_HEDGED,
+                    ExecutionState.EXCEPTION,
+                    ExecutionState.CANCELLED,
+                }
+                and not record.capital_settled
+            )
+        ]
 
     async def get(self, correlation_id: str) -> ExecutionRecord:
         return self._records[correlation_id]

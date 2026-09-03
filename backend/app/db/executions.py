@@ -1,3 +1,4 @@
+import builtins
 import json
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -57,6 +58,24 @@ class PostgresExecutionStore:
             )
             return [_record(row._mapping["snapshot"]) for row in result]
 
+    async def list_recovery_candidates(self) -> builtins.list[ExecutionRecord]:
+        async with self._sessions() as session:
+            result = await session.execute(
+                text(
+                    """
+                    SELECT snapshot
+                    FROM execution_record
+                    WHERE state = 'submitted'
+                       OR (
+                           state IN ('paired', 'partially_hedged', 'exception', 'cancelled')
+                           AND COALESCE(snapshot ->> 'capital_settled', 'false') <> 'true'
+                       )
+                    ORDER BY occurred_at DESC
+                    """
+                )
+            )
+            return [_record(row._mapping["snapshot"]) for row in result]
+
     async def get(self, correlation_id: str) -> ExecutionRecord:
         async with self._sessions() as session:
             result = await session.execute(
@@ -103,6 +122,7 @@ def _snapshot(record: ExecutionRecord) -> dict[str, object]:
             }
             for transition in record.transitions
         ],
+        "capital_settled": record.capital_settled,
     }
 
 
@@ -151,6 +171,7 @@ def _record(snapshot: dict[str, object]) -> ExecutionRecord:
         matched_quantity=Decimal(str(snapshot["matched_quantity"])),
         unhedged_quantity=Decimal(str(snapshot["unhedged_quantity"])),
         transitions=transitions,
+        capital_settled=_capital_settled(snapshot.get("capital_settled")),
     )
 
 
@@ -211,3 +232,7 @@ def _string_pair(raw: object) -> tuple[str, str]:
 def _decimal_pair(raw: object) -> tuple[Decimal, Decimal]:
     left, right = _string_pair(raw)
     return Decimal(left), Decimal(right)
+
+
+def _capital_settled(raw: object) -> bool:
+    return raw is True or raw == "true"

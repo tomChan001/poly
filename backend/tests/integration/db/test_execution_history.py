@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from backend.app.db.executions import PostgresExecutionStore
+from backend.app.db.executions import PostgresExecutionStore, _record, _snapshot
 from backend.app.domain.enums import ExecutionState, Venue
 from backend.app.services.execution import (
     ExecutionEvidence,
@@ -17,6 +17,50 @@ from backend.app.services.execution import (
     OrderSubmissionResult,
     StateTransition,
 )
+
+
+def test_execution_snapshot_defaults_missing_capital_settlement_to_false() -> None:
+    restored = _record(
+        {
+            "correlation_id": "legacy-execution",
+            "state": "paired",
+            "requested_quantity": "10",
+            "matched_quantity": "10",
+            "unhedged_quantity": "0",
+            "evidence": None,
+            "legs": {},
+            "transitions": [],
+        }
+    )
+
+    assert restored.capital_settled is False
+    assert _snapshot(restored)["capital_settled"] is False
+
+
+@pytest.mark.asyncio
+async def test_postgres_recovery_candidate_query_targets_unsettled_records() -> None:
+    class RecordingSession:
+        statement = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def execute(self, statement):
+            self.statement = statement
+            return []
+
+    session = RecordingSession()
+    store = PostgresExecutionStore(lambda: session)
+
+    assert await store.list_recovery_candidates() == []
+    assert session.statement is not None
+    sql = session.statement.text
+    assert "state = 'submitted'" in sql
+    assert "capital_settled" in sql
+    assert "ORDER BY occurred_at DESC" in sql
 
 
 @pytest.mark.asyncio

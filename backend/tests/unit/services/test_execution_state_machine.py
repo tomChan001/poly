@@ -11,6 +11,7 @@ from backend.app.services.execution import (
     ExecutionEvidence,
     ExecutionRecord,
     FillReport,
+    InMemoryExecutionStore,
     OrderStatus,
     OrderSubmissionResult,
 )
@@ -76,6 +77,37 @@ def test_authorization_is_exact_only_short_lived_and_single_use() -> None:
 
     with pytest.raises(AuthorizationRejected, match="EXACT"):
         authorizations.issue(MappingStatus.CONDITIONAL, evidence(), NOW)
+
+
+@pytest.mark.asyncio
+async def test_recovery_candidates_skip_settled_terminal_records() -> None:
+    store = InMemoryExecutionStore()
+    settled = ExecutionRecord(
+        correlation_id="settled",
+        state=ExecutionState.PAIRED,
+        requested_quantity=Decimal(10),
+        capital_settled=True,
+    )
+    unsettled = ExecutionRecord(
+        correlation_id="unsettled",
+        state=ExecutionState.EXCEPTION,
+        requested_quantity=Decimal(10),
+    )
+    submitted = ExecutionRecord(
+        correlation_id="submitted",
+        state=ExecutionState.SUBMITTED,
+        requested_quantity=Decimal(10),
+        capital_settled=True,
+    )
+    for record in (settled, unsettled, submitted):
+        await store.save(record)
+
+    candidates = await store.list_recovery_candidates()
+
+    assert {record.correlation_id for record in candidates} == {
+        "unsettled",
+        "submitted",
+    }
 
 
 def test_authorization_rejects_changed_execution_evidence() -> None:

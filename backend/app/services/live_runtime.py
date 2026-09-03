@@ -136,7 +136,7 @@ class LiveRuntimeService:
         # on it. If it fails, do not reserve capital or submit any orders.
         self._opportunities.replace(observed)
 
-        records = await self._execution_store.list()
+        records = await self._execution_store.list_recovery_candidates()
         if records:
             if ports is None:
                 ports = await _resolve(self._trading_ports_factory(bundle))
@@ -180,7 +180,7 @@ class LiveRuntimeService:
             if existing is not None:
                 if existing.state is ExecutionState.SUBMITTED:
                     recovered = await executor.recover_submitted(existing, now)
-                    await self._settle_capital(correlation_id, recovered.state)
+                    await self._settle_capital(recovered)
                 self._processed_books.add(identity)
                 continue
 
@@ -225,7 +225,7 @@ class LiveRuntimeService:
             except Exception:
                 await self._capital_ledger.release_pair(correlation_id)
                 raise
-            await self._settle_capital(correlation_id, record.state)
+            await self._settle_capital(record)
             executions += 1
 
         self._runtime_status.record_cycle(executions=executions)
@@ -258,17 +258,21 @@ class LiveRuntimeService:
                 ExecutionState.EXCEPTION,
                 ExecutionState.CANCELLED,
             }:
-                await self._settle_capital(record.correlation_id, record.state)
+                await self._settle_capital(record)
 
-    async def _settle_capital(
-        self,
-        correlation_id: str,
-        state: ExecutionState,
-    ) -> None:
-        if state in {ExecutionState.PAIRED, ExecutionState.PARTIALLY_HEDGED}:
-            await self._capital_ledger.convert_pair(correlation_id)
+    async def _settle_capital(self, record: ExecutionRecord) -> None:
+        if record.capital_settled:
+            return
+        if record.state in {ExecutionState.PAIRED, ExecutionState.PARTIALLY_HEDGED}:
+            await self._capital_ledger.convert_pair(record.correlation_id)
         else:
-            await self._capital_ledger.release_pair(correlation_id)
+            await self._capital_ledger.release_pair(record.correlation_id)
+        record.capital_settled = True
+        try:
+            await self._execution_store.save(record)
+        except Exception:
+            record.capital_settled = False
+            raise
 
     async def _evaluate_pair(
         self,
