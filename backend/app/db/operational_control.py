@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import cast
 
@@ -16,6 +17,9 @@ _OPENING_CONTROL = "opening"
 class PostgresOperationalControlStore:
     def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
         self._sessions = sessions
+        self._guard_session: ContextVar[AsyncSession | None] = ContextVar(
+            "opening_guard_session", default=None
+        )
 
     async def load_opening(self) -> OpeningControlState | None:
         async with self._sessions() as session:
@@ -36,7 +40,23 @@ class PostgresOperationalControlStore:
                 {"name": _OPENING_CONTROL},
             )
             row = result.first()
-            yield None if row is None else self._state(row._mapping)
+            token = self._guard_session.set(session)
+            try:
+                yield None if row is None else self._state(row._mapping)
+            finally:
+                self._guard_session.reset(token)
+
+    async def save_opening_while_guarded(
+        self,
+        *,
+        enabled: bool,
+        reason: str,
+        changed_by: str,
+    ) -> OpeningControlState:
+        session = self._guard_session.get()
+        if session is None:
+            raise RuntimeError("opening submission guard is not active")
+        return await self._save_opening(session, enabled, reason, changed_by)
 
     async def save_opening(
         self,
@@ -45,10 +65,19 @@ class PostgresOperationalControlStore:
         reason: str,
         changed_by: str,
     ) -> OpeningControlState:
-        changed_at = datetime.now(UTC)
         async with self._sessions.begin() as session:
             await self._lock_opening(session)
-            result = await session.execute(
+            return await self._save_opening(session, enabled, reason, changed_by)
+
+    async def _save_opening(
+        self,
+        session: AsyncSession,
+        enabled: bool,
+        reason: str,
+        changed_by: str,
+    ) -> OpeningControlState:
+        changed_at = datetime.now(UTC)
+        result = await session.execute(
                 text(
                     """
                     INSERT INTO system_control (
@@ -73,7 +102,7 @@ class PostgresOperationalControlStore:
                     "reason": reason,
                 },
             )
-            return self._state(result.one()._mapping)
+        return self._state(result.one()._mapping)
 
     @staticmethod
     async def _lock_opening(session: AsyncSession) -> None:

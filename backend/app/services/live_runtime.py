@@ -227,13 +227,13 @@ class LiveRuntimeService:
                         minimum_roi=policy.minimum_roi,
                         estimated_fees=evaluation.estimated_fees,
                     )
-                    authorization = ExecutionAuthorizationService().issue(
-                        MappingStatus.EXACT,
-                        evidence,
-                        now,
-                        correlation_id=correlation_id,
-                    )
                     try:
+                        authorization = ExecutionAuthorizationService().issue(
+                            MappingStatus.EXACT,
+                            evidence,
+                            now,
+                            correlation_id=correlation_id,
+                        )
                         record = await executor.execute(
                             authorization,
                             evidence,
@@ -245,6 +245,16 @@ class LiveRuntimeService:
                         # A concurrent runtime owns this identity and its
                         # reservation.  Do not release or recover it here.
                         continue
+                    except Exception:
+                        # Before a durable claim, this runtime owns the only
+                        # reservation and must release it. Once claimed, the
+                        # recovery record owns the reservation even if a later
+                        # transition/save/venue step fails.
+                        try:
+                            await self._execution_store.get(correlation_id)
+                        except KeyError:
+                            await self._capital_ledger.release_pair(correlation_id)
+                        raise
                     self._processed_books.add(identity)
                     await self._settle_capital(record)
                     pending_disable_reason = executor.take_pending_disable_reason()
@@ -274,28 +284,38 @@ class LiveRuntimeService:
             maximum_unhedged_loss,
         )
         for candidate in records:
-            pending_disable_reason: str | None = None
-            async with self._execution_store.execution_guard(
-                candidate.correlation_id
+            # Recovery uses the same global -> correlation order as openings.
+            # It ignores an OFF permission for reconciliation, but keeps the
+            # scoped permission available to persist any incident fail-close.
+            async with (
+                self._system_control.opening_submission_guard() as permission,
+                self._execution_store.execution_guard(candidate.correlation_id),
             ):
-                try:
-                    record = await self._execution_store.get(candidate.correlation_id)
-                except KeyError:
-                    continue
-                if record.state is ExecutionState.SUBMITTED:
-                    record = await executor.recover_submitted(record, now)
-                if record.state in {
-                    ExecutionState.PAIRED,
-                    ExecutionState.PARTIALLY_HEDGED,
-                    ExecutionState.EXCEPTION,
-                    ExecutionState.CANCELLED,
-                }:
-                    await self._settle_capital(record)
-                pending_disable_reason = executor.take_pending_disable_reason()
-            # This is intentionally after releasing execution_guard: recovery
-            # never nests the global submission fence under a correlation lock.
-            if pending_disable_reason is not None:
-                await self._system_control.disable_opening_async(pending_disable_reason)
+                    try:
+                        record = await self._execution_store.get(
+                            candidate.correlation_id
+                        )
+                    except KeyError:
+                        continue
+                    if record.state is ExecutionState.SUBMITTED:
+                        record = await executor.recover_submitted(
+                            record,
+                            now,
+                            submission_permission=permission,
+                        )
+                    if record.state in {
+                        ExecutionState.PAIRED,
+                        ExecutionState.PARTIALLY_HEDGED,
+                        ExecutionState.EXCEPTION,
+                        ExecutionState.CANCELLED,
+                    }:
+                        await self._settle_capital(record)
+                    pending_disable_reason = executor.take_pending_disable_reason()
+                    if pending_disable_reason is not None:
+                        await self._system_control.disable_opening_with_permission(
+                            permission,
+                            pending_disable_reason,
+                        )
 
     async def _settle_capital(self, record: ExecutionRecord) -> None:
         if record.capital_settled:

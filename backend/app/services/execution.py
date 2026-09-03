@@ -212,6 +212,7 @@ class ExecutionSupervisorPort(Protocol):
         *,
         now: datetime,
         maximum_unhedged_loss: Decimal = Decimal(0),
+        submission_permission: OpeningSubmissionPermission | None = None,
     ) -> object | None: ...
 
 
@@ -230,11 +231,16 @@ class InMemoryExecutionStore:
         """
         lock = self._execution_locks.setdefault(correlation_id, asyncio.Lock())
         async with lock:
-            yield _ExecutionLease(self, correlation_id)
+            scope = _ActiveExecutionScope()
+            try:
+                yield _ExecutionLease(self, correlation_id, scope)
+            finally:
+                scope.active = False
 
     def owns_execution_lease(self, lease: object, correlation_id: str) -> bool:
         return isinstance(lease, _ExecutionLease) and (
             lease.owner is self and lease.correlation_id == correlation_id
+            and lease.scope.active
         )
 
     async def claim_submission(self, record: ExecutionRecord) -> bool:
@@ -275,6 +281,11 @@ class InMemoryExecutionStore:
 class _ExecutionLease:
     owner: object
     correlation_id: str
+    scope: "_ActiveExecutionScope"
+
+
+class _ActiveExecutionScope:
+    active = True
 
 
 class ControlledExecutionService:
@@ -402,13 +413,15 @@ class ControlledExecutionService:
             *(self._submit_or_recover(request) for request in requests.values()),
         )
         record.legs = dict(zip(requests, results, strict=True))
-        await self._finalize(record, now, current_evidence)
+        await self._finalize(record, now, current_evidence, permission)
         return record
 
     async def recover_submitted(
         self,
         record: ExecutionRecord,
         now: datetime,
+        *,
+        submission_permission: OpeningSubmissionPermission | None = None,
     ) -> ExecutionRecord:
         if record.state is not ExecutionState.SUBMITTED:
             raise ValueError("only submitted executions can be recovered")
@@ -423,7 +436,7 @@ class ControlledExecutionService:
                 if result is None
                 else replace(result, client_order_id=client_order_id)
             )
-        await self._finalize(record, now, record.evidence)
+        await self._finalize(record, now, record.evidence, submission_permission)
         return record
 
     async def _finalize(
@@ -431,6 +444,7 @@ class ControlledExecutionService:
         record: ExecutionRecord,
         now: datetime,
         evidence: ExecutionEvidence | None = None,
+        submission_permission: OpeningSubmissionPermission | None = None,
     ) -> None:
         quantities = [record.legs[venue].filled_quantity for venue in Venue]
         record.matched_quantity = min(quantities)
@@ -463,6 +477,7 @@ class ControlledExecutionService:
                 evidence,
                 now=now,
                 maximum_unhedged_loss=self._maximum_unhedged_loss,
+                submission_permission=submission_permission,
             )
 
     def _requests(

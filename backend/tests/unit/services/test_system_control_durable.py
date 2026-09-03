@@ -87,6 +87,16 @@ async def test_in_memory_store_serializes_disable_with_submission_guard() -> Non
     await disabling
 
 
+@pytest.mark.asyncio
+async def test_submission_permission_expires_when_its_guard_exits() -> None:
+    control = SystemControl(opening_enabled=True)
+
+    async with control.opening_submission_guard() as permission:
+        assert control.owns_submission_permission(permission)
+
+    assert not control.owns_submission_permission(permission)
+
+
 class ProgrammingFailureStore:
     async def load_opening(self) -> OpeningControlState | None:
         raise ProgrammingError("SELECT malformed", {}, Exception("syntax"))

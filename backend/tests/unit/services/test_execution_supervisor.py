@@ -83,6 +83,31 @@ async def test_partial_fill_records_real_hedge_incident_and_outbox() -> None:
 
 
 @pytest.mark.asyncio
+async def test_incident_uses_the_active_submission_permission_without_relocking() -> None:
+    control = SystemControl(opening_enabled=True)
+    supervisor = ExecutionSupervisor(
+        system_control=control,
+        incidents=InMemoryIncidentStore(),
+        notifications=NotificationService(InMemoryOutbox()),
+    )
+    record = ExecutionRecord(
+        correlation_id="corr-scoped-close",
+        state=ExecutionState.EXCEPTION,
+        requested_quantity=Decimal(1),
+    )
+
+    async with control.opening_submission_guard() as permission:
+        incident = await supervisor.finalize(
+            record,
+            now=datetime(2026, 8, 26, tzinfo=UTC),
+            submission_permission=permission,
+        )
+
+    assert incident is not None
+    assert control.opening_enabled is False
+
+
+@pytest.mark.asyncio
 async def test_paired_execution_reconciles_actual_fees_and_closes_opening() -> None:
     control = SystemControl(opening_enabled=True)
     supervisor = ExecutionSupervisor(

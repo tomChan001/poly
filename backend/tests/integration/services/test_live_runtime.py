@@ -172,6 +172,7 @@ class RecordingExecutionSupervisor:
         *,
         now: datetime,
         maximum_unhedged_loss: Decimal = Decimal(0),
+        submission_permission=None,
     ) -> None:
         assert now == NOW
         self.evidence = evidence

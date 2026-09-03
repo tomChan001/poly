@@ -19,6 +19,10 @@ from backend.app.services.execution import (
 )
 
 
+class _ActiveExecutionScope:
+    active = True
+
+
 class PostgresExecutionStore:
     def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
         self._sessions = sessions
@@ -39,11 +43,16 @@ class PostgresExecutionStore:
                 ),
                 {"correlation_id": correlation_id},
             )
-            yield _ExecutionLease(self, correlation_id)
+            scope = _ActiveExecutionScope()
+            try:
+                yield _ExecutionLease(self, correlation_id, scope)
+            finally:
+                scope.active = False
 
     def owns_execution_lease(self, lease: object, correlation_id: str) -> bool:
         return isinstance(lease, _ExecutionLease) and (
             lease.owner is self and lease.correlation_id == correlation_id
+            and lease.scope.active
         )
 
     async def claim_submission(self, record: ExecutionRecord) -> bool:
@@ -320,6 +329,12 @@ def _capital_settled(raw: object) -> bool:
 
 
 class _ExecutionLease:
-    def __init__(self, owner: object, correlation_id: str) -> None:
+    def __init__(
+        self,
+        owner: object,
+        correlation_id: str,
+        scope: _ActiveExecutionScope,
+    ) -> None:
         self.owner = owner
         self.correlation_id = correlation_id
+        self.scope = scope

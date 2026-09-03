@@ -47,9 +47,12 @@ class PostgresRiskPolicyStore:
         return self.current
 
     async def create(self, value: RiskPolicyInput) -> RiskPolicy:
-        policy = _snapshot(value)
         async with self._sessions.begin() as session:
             await lock_submission_fence(session)
+            # Timestamp/version creation is ordered by the same fence as the
+            # insert, so concurrent operators cannot publish reversed policy
+            # chronology after waiting for the lock.
+            policy = _snapshot(value)
             await _insert(session, policy)
         self.current = policy
         return policy

@@ -33,8 +33,21 @@ class OpeningControlStore(Protocol):
     ) -> OpeningControlState: ...
 
 
+    async def save_opening_while_guarded(
+        self,
+        *,
+        enabled: bool,
+        reason: str,
+        changed_by: str,
+    ) -> OpeningControlState: ...
+
+
 class OpeningControlPersistenceError(RuntimeError):
     """The durable opening-control store cannot accept an update."""
+
+
+class _ActiveScope:
+    active = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +57,7 @@ class OpeningSubmissionPermission:
     allowed: bool
     state: OpeningControlState | None
     _issuer: object = field(repr=False, compare=False)
+    _scope: _ActiveScope = field(repr=False, compare=False)
 
 
 class InMemoryOpeningControlStore:
@@ -73,6 +87,17 @@ class InMemoryOpeningControlStore:
                 changed_by,
             )
             return self._state
+
+    async def save_opening_while_guarded(
+        self,
+        *,
+        enabled: bool,
+        reason: str,
+        changed_by: str,
+    ) -> OpeningControlState:
+        version = 1 if self._state is None else self._state.version + 1
+        self._state = OpeningControlState(enabled, reason, version, changed_by)
+        return self._state
 
     @asynccontextmanager
     async def opening_submission_guard(
@@ -165,9 +190,13 @@ class SystemControl:
         if self._store is None:
             async with self._submission_lock:
                 state = self.snapshot()
-                yield OpeningSubmissionPermission(
-                    state.opening_enabled, state, self._permission_issuer
-                )
+                scope = _ActiveScope()
+                try:
+                    yield OpeningSubmissionPermission(
+                        state.opening_enabled, state, self._permission_issuer, scope
+                    )
+                finally:
+                    scope.active = False
             return
         try:
             async with self._store.opening_submission_guard() as durable_state:
@@ -175,11 +204,16 @@ class SystemControl:
                     durable_state = self._apply_uninitialized_durable_state()
                 else:
                     self._apply(durable_state)
-                yield OpeningSubmissionPermission(
-                    durable_state.opening_enabled,
-                    durable_state,
-                    self._permission_issuer,
-                )
+                scope = _ActiveScope()
+                try:
+                    yield OpeningSubmissionPermission(
+                        durable_state.opening_enabled,
+                        durable_state,
+                        self._permission_issuer,
+                        scope,
+                    )
+                finally:
+                    scope.active = False
         except (OSError, SQLAlchemyError) as exc:
             if isinstance(exc, ProgrammingError):
                 raise
@@ -192,7 +226,27 @@ class SystemControl:
         return (
             isinstance(permission, OpeningSubmissionPermission)
             and permission._issuer is self._permission_issuer
+            and permission._scope.active
         )
+
+    async def disable_opening_with_permission(
+        self,
+        permission: OpeningSubmissionPermission,
+        reason: str,
+        *,
+        changed_by: str = "system",
+    ) -> OpeningControlState:
+        if not self.owns_submission_permission(permission):
+            raise OpeningControlPersistenceError("submission permission is not active")
+        if self._store is None:
+            return self.set_opening(False, reason, changed_by)
+        state = await self._store.save_opening_while_guarded(
+            enabled=False,
+            reason=reason,
+            changed_by=changed_by,
+        )
+        self._apply(state)
+        return state
 
     async def disable_opening_async(
         self,

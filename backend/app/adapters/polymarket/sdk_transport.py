@@ -10,7 +10,13 @@ from typing import Any, Protocol
 class ClobClientPort(Protocol):
     def create_order(self, order: object) -> object: ...
 
-    def post_order(self, order: object, order_type: object) -> dict[str, object]: ...
+    def post_order(
+        self,
+        order: object,
+        order_type: object,
+        *,
+        defer_exec: bool = False,
+    ) -> dict[str, object]: ...
 
     def get_order(self, order_id: str) -> dict[str, object]: ...
 
@@ -124,11 +130,12 @@ class PolymarketSdkTransport:
             size=float(size),
             side=_required_text(payload, "side"),
         )
-        signed = await asyncio.to_thread(self._client.create_order, order_args)
-        response = await asyncio.to_thread(
+        signed = await _await_thread_completion(self._client.create_order, order_args)
+        response = await _await_thread_completion(
             self._client.post_order,
             signed,
             self._fok_order_type,
+            defer_exec=True,
         )
         if not isinstance(response, dict):
             raise TypeError("Polymarket order response must be an object")
@@ -375,3 +382,20 @@ def _normalize_order_status(value: object) -> str:
         "INVALID": "REJECTED",
         "REJECTED": "REJECTED",
     }.get(raw, "UNKNOWN")
+
+
+async def _await_thread_completion(
+    function: Callable[..., Any],
+    /,
+    *args: object,
+    **kwargs: object,
+) -> Any:
+    """Do not abandon a potentially-writing SDK thread on cancellation."""
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # A thread cannot be cancelled. Wait for the write boundary before
+        # releasing an upstream submission fence, then preserve cancellation.
+        await asyncio.shield(task)
+        raise

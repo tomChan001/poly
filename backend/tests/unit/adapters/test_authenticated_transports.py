@@ -106,7 +106,9 @@ class FakeClobClient:
         self.created = order
         return {"signed": True}
 
-    def post_order(self, order: object, order_type: object) -> dict[str, object]:
+    def post_order(
+        self, order: object, order_type: object, *, defer_exec: bool = False
+    ) -> dict[str, object]:
         assert order == {"signed": True}
         self.posted_type = order_type
         return {

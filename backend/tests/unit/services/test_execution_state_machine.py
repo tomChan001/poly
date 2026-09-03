@@ -199,6 +199,16 @@ async def test_execution_guard_serializes_one_correlation_without_blocking_anoth
     assert second_entered.is_set()
 
 
+@pytest.mark.asyncio
+async def test_execution_lease_expires_when_its_guard_exits() -> None:
+    store = InMemoryExecutionStore()
+
+    async with store.execution_guard("same") as lease:
+        assert store.owns_execution_lease(lease, "same")
+
+    assert not store.owns_execution_lease(lease, "same")
+
+
 def test_authorization_rejects_changed_execution_evidence() -> None:
     authorizations = ExecutionAuthorizationService()
     authorization = authorizations.issue(MappingStatus.EXACT, evidence(), NOW)

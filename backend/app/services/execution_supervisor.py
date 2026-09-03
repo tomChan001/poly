@@ -20,7 +20,10 @@ from backend.app.services.execution import (
 )
 from backend.app.services.fees import FeeReconciliationService
 from backend.app.services.notifications import NotificationService
-from backend.app.services.system_control import SystemControl
+from backend.app.services.system_control import (
+    OpeningSubmissionPermission,
+    SystemControl,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +134,7 @@ class ExecutionSupervisor:
         now: datetime | None = None,
         occurred_at: datetime | None = None,
         maximum_unhedged_loss: Decimal = Decimal(0),
+        submission_permission: OpeningSubmissionPermission | None = None,
     ) -> ExecutionIncident | None:
         if evidence is not None and record.state is ExecutionState.PAIRED:
             estimated = sum(evidence.estimated_fees, Decimal(0))
@@ -159,7 +163,13 @@ class ExecutionSupervisor:
             action = "hedge"
         control_error: Exception | None = None
         try:
-            await self._system_control.disable_opening_async("execution incident")
+            if submission_permission is None:
+                await self._system_control.disable_opening_async("execution incident")
+            else:
+                await self._system_control.disable_opening_with_permission(
+                    submission_permission,
+                    "execution incident",
+                )
         except Exception as exc:  # noqa: BLE001 - local fail-close already applied
             control_error = exc
         incident, _claimed = await self._incidents.claim(
