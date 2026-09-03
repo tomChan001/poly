@@ -388,7 +388,6 @@ test('opens the integration menu with write-only credential inputs', async () =>
       if (url.includes('/health')) {
         payload = {
           status: 'ok',
-          trading_mode: 'limited_auto',
           opening_enabled: true,
           reason: 'configured default',
         }
@@ -442,6 +441,130 @@ test('opens the integration menu with write-only credential inputs', async () =>
     screen.getByRole('button', { name: '测试连接（不会下单）' }),
   ).toBeDisabled()
   expect(screen.queryByRole('heading', { name: 'OIDC' })).not.toBeInTheDocument()
+})
+
+test('shows a healthy market evaluation runtime while real ordering is off', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/runtime')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ ...runtimeStatus, opening_enabled: false }),
+        })
+      }
+      if (url.includes('/health')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ status: 'ok', opening_enabled: false, reason: 'operator disabled real ordering' }),
+        })
+      }
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }),
+  )
+
+  render(<App />)
+
+  expect(await screen.findByText('真实下单已关闭')).toBeInTheDocument()
+  expect(screen.getByText('仅评估和展示机会，不提交新订单')).toBeInTheDocument()
+  expect(screen.getByText('行情评估运行中')).toBeInTheDocument()
+  expect(screen.queryByText('运行未就绪')).not.toBeInTheDocument()
+})
+
+test('enables and disables real ordering from integrations with the exact request body', async () => {
+  const bodies: unknown[] = []
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === '/api/system-control/opening' && init?.method === 'PUT') {
+        const body = JSON.parse(String(init.body)) as { opening_enabled: boolean }
+        bodies.push(body)
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            opening_enabled: body.opening_enabled,
+            reason: body.opening_enabled ? 'operator enabled real ordering' : 'operator disabled real ordering',
+            version: body.opening_enabled ? 2 : 3,
+          }),
+        })
+      }
+      if (url.includes('/api/runtime')) return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+      if (url.includes('/health')) return Promise.resolve({ ok: true, json: async () => ({ status: 'ok', opening_enabled: false, reason: 'operator disabled real ordering' }) })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '集成' }))
+  const realOrdering = await screen.findByRole('switch', { name: '真实下单' })
+  expect(realOrdering).not.toBeChecked()
+
+  fireEvent.click(realOrdering)
+  await waitFor(() => expect(bodies).toEqual([{ opening_enabled: true, reason: 'operator enabled real ordering' }]))
+  expect(await screen.findByText('真实下单已开启')).toBeInTheDocument()
+  expect(realOrdering).toBeChecked()
+
+  fireEvent.click(realOrdering)
+  await waitFor(() => expect(bodies).toEqual([
+    { opening_enabled: true, reason: 'operator enabled real ordering' },
+    { opening_enabled: false, reason: 'operator disabled real ordering' },
+  ]))
+  expect(await screen.findByText('真实下单已关闭')).toBeInTheDocument()
+  expect(realOrdering).not.toBeChecked()
+})
+
+test('keeps real ordering state and displays the API error when a change fails', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === '/api/system-control/opening' && init?.method === 'PUT') {
+        return Promise.resolve({ ok: false, status: 409, json: async () => ({ detail: 'operator lock required' }) })
+      }
+      if (url.includes('/api/runtime')) return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+      if (url.includes('/health')) return Promise.resolve({ ok: true, json: async () => ({ status: 'ok', opening_enabled: false, reason: 'operator disabled real ordering' }) })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '集成' }))
+  const realOrdering = await screen.findByRole('switch', { name: '真实下单' })
+  fireEvent.click(realOrdering)
+
+  expect(await screen.findByText('operator lock required')).toBeInTheDocument()
+  expect(realOrdering).not.toBeChecked()
+  expect(screen.getByText('真实下单已关闭')).toBeInTheDocument()
+})
+
+test('disables the real-ordering switch while its change is pending', async () => {
+  let resolveRequest: (value: unknown) => void = () => undefined
+  const changeRequest = new Promise((resolve) => { resolveRequest = resolve })
+  const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input)
+    if (url === '/api/system-control/opening' && init?.method === 'PUT') return changeRequest
+    if (url.includes('/api/runtime')) return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+    if (url.includes('/health')) return Promise.resolve({ ok: true, json: async () => ({ status: 'ok', opening_enabled: false, reason: 'operator disabled real ordering' }) })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  })
+  vi.stubGlobal('fetch', fetchMock)
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '集成' }))
+  const realOrdering = await screen.findByRole('switch', { name: '真实下单' })
+  fireEvent.click(realOrdering)
+
+  expect(realOrdering).toBeDisabled()
+  fireEvent.click(realOrdering)
+  expect(fetchMock.mock.calls.filter(([input]) => String(input) === '/api/system-control/opening')).toHaveLength(1)
+
+  resolveRequest({
+    ok: true,
+    json: async () => ({ opening_enabled: true, reason: 'operator enabled real ordering', version: 2 }),
+  })
+  expect(await screen.findByText('真实下单已开启')).toBeInTheDocument()
 })
 
 test('always saves the canonical Oddpool API address', async () => {
@@ -678,7 +801,6 @@ test('renders the operational opportunity table', async () => {
           ok: true,
           json: async () => ({
             status: 'ok',
-            trading_mode: 'limited_auto',
             opening_enabled: true,
             reason: 'configured default',
           }),
@@ -702,9 +824,8 @@ test('renders the operational opportunity table', async () => {
     await screen.findByRole('heading', { name: '跨市场控制台' }),
   ).toBeInTheDocument()
   expect(await screen.findByText('Example market')).toBeInTheDocument()
-  expect(screen.getByText('LIMITED AUTO')).toBeInTheDocument()
-  expect(screen.getByText('真实订单已启用')).toBeInTheDocument()
-  expect(screen.getByText('ON')).toBeInTheDocument()
+  expect(screen.getByText('真实下单已开启')).toBeInTheDocument()
+  expect(screen.getByText('符合风控条件的机会可以提交订单')).toBeInTheDocument()
 
   fireEvent.click(screen.getByRole('button', { name: '运行' }))
   expect(await screen.findByText('PAIRED')).toBeInTheDocument()
@@ -768,7 +889,6 @@ test('groups execution history by Beijing calendar day', async () => {
           ok: true,
           json: async () => ({
             status: 'ok',
-            trading_mode: 'limited_auto',
             opening_enabled: true,
             reason: 'configured default',
           }),
@@ -859,7 +979,6 @@ test('shows real runtime state and lets a human review market equivalence', asyn
           ok: true,
           json: async () => ({
             status: 'ok',
-            trading_mode: 'limited_auto',
             opening_enabled: true,
             reason: 'configured default',
           }),
@@ -873,7 +992,7 @@ test('shows real runtime state and lets a human review market equivalence', asyn
   )
 
   render(<App />)
-  expect(await screen.findByText('自动执行运行中')).toBeInTheDocument()
+  expect(await screen.findByText('行情评估运行中')).toBeInTheDocument()
   expect(screen.getByText('已启动 3 次执行')).toBeInTheDocument()
 
   fireEvent.click(screen.getByRole('button', { name: '审核' }))
@@ -933,7 +1052,6 @@ test('preserves an unsaved review draft across automatic candidate refreshes', a
             ok: true,
             json: async () => ({
               status: 'ok',
-              trading_mode: 'limited_auto',
               opening_enabled: true,
               reason: 'configured default',
             }),
@@ -996,7 +1114,6 @@ test('discards the current draft without prompting when switching candidates', a
           ok: true,
           json: async () => ({
             status: 'ok',
-            trading_mode: 'limited_auto',
             opening_enabled: true,
             reason: 'configured default',
           }),
@@ -1038,7 +1155,6 @@ test('keeps the empty oddpool candidate state inside the scroll region', async (
           ok: true,
           json: async () => ({
             status: 'ok',
-            trading_mode: 'limited_auto',
             opening_enabled: true,
             reason: 'configured default',
           }),

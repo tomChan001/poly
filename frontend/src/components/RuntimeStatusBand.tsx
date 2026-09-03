@@ -11,17 +11,17 @@ export function RuntimeStatusBand({ status }: Props) {
     return <div className="runtime-band pending"><LoaderCircle size={15} />正在读取运行状态</div>
   }
 
-  const active = status.ready && status.running && status.opening_enabled && !status.last_error
+  const active = status.ready && status.running && !status.last_error
   const reason = status.last_error
     ?? (status.missing_providers.length > 0
       ? `待配置：${status.missing_providers.join('、')}`
-      : !status.opening_enabled ? '开仓总开关已关闭' : !status.running ? '后台轮询未运行' : null)
+      : !status.running ? '后台轮询未运行' : null)
 
   return (
     <div className={active ? 'runtime-band active' : 'runtime-band blocked'}>
       <div className="runtime-state">
         {active ? <CircleCheck size={15} /> : <CircleAlert size={15} />}
-        <strong>{active ? '自动执行运行中' : '自动执行未就绪'}</strong>
+        <strong>{active ? '行情评估运行中' : '运行未就绪'}</strong>
         {reason && <span>{reason}</span>}
       </div>
       <div className="runtime-meta">

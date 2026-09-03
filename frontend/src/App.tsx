@@ -11,9 +11,9 @@ import {
   ShieldCheck,
 } from 'lucide-react'
 
-import { getExecutions, getOpportunities, getRuntimeStatus, getSystemStatus } from './api/client'
+import { getExecutions, getOpportunities, getRuntimeStatus, getSystemStatus, setRealOrdering } from './api/client'
+import { RealOrderingBanner } from './components/RealOrderingBanner'
 import { RuntimeStatusBand } from './components/RuntimeStatusBand'
-import { TradingModeBanner } from './components/TradingModeBanner'
 import { AnalyticsPage } from './pages/AnalyticsPage'
 import { HistoryPage } from './pages/HistoryPage'
 import { MappingQueuePage } from './pages/MappingQueuePage'
@@ -44,8 +44,7 @@ function App() {
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null)
   const [systemStatus, setSystemStatus] = useState<SystemStatus>({
     status: 'ok',
-    trading_mode: 'limited_auto',
-    opening_enabled: true,
+    opening_enabled: false,
     reason: 'configured default',
   })
   const [loading, setLoading] = useState(true)
@@ -80,6 +79,18 @@ function App() {
     () => opportunities.filter((item) => item.rejection_reasons.length === 0).length,
     [opportunities],
   )
+
+  const updateRealOrdering = async (enabled: boolean) => {
+    const result = await setRealOrdering(enabled)
+    setSystemStatus((current) => ({
+      ...current,
+      opening_enabled: result.opening_enabled,
+      reason: result.reason,
+    }))
+    setRuntimeStatus((current) => current === null
+      ? current
+      : { ...current, opening_enabled: result.opening_enabled })
+  }
 
   return (
     <div className="app-shell">
@@ -133,10 +144,7 @@ function App() {
           </div>
         </header>
 
-        <TradingModeBanner
-          mode={systemStatus.trading_mode}
-          openingEnabled={systemStatus.opening_enabled}
-        />
+        <RealOrderingBanner enabled={systemStatus.opening_enabled} />
         <RuntimeStatusBand status={runtimeStatus} />
 
         {error && <div className="error-band">{error}</div>}
@@ -153,7 +161,12 @@ function App() {
         )}
         {view === 'history' && <HistoryPage executions={executions} />}
         {view === 'settings' && <RiskSettingsPage />}
-        {view === 'integrations' && <IntegrationSettingsPage />}
+        {view === 'integrations' && (
+          <IntegrationSettingsPage
+            realOrderingEnabled={systemStatus.opening_enabled}
+            onRealOrderingChange={updateRealOrdering}
+          />
+        )}
       </main>
     </div>
   )

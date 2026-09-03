@@ -7,7 +7,7 @@ import type {
   SecretStatus,
 } from '../types/integration'
 import type { Opportunity } from '../types/opportunity'
-import type { SystemStatus } from '../types/system'
+import type { OpeningControlState, SystemStatus } from '../types/system'
 import type { RiskPolicy, RiskPolicyUpdate } from '../types/risk'
 import type {
   ExecutablePair,
@@ -75,6 +75,18 @@ function formatApiDetail(detail: unknown): string | null {
 
 export function getRuntimeStatus(): Promise<RuntimeStatus> {
   return apiRequest<RuntimeStatus>('/api/runtime')
+}
+
+
+export function setRealOrdering(enabled: boolean): Promise<OpeningControlState> {
+  return apiRequest<OpeningControlState>('/api/system-control/opening', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      opening_enabled: enabled,
+      reason: enabled ? 'operator enabled real ordering' : 'operator disabled real ordering',
+    }),
+  })
 }
 
 

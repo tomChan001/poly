@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Check, LoaderCircle, PlugZap, Save, Trash2, X } from 'lucide-react'
 
 import {
@@ -116,7 +116,15 @@ function fromServer(definition: ProviderDefinition, value: IntegrationConfig): E
   }
 }
 
-export function IntegrationSettingsPage() {
+interface IntegrationSettingsPageProps {
+  realOrderingEnabled: boolean
+  onRealOrderingChange: (enabled: boolean) => Promise<void>
+}
+
+export function IntegrationSettingsPage({
+  realOrderingEnabled,
+  onRealOrderingChange,
+}: IntegrationSettingsPageProps) {
   const initial = useMemo(
     () => Object.fromEntries(providers.map((item) => [item.provider, emptyConfig(item)])) as Record<IntegrationProvider, EditableConfig>,
     [],
@@ -125,6 +133,9 @@ export function IntegrationSettingsPage() {
   const [loading, setLoading] = useState(true)
   const [pending, setPending] = useState<string | null>(null)
   const [messages, setMessages] = useState<Partial<Record<IntegrationProvider, { ok: boolean; text: string }>>>({})
+  const [realOrderingPending, setRealOrderingPending] = useState(false)
+  const [realOrderingError, setRealOrderingError] = useState<string | null>(null)
+  const realOrderingPendingRef = useRef(false)
 
   useEffect(() => {
     getIntegrations()
@@ -235,10 +246,44 @@ export function IntegrationSettingsPage() {
     }
   }
 
+  const updateRealOrdering = async (enabled: boolean) => {
+    if (realOrderingPendingRef.current) return
+    realOrderingPendingRef.current = true
+    setRealOrderingPending(true)
+    setRealOrderingError(null)
+    try {
+      await onRealOrderingChange(enabled)
+    } catch (error) {
+      setRealOrderingError(error instanceof Error ? error.message : '更新真实下单设置失败')
+    } finally {
+      realOrderingPendingRef.current = false
+      setRealOrderingPending(false)
+    }
+  }
+
   return (
     <div className="page integrations-page">
       <section className="page-heading">
         <div><h2>集成配置</h2><p>平台连接、账户标识与凭证状态</p></div>
+      </section>
+
+      <section className="real-ordering-panel" aria-labelledby="real-ordering-title">
+        <div>
+          <h3 id="real-ordering-title">交易执行</h3>
+          <p>开启后，符合风控条件的机会可以提交真实订单。</p>
+          {realOrderingError && <p className="real-ordering-error">{realOrderingError}</p>}
+        </div>
+        <label className="real-ordering-switch">
+          <input
+            role="switch"
+            aria-label="真实下单"
+            type="checkbox"
+            checked={realOrderingEnabled}
+            disabled={realOrderingPending}
+            onChange={(event) => void updateRealOrdering(event.target.checked)}
+          />
+          <span>{realOrderingPending ? '正在更新' : realOrderingEnabled ? '已开启' : '已关闭'}</span>
+        </label>
       </section>
 
       <div className="integration-list" aria-busy={loading}>
