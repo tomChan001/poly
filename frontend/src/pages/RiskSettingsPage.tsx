@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import { Save } from 'lucide-react'
 
 import { getRiskPolicy, saveRiskPolicy } from '../api/client'
@@ -77,6 +77,44 @@ function toUpdate(form: RiskForm): RiskPolicyUpdate {
   }
 }
 
+interface ValidationRule {
+  name: keyof RiskForm
+  label: string
+  positive?: boolean
+  integer?: boolean
+}
+
+const validationRules: ValidationRule[] = [
+  { name: 'minimumRoiPercent', label: '最低保守 ROI' },
+  { name: 'maximumSettlementDays', label: '最长预计结算', positive: true, integer: true },
+  { name: 'maximumBookAgeSeconds', label: '行情最大年龄', positive: true },
+  { name: 'perTradeLimit', label: '单笔上限', positive: true },
+  { name: 'perEventLimit', label: '单事件上限', positive: true },
+  { name: 'portfolioLimit', label: '总未结算资本', positive: true },
+  { name: 'explicitCost', label: '显式成本' },
+  { name: 'riskBuffer', label: '单笔风险缓冲' },
+  { name: 'maximumUnhedgedSeconds', label: '最大未对冲时长', positive: true },
+  { name: 'maximumUnhedgedLoss', label: '最大未对冲损失' },
+  { name: 'maximumArrivalGapSeconds', label: '最大行情到达间隔', positive: true },
+]
+
+function validateForm(form: RiskForm): string | null {
+  for (const rule of validationRules) {
+    const raw = form[rule.name].trim()
+    if (!raw) return `${rule.label} 不能为空`
+
+    const value = Number(raw)
+    if (!Number.isFinite(value)) return `${rule.label}必须是有限数字`
+    if (rule.integer && !Number.isInteger(value)) return `${rule.label}必须是整数`
+    if (rule.name === 'minimumRoiPercent' && (value < 0 || value > 100)) {
+      return '最低保守 ROI 必须在 0% 到 100% 之间'
+    }
+    if (rule.positive && value <= 0) return `${rule.label}必须大于 0`
+    if (!rule.positive && value < 0) return `${rule.label}不能小于 0`
+  }
+  return null
+}
+
 function formatCreatedAt(value: string): string {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return value
@@ -95,10 +133,11 @@ interface RiskInputProps {
   prefix?: string
   suffix?: string
   min?: string
+  max?: string
   step?: string
 }
 
-function RiskInput({ label, name, value, onChange, prefix, suffix, min, step }: RiskInputProps) {
+function RiskInput({ label, name, value, onChange, prefix, suffix, min, max, step }: RiskInputProps) {
   return (
     <label>
       <span>{label}</span>
@@ -109,7 +148,9 @@ function RiskInput({ label, name, value, onChange, prefix, suffix, min, step }: 
           type="number"
           value={value}
           min={min}
+          max={max}
           step={step}
+          aria-required="true"
           onChange={(event) => onChange(name, event.target.value)}
         />
         {suffix && <b>{suffix}</b>}
@@ -126,32 +167,41 @@ export function RiskSettingsPage() {
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
 
-  useEffect(() => {
-    let cancelled = false
-    void getRiskPolicy()
-      .then((loadedPolicy) => {
-        if (cancelled) return
-        setPolicy(loadedPolicy)
-        setForm(toForm(loadedPolicy))
-        setError(null)
-      })
-      .catch((reason: unknown) => {
-        if (!cancelled) setError(`加载失败：${reason instanceof Error ? reason.message : '未知错误'}`)
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false)
-      })
-    return () => { cancelled = true }
+  const loadPolicy = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const loadedPolicy = await getRiskPolicy()
+      setPolicy(loadedPolicy)
+      setForm(toForm(loadedPolicy))
+    } catch (reason) {
+      setError(`加载失败：${reason instanceof Error ? reason.message : '未知错误'}`)
+    } finally {
+      setLoading(false)
+    }
   }, [])
 
+  useEffect(() => {
+    void loadPolicy()
+  }, [loadPolicy])
+
   const updateField = (name: keyof RiskForm, value: string) => {
-    setForm((current) => current ? { ...current, [name]: value } : current)
+    if (!form) return
+    const nextForm = { ...form, [name]: value }
+    setForm(nextForm)
+    setError(validateForm(nextForm))
     setSaved(false)
   }
 
-  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
+  const savePolicy = async () => {
     if (!form || saving) return
+
+    const validationError = validateForm(form)
+    if (validationError) {
+      setError(validationError)
+      setSaved(false)
+      return
+    }
 
     setSaving(true)
     setError(null)
@@ -166,6 +216,11 @@ export function RiskSettingsPage() {
     } finally {
       setSaving(false)
     }
+  }
+
+  const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    void savePolicy()
   }
 
   const disabled = loading || saving || !form
@@ -183,33 +238,33 @@ export function RiskSettingsPage() {
           )}
         </div>
       </section>
-      <form className="settings-form" onSubmit={handleSubmit} aria-busy={loading || saving}>
+      <form className="settings-form" onSubmit={handleSubmit} aria-busy={loading || saving} noValidate>
         <fieldset disabled={disabled}>
           {loading && <p className="form-status" role="status">正在加载风控策略…</p>}
           {form && (
             <>
               <div className="settings-group">
                 <h3>收益与时间</h3>
-                <RiskInput label="最低保守 ROI" name="minimumRoiPercent" value={form.minimumRoiPercent} onChange={updateField} suffix="%" min="0" step="0.1" />
+                <RiskInput label="最低保守 ROI" name="minimumRoiPercent" value={form.minimumRoiPercent} onChange={updateField} suffix="%" min="0" max="100" step="any" />
                 <RiskInput label="最长预计结算" name="maximumSettlementDays" value={form.maximumSettlementDays} onChange={updateField} suffix="天" min="1" step="1" />
-                <RiskInput label="行情最大年龄" name="maximumBookAgeSeconds" value={form.maximumBookAgeSeconds} onChange={updateField} suffix="秒" min="0" step="0.1" />
+                <RiskInput label="行情最大年龄" name="maximumBookAgeSeconds" value={form.maximumBookAgeSeconds} onChange={updateField} suffix="秒" min="0" step="any" />
               </div>
               <div className="settings-group">
                 <h3>资本限额</h3>
-                <RiskInput label="单笔上限" name="perTradeLimit" value={form.perTradeLimit} onChange={updateField} prefix="$" min="0" step="0.01" />
-                <RiskInput label="单事件上限" name="perEventLimit" value={form.perEventLimit} onChange={updateField} prefix="$" min="0" step="0.01" />
-                <RiskInput label="总未结算资本" name="portfolioLimit" value={form.portfolioLimit} onChange={updateField} prefix="$" min="0" step="0.01" />
+                <RiskInput label="单笔上限" name="perTradeLimit" value={form.perTradeLimit} onChange={updateField} prefix="$" min="0" step="any" />
+                <RiskInput label="单事件上限" name="perEventLimit" value={form.perEventLimit} onChange={updateField} prefix="$" min="0" step="any" />
+                <RiskInput label="总未结算资本" name="portfolioLimit" value={form.portfolioLimit} onChange={updateField} prefix="$" min="0" step="any" />
               </div>
               <div className="settings-group">
                 <h3>未对冲保护</h3>
-                <RiskInput label="最大未对冲时长" name="maximumUnhedgedSeconds" value={form.maximumUnhedgedSeconds} onChange={updateField} suffix="秒" min="0" step="0.1" />
-                <RiskInput label="最大未对冲损失" name="maximumUnhedgedLoss" value={form.maximumUnhedgedLoss} onChange={updateField} prefix="$" min="0" step="0.01" />
-                <RiskInput label="单笔风险缓冲" name="riskBuffer" value={form.riskBuffer} onChange={updateField} prefix="$" min="0" step="0.01" />
+                <RiskInput label="最大未对冲时长" name="maximumUnhedgedSeconds" value={form.maximumUnhedgedSeconds} onChange={updateField} suffix="秒" min="0" step="any" />
+                <RiskInput label="最大未对冲损失" name="maximumUnhedgedLoss" value={form.maximumUnhedgedLoss} onChange={updateField} prefix="$" min="0" step="any" />
+                <RiskInput label="单笔风险缓冲" name="riskBuffer" value={form.riskBuffer} onChange={updateField} prefix="$" min="0" step="any" />
               </div>
               <div className="settings-group">
                 <h3>成本与行情同步</h3>
-                <RiskInput label="显式成本" name="explicitCost" value={form.explicitCost} onChange={updateField} prefix="$" min="0" step="0.01" />
-                <RiskInput label="最大行情到达间隔" name="maximumArrivalGapSeconds" value={form.maximumArrivalGapSeconds} onChange={updateField} suffix="秒" min="0" step="0.1" />
+                <RiskInput label="显式成本" name="explicitCost" value={form.explicitCost} onChange={updateField} prefix="$" min="0" step="any" />
+                <RiskInput label="最大行情到达间隔" name="maximumArrivalGapSeconds" value={form.maximumArrivalGapSeconds} onChange={updateField} suffix="秒" min="0" step="any" />
               </div>
             </>
           )}
@@ -219,6 +274,11 @@ export function RiskSettingsPage() {
             <button type="submit" className="primary-button"><Save size={16} />{saving ? '保存中…' : '保存策略'}</button>
           </div>
         </fieldset>
+        {!form && error && (
+          <div className="form-retry">
+            <button type="button" className="secondary-button" onClick={() => void loadPolicy()} disabled={loading}>重试</button>
+          </div>
+        )}
       </form>
     </div>
   )

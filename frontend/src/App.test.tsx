@@ -107,6 +107,166 @@ test('keeps risk edits visible when saving the policy fails', async () => {
   expect(roi).toHaveValue(5.5)
 })
 
+test('loads and saves precise decimal risk limits without discrete step restrictions', async () => {
+  let savedBody: Record<string, unknown> | null = null
+  const precisePolicy = {
+    ...riskPolicy,
+    minimum_roi: '0.0125',
+    maximum_book_age_seconds: '3.33',
+    per_trade_limit: '1.25',
+    per_event_limit: '2.75',
+    explicit_cost: '0.25',
+    risk_buffer: '0.333',
+    maximum_unhedged_seconds: '0.25',
+    maximum_unhedged_loss: '1.25',
+    maximum_arrival_gap_seconds: '0.25',
+  }
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/settings/risk')) {
+        if (init?.method === 'PUT') {
+          savedBody = JSON.parse(String(init.body)) as Record<string, unknown>
+        }
+        return Promise.resolve({ ok: true, json: async () => precisePolicy })
+      }
+      if (url.includes('/api/runtime')) return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+      if (url.includes('/health')) return Promise.resolve({ ok: true, json: async () => ({ status: 'ok' }) })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '风控' }))
+
+  expect(await screen.findByLabelText('最低保守 ROI')).toHaveValue(1.25)
+  expect(screen.getByLabelText('行情最大年龄')).toHaveValue(3.33)
+  expect(screen.getByLabelText('显式成本')).toHaveValue(0.25)
+  expect(screen.getByLabelText('最低保守 ROI')).toHaveAttribute('step', 'any')
+  expect(screen.getByLabelText('最大未对冲时长')).toHaveAttribute('step', 'any')
+  expect(screen.getByLabelText('单笔上限')).toHaveAttribute('step', 'any')
+  expect(screen.getByLabelText('最长预计结算')).toHaveAttribute('step', '1')
+
+  fireEvent.click(screen.getByRole('button', { name: '保存策略' }))
+  await waitFor(() => expect(savedBody).toMatchObject({
+    minimum_roi: '0.0125',
+    maximum_book_age_seconds: '3.33',
+    per_trade_limit: '1.25',
+    explicit_cost: '0.25',
+    maximum_arrival_gap_seconds: '0.25',
+  }))
+})
+
+test('blocks an empty risk value before saving', async () => {
+  let saveRequests = 0
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/settings/risk')) {
+        if (init?.method === 'PUT') saveRequests += 1
+        return Promise.resolve({ ok: true, json: async () => ({ ...riskPolicy, minimum_roi: '' }) })
+      }
+      if (url.includes('/api/runtime')) return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+      if (url.includes('/health')) return Promise.resolve({ ok: true, json: async () => ({ status: 'ok' }) })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '风控' }))
+  await screen.findByLabelText('最低保守 ROI')
+  await waitFor(() => expect(screen.getByRole('group')).not.toBeDisabled())
+  expect(screen.getByLabelText('最低保守 ROI')).toHaveValue(null)
+  const saveButton = screen.getByRole('button', { name: '保存策略' })
+  expect(saveButton).toBeEnabled()
+  fireEvent.click(saveButton)
+  expect(await screen.findByText('最低保守 ROI 不能为空')).toBeInTheDocument()
+  expect(saveRequests).toBe(0)
+})
+
+test('blocks an out-of-range risk value before saving', async () => {
+  let saveRequests = 0
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/settings/risk')) {
+        if (init?.method === 'PUT') saveRequests += 1
+        return Promise.resolve({ ok: true, json: async () => riskPolicy })
+      }
+      if (url.includes('/api/runtime')) return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+      if (url.includes('/health')) return Promise.resolve({ ok: true, json: async () => ({ status: 'ok' }) })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '风控' }))
+  const minimumRoi = await screen.findByLabelText('最低保守 ROI')
+
+  fireEvent.change(minimumRoi, { target: { value: '101' } })
+  fireEvent.click(screen.getByRole('button', { name: '保存策略' }))
+  expect(await screen.findByText('最低保守 ROI 必须在 0% 到 100% 之间')).toBeInTheDocument()
+  expect(saveRequests).toBe(0)
+})
+
+test('retries a transient risk policy load failure', async () => {
+  let riskRequests = 0
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/settings/risk')) {
+        riskRequests += 1
+        if (riskRequests === 1) {
+          return Promise.resolve({ ok: false, status: 503, json: async () => ({ detail: '服务暂不可用' }) })
+        }
+        return Promise.resolve({ ok: true, json: async () => riskPolicy })
+      }
+      if (url.includes('/api/runtime')) return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+      if (url.includes('/health')) return Promise.resolve({ ok: true, json: async () => ({ status: 'ok' }) })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '风控' }))
+  expect(await screen.findByText('加载失败：服务暂不可用')).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: '重试' }))
+  expect(await screen.findByLabelText('最低保守 ROI')).toHaveValue(3)
+  expect(riskRequests).toBe(2)
+})
+
+test('shows readable FastAPI validation details when saving fails', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/settings/risk')) {
+        if (init?.method === 'PUT') {
+          return Promise.resolve({
+            ok: false,
+            status: 422,
+            json: async () => ({ detail: [{ loc: ['body', 'minimum_roi'], msg: 'Input should be less than or equal to 1' }] }),
+          })
+        }
+        return Promise.resolve({ ok: true, json: async () => riskPolicy })
+      }
+      if (url.includes('/api/runtime')) return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+      if (url.includes('/health')) return Promise.resolve({ ok: true, json: async () => ({ status: 'ok' }) })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    }),
+  )
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '风控' }))
+  fireEvent.click(await screen.findByRole('button', { name: '保存策略' }))
+
+  expect(await screen.findByText('保存失败：minimum_roi：Input should be less than or equal to 1')).toBeInTheDocument()
+})
+
 test('opens the integration menu with write-only credential inputs', async () => {
   vi.stubGlobal(
     'fetch',

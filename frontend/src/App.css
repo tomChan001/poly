@@ -254,6 +254,8 @@ tbody tr:last-child td { border-bottom: 0; }
 .settings-form { overflow: hidden; }
 .settings-form fieldset { margin: 0; padding: 0; border: 0; }
 .settings-form fieldset:disabled { opacity: 0.72; }
+.settings-form fieldset:disabled .input-suffix, .settings-form fieldset:disabled .input-prefix { background: #f4f6f7; }
+.settings-form fieldset:disabled .input-suffix input, .settings-form fieldset:disabled .input-prefix input { cursor: not-allowed; background: transparent; }
 .settings-group { display: grid; grid-template-columns: 180px repeat(3, minmax(150px, 1fr)); gap: 16px; align-items: end; padding: 20px; border-bottom: 1px solid var(--line); }
 .settings-group h3 { align-self: center; margin: 0; }
 .settings-group label { display: grid; gap: 6px; color: var(--muted); font-size: 11px; }
@@ -267,9 +269,9 @@ tbody tr:last-child td { border-bottom: 0; }
 .policy-metadata, .form-status { margin: 6px 0 0; color: var(--muted); font-size: 11px; }
 .form-status { padding: 20px; }
 .form-error { margin-right: auto; color: var(--red); font-size: 11px; }
+.form-retry { display: flex; justify-content: flex-end; padding: 0 20px 20px; background: #f8f9f9; }
 .primary-button { min-height: 36px; display: inline-flex; align-items: center; gap: 7px; padding: 0 14px; color: #fff; background: #1c5f80; border: 1px solid #174f6a; border-radius: 4px; font-size: 12px; }
 .primary-button:hover { background: #164e69; }
-.primary-button:disabled { cursor: not-allowed; opacity: 0.6; }
 
 .history-heading { align-items: end; }
 .history-date-control { min-width: 190px; display: grid; gap: 6px; color: var(--muted); font-size: 11px; }

@@ -47,10 +47,29 @@ async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init)
   if (!response.ok) {
     const payload = await response.json().catch(() => null) as { detail?: unknown } | null
-    const detail = typeof payload?.detail === 'string' ? payload.detail : `HTTP ${response.status}`
+    const detail = formatApiDetail(payload?.detail) ?? `HTTP ${response.status}`
     throw new Error(detail)
   }
   return response.json() as Promise<T>
+}
+
+
+function formatApiDetail(detail: unknown): string | null {
+  if (typeof detail === 'string') return detail
+  if (!Array.isArray(detail)) return null
+
+  const messages = detail.flatMap((item) => {
+    if (!item || typeof item !== 'object') return []
+    const value = item as { loc?: unknown; msg?: unknown }
+    if (typeof value.msg !== 'string') return []
+    const location = Array.isArray(value.loc)
+      ? value.loc.filter((part): part is string | number => typeof part === 'string' || typeof part === 'number')
+        .filter((part) => part !== 'body')
+        .join('.')
+      : ''
+    return [location ? `${location}：${value.msg}` : value.msg]
+  })
+  return messages.length > 0 ? messages.join('；') : null
 }
 
 
