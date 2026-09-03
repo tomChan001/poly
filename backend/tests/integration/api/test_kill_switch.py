@@ -49,6 +49,20 @@ class UnavailableControlStore:
         raise SQLAlchemyError("database connection unavailable")
 
 
+class ConnectionRefusedControlStore:
+    async def load_opening(self) -> OpeningControlState | None:
+        return None
+
+    async def save_opening(
+        self,
+        *,
+        enabled: bool,
+        reason: str,
+        changed_by: str,
+    ) -> OpeningControlState:
+        raise ConnectionRefusedError("database connection refused")
+
+
 class RetryingControlStore:
     def __init__(self) -> None:
         self.calls = 0
@@ -220,6 +234,54 @@ async def test_enabling_opening_keeps_it_closed_when_persistence_is_unavailable(
     assert container.system_control.opening_enabled is False
     assert container.system_control.reason == "safe default"
     assert container.system_control.version == 4
+
+
+@pytest.mark.asyncio
+async def test_disabling_opening_fails_closed_when_connection_is_refused() -> None:
+    container = ApplicationContainer()
+    container.system_control = SystemControl(
+        opening_enabled=True,
+        reason="active opening",
+        store=ConnectionRefusedControlStore(),
+    )
+    transport = httpx.ASGITransport(
+        app=app_for(container, Role.OPERATOR),
+        raise_app_exceptions=False,
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.put(
+            "/api/system-control/opening",
+            json={"enabled": False, "reason": "manual shutdown"},
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "opening control persistence unavailable"}
+    assert container.system_control.opening_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_enabling_opening_stays_closed_when_connection_is_refused() -> None:
+    container = ApplicationContainer()
+    container.system_control = SystemControl(
+        opening_enabled=False,
+        reason="safe default",
+        store=ConnectionRefusedControlStore(),
+    )
+    transport = httpx.ASGITransport(
+        app=app_for(container, Role.OPERATOR),
+        raise_app_exceptions=False,
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.put(
+            "/api/system-control/opening",
+            json={"enabled": True, "reason": "operator authorized"},
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "opening control persistence unavailable"}
+    assert container.system_control.opening_enabled is False
 
 
 @pytest.mark.asyncio

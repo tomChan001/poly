@@ -113,7 +113,9 @@ class SystemControl:
                 reason=reason,
                 changed_by=changed_by,
             )
-        except SQLAlchemyError as exc:
+        # TimeoutError and connection failures such as ConnectionRefusedError
+        # are OSErrors; programming and cancellation errors remain visible.
+        except (OSError, SQLAlchemyError) as exc:
             raise OpeningControlPersistenceError(
                 "opening control persistence unavailable"
             ) from exc
