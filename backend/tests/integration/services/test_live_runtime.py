@@ -258,6 +258,24 @@ class FailOnceSettledSaveStore(InMemoryExecutionStore):
         await super().save(record)
 
 
+class CancelAfterReserveLedger(CapitalLedger):
+    async def reserve_pair(
+        self,
+        correlation_id: str,
+        kalshi_amount: Decimal,
+        polymarket_amount: Decimal,
+        *,
+        event_id: str | None = None,
+    ):
+        await super().reserve_pair(
+            correlation_id,
+            kalshi_amount,
+            polymarket_amount,
+            event_id=event_id,
+        )
+        raise asyncio.CancelledError
+
+
 async def configured_integrations() -> IntegrationConfigService:
     service = IntegrationConfigService(
         InMemoryIntegrationConfigRepository(),
@@ -518,6 +536,65 @@ async def test_live_cycle_executes_reviewed_profitable_pair_once_per_book_sequen
     assert supervisor.evidence is not None
     assert supervisor.evidence.estimated_fees[0] > 0
     assert supervisor.maximum_unhedged_loss == risk.current.maximum_unhedged_loss
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_reservation_commit_releases_unclaimed_capital() -> None:
+    integrations = await configured_integrations()
+    pairs = ExecutablePairService(InMemoryExecutablePairRepository())
+    pair = await pairs.create(
+        ExecutablePairInput(
+            title="Cancelled reservation pair",
+            kalshi_market_id="K-MARKET",
+            kalshi_outcome="no",
+            kalshi_rule_text="K rule",
+            kalshi_rule_url="https://kalshi.test/rule",
+            polymarket_market_id="P-TOKEN",
+            polymarket_outcome="yes",
+            polymarket_rule_text="P rule",
+            polymarket_rule_url="https://poly.test/rule",
+            minimum_quantity=Decimal(10),
+            quantity_step=Decimal(1),
+            enabled=True,
+            kalshi_category="standard",
+            polymarket_category="standard",
+        )
+    )
+    await pairs.review(
+        pair.id,
+        status=MappingStatus.EXACT,
+        checklist={item: True for item in REQUIRED_REVIEW_ITEMS},
+        truth_table=[{"kalshi": Decimal(1), "polymarket": Decimal(0)}],
+        notes="exact",
+        reviewer="human",
+    )
+    control = SystemControl(opening_enabled=True)
+    history = InMemoryExecutionStore()
+    ports = {
+        Venue.KALSHI: FakeTradingPort(Venue.KALSHI),
+        Venue.POLYMARKET: FakeTradingPort(Venue.POLYMARKET),
+    }
+    capital = CancelAfterReserveLedger({})
+    runtime = LiveRuntimeService(
+        integrations=integrations,
+        pairs=pairs,
+        risk_policies=InMemoryRiskPolicyStore(RiskPolicyInput.defaults()),
+        system_control=control,
+        execution_store=history,
+        opportunities=InMemoryOpportunityStore(),
+        runtime_status=RuntimeStatusService(integrations, control),
+        market_data_factory=lambda _bundle: FakeMarketData(),
+        trading_ports_factory=lambda _bundle: ports,
+        optimizer=QuoteOptimizer(fee_engine()),
+        capital_ledger=capital,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await runtime.run_once(NOW)
+
+    assert capital.reservations == {}
+    assert await history.list() == []
+    assert all(port.submissions == 0 for port in ports.values())
 
 
 @pytest.mark.asyncio
