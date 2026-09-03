@@ -83,7 +83,7 @@ export function setRealOrdering(enabled: boolean): Promise<OpeningControlState> 
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      opening_enabled: enabled,
+      enabled,
       reason: enabled ? 'operator enabled real ordering' : 'operator disabled real ordering',
     }),
   })

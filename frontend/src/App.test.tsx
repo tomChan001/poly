@@ -479,14 +479,14 @@ test('enables and disables real ordering from integrations with the exact reques
     vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       if (url === '/api/system-control/opening' && init?.method === 'PUT') {
-        const body = JSON.parse(String(init.body)) as { opening_enabled: boolean }
+        const body = JSON.parse(String(init.body)) as { enabled: boolean }
         bodies.push(body)
         return Promise.resolve({
           ok: true,
           json: async () => ({
-            opening_enabled: body.opening_enabled,
-            reason: body.opening_enabled ? 'operator enabled real ordering' : 'operator disabled real ordering',
-            version: body.opening_enabled ? 2 : 3,
+            opening_enabled: body.enabled,
+            reason: body.enabled ? 'operator enabled real ordering' : 'operator disabled real ordering',
+            version: body.enabled ? 2 : 3,
           }),
         })
       }
@@ -502,14 +502,15 @@ test('enables and disables real ordering from integrations with the exact reques
   expect(realOrdering).not.toBeChecked()
 
   fireEvent.click(realOrdering)
-  await waitFor(() => expect(bodies).toEqual([{ opening_enabled: true, reason: 'operator enabled real ordering' }]))
+  await waitFor(() => expect(bodies).toEqual([{ enabled: true, reason: 'operator enabled real ordering' }]))
+  expect(bodies[0]).not.toHaveProperty('opening_enabled')
   expect(await screen.findByText('真实下单已开启')).toBeInTheDocument()
   expect(realOrdering).toBeChecked()
 
   fireEvent.click(realOrdering)
   await waitFor(() => expect(bodies).toEqual([
-    { opening_enabled: true, reason: 'operator enabled real ordering' },
-    { opening_enabled: false, reason: 'operator disabled real ordering' },
+    { enabled: true, reason: 'operator enabled real ordering' },
+    { enabled: false, reason: 'operator disabled real ordering' },
   ]))
   expect(await screen.findByText('真实下单已关闭')).toBeInTheDocument()
   expect(realOrdering).not.toBeChecked()
