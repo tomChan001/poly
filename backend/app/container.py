@@ -18,7 +18,6 @@ from backend.app.db.operational_control import PostgresOperationalControlStore
 from backend.app.db.outbox import PostgresOutbox
 from backend.app.db.risk_policy import PostgresRiskPolicyStore
 from backend.app.domain.enums import Venue
-from backend.app.services.automation_gate import AutomationEvidence, AutomationGate
 from backend.app.services.capital import CapitalLedger
 from backend.app.services.executable_pairs import (
     ExecutablePairService,
@@ -94,8 +93,6 @@ class ApplicationContainer:
         )
         self.live_runtime: LiveRuntimeService | None = None
         self.pair_discovery: ConfiguredOddpoolPairDiscoveryService | None = None
-        self.automation_gate = AutomationGate()
-        self.automation_evidence: AutomationEvidence | None = None
 
     @classmethod
     def runtime(cls) -> "ApplicationContainer":

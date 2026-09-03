@@ -153,11 +153,10 @@ async def test_kill_switch_reason_cannot_be_blank() -> None:
 
 
 @pytest.mark.asyncio
-async def test_operator_can_enable_opening_without_automation_evidence() -> None:
+async def test_operator_can_enable_opening() -> None:
     container = ApplicationContainer()
     store = RecordingControlStore()
     container.system_control = SystemControl(store=store)
-    container.automation_evidence = None
 
     transport = httpx.ASGITransport(app=app_for(container, Role.OPERATOR))
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

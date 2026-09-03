@@ -290,8 +290,8 @@ class ControlledExecutionService:
         if record.state is not ExecutionState.SUBMITTED:
             raise ValueError("only submitted executions can be recovered")
 
-        # Recovery is reconciliation, not a new opening. It must continue when
-        # trading mode or the kill switch is off, and it must never resubmit.
+        # Recovery is reconciliation, not a new opening. It continues when
+        # real-order opening is disabled and never resubmits.
         for venue in Venue:
             client_order_id = f"{record.correlation_id}-{venue.value}"
             result = await self._ports[venue].find_by_client_order_id(client_order_id)
