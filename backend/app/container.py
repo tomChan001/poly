@@ -203,7 +203,6 @@ class ApplicationContainer:
             runtime_status=container.runtime_status,
             market_data_factory=market_data_factory,
             trading_ports_factory=trading_ports_factory,
-            trading_mode=settings.trading_mode,
             optimizer=QuoteOptimizer(container.fees),
             capital_ledger=container.capital_ledger,
             execution_supervisor=container.execution_supervisor,

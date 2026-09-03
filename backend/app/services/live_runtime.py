@@ -7,7 +7,6 @@ from hashlib import sha256
 from typing import Protocol
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
-from backend.app.core.config import TradingMode
 from backend.app.domain.enums import ExecutionState, MappingStatus, Venue
 from backend.app.domain.market import BookLevel, NormalizedBook
 from backend.app.services.capital import CapitalLedger
@@ -87,7 +86,6 @@ class LiveRuntimeService:
         runtime_status: RuntimeStatusService,
         market_data_factory: MarketDataFactory,
         trading_ports_factory: TradingPortsFactory,
-        trading_mode: TradingMode,
         optimizer: QuoteOptimizer,
         capital_ledger: CapitalLedger,
         execution_supervisor: ExecutionSupervisorPort | None = None,
@@ -101,7 +99,6 @@ class LiveRuntimeService:
         self._runtime_status = runtime_status
         self._market_data_factory = market_data_factory
         self._trading_ports_factory = trading_ports_factory
-        self._trading_mode = trading_mode
         self._optimizer = optimizer
         self._capital_ledger = capital_ledger
         self._execution_supervisor = execution_supervisor
@@ -109,15 +106,6 @@ class LiveRuntimeService:
 
     async def run_once(self, now: datetime) -> int:
         """Run one polling cycle and return the number of executions started."""
-        if self._trading_mode is not TradingMode.LIMITED_AUTO:
-            self._runtime_status.record_cycle(
-                error="real submission requires limited_auto mode"
-            )
-            return 0
-        if not self._system_control.opening_enabled:
-            self._runtime_status.record_cycle(error="opening kill switch is disabled")
-            return 0
-
         bundle = await self._integrations.runtime_bundle()
         pairs = await self._pairs.list_executable()
         if not pairs:
@@ -134,8 +122,8 @@ class LiveRuntimeService:
         ports = await _resolve(self._trading_ports_factory(bundle))
         if self._execution_supervisor is not None:
             self._execution_supervisor.bind_emergency_ports(ports)
-        executions = 0
         observed: list[OpportunityRecord] = []
+        evaluated: list[tuple[ExecutablePair, PairEvaluation]] = []
         for pair in pairs:
             evaluation = await self._evaluate_pair(
                 pair, policy, market_data, ports, now
@@ -143,6 +131,14 @@ class LiveRuntimeService:
             if evaluation is None:
                 continue
             observed.append(evaluation.opportunity)
+            evaluated.append((pair, evaluation))
+
+        # Publication is the boundary between evaluating the market and acting
+        # on it. If it fails, do not reserve capital or submit any orders.
+        self._opportunities.replace(observed)
+
+        executions = 0
+        for pair, evaluation in evaluated:
             if evaluation.opportunity.rejection_reasons:
                 continue
 
@@ -166,6 +162,9 @@ class LiveRuntimeService:
                 self._processed_books.add(identity)
                 if existing.state is ExecutionState.SUBMITTED:
                     await executor.recover_submitted(existing, now)
+                continue
+
+            if not self._system_control.opening_enabled:
                 continue
 
             # Mark before the first network write. A retry after an ambiguous
@@ -212,7 +211,6 @@ class LiveRuntimeService:
                 await self._capital_ledger.release_pair(correlation_id)
             executions += 1
 
-        self._opportunities.replace(observed)
         self._runtime_status.record_cycle(executions=executions)
         return executions
 

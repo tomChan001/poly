@@ -3,7 +3,6 @@ from decimal import Decimal
 
 import pytest
 
-from backend.app.core.config import TradingMode
 from backend.app.core.secrets import InMemorySecretStore
 from backend.app.domain.enums import ExecutionState, MappingStatus, Venue
 from backend.app.domain.market import BookLevel, NormalizedBook
@@ -33,7 +32,10 @@ from backend.app.services.integration_config import (
 )
 from backend.app.services.live_runtime import LiveRuntimeService
 from backend.app.services.mappings import REQUIRED_REVIEW_ITEMS
-from backend.app.services.opportunities import InMemoryOpportunityStore
+from backend.app.services.opportunities import (
+    InMemoryOpportunityStore,
+    OpportunityRecord,
+)
 from backend.app.services.optimizer import QuoteOptimizer
 from backend.app.services.runtime_status import RuntimeStatusService
 from backend.app.services.settings import InMemoryRiskPolicyStore, RiskPolicyInput
@@ -155,6 +157,11 @@ class StaleMarketData:
         )
 
 
+class FailingOpportunityStore(InMemoryOpportunityStore):
+    def replace(self, records: list[OpportunityRecord]) -> None:
+        raise RuntimeError("opportunity publication failed")
+
+
 async def configured_integrations() -> IntegrationConfigService:
     service = IntegrationConfigService(
         InMemoryIntegrationConfigRepository(),
@@ -197,6 +204,65 @@ async def configured_integrations() -> IntegrationConfigService:
 
 
 @pytest.mark.asyncio
+async def test_live_cycle_does_not_reserve_or_submit_when_publication_fails() -> None:
+    integrations = await configured_integrations()
+    pairs = ExecutablePairService(InMemoryExecutablePairRepository())
+    pair = await pairs.create(
+        ExecutablePairInput(
+            title="Publication failure pair",
+            kalshi_market_id="K-PUBLISH",
+            kalshi_outcome="no",
+            kalshi_rule_text="K rule",
+            kalshi_rule_url="https://kalshi.test/rule",
+            polymarket_market_id="P-PUBLISH",
+            polymarket_outcome="yes",
+            polymarket_rule_text="P rule",
+            polymarket_rule_url="https://poly.test/rule",
+            minimum_quantity=Decimal(10),
+            quantity_step=Decimal(1),
+            enabled=True,
+            kalshi_category="standard",
+            polymarket_category="standard",
+        )
+    )
+    await pairs.review(
+        pair.id,
+        status=MappingStatus.EXACT,
+        checklist={item: True for item in REQUIRED_REVIEW_ITEMS},
+        truth_table=[{"kalshi": Decimal(1), "polymarket": Decimal(0)}],
+        notes="exact",
+        reviewer="human",
+    )
+    control = SystemControl(opening_enabled=True)
+    history = InMemoryExecutionStore()
+    ports = {
+        Venue.KALSHI: FakeTradingPort(Venue.KALSHI),
+        Venue.POLYMARKET: FakeTradingPort(Venue.POLYMARKET),
+    }
+    capital = CapitalLedger({})
+    runtime = LiveRuntimeService(
+        integrations=integrations,
+        pairs=pairs,
+        risk_policies=InMemoryRiskPolicyStore(RiskPolicyInput.defaults()),
+        system_control=control,
+        execution_store=history,
+        opportunities=FailingOpportunityStore(),
+        runtime_status=RuntimeStatusService(integrations, control),
+        market_data_factory=lambda _bundle: FakeMarketData(),
+        trading_ports_factory=lambda _bundle: ports,
+        optimizer=QuoteOptimizer(fee_engine()),
+        capital_ledger=capital,
+    )
+
+    with pytest.raises(RuntimeError, match="opportunity publication failed"):
+        await runtime.run_once(NOW)
+
+    assert await history.list() == []
+    assert capital.reservations == {}
+    assert all(port.submissions == 0 for port in ports.values())
+
+
+@pytest.mark.asyncio
 async def test_live_cycle_executes_reviewed_profitable_pair_once_per_book_sequence() -> (
     None
 ):
@@ -229,8 +295,9 @@ async def test_live_cycle_executes_reviewed_profitable_pair_once_per_book_sequen
         reviewer="human",
     )
     risk = InMemoryRiskPolicyStore(RiskPolicyInput.defaults())
-    control = SystemControl(opening_enabled=True)
+    control = SystemControl(opening_enabled=False)
     history = InMemoryExecutionStore()
+    opportunities = InMemoryOpportunityStore()
     status = RuntimeStatusService(integrations, control)
     ports = {
         Venue.KALSHI: FakeTradingPort(Venue.KALSHI),
@@ -244,17 +311,21 @@ async def test_live_cycle_executes_reviewed_profitable_pair_once_per_book_sequen
         risk_policies=risk,
         system_control=control,
         execution_store=history,
-        opportunities=InMemoryOpportunityStore(),
+        opportunities=opportunities,
         runtime_status=status,
         market_data_factory=lambda _bundle: FakeMarketData(),
         trading_ports_factory=lambda _bundle: ports,
-        trading_mode=TradingMode.LIMITED_AUTO,
         optimizer=QuoteOptimizer(fee_engine()),
         capital_ledger=capital,
         execution_supervisor=supervisor,
     )
 
     first = await runtime.run_once(NOW)
+    [published] = opportunities.list_ranked()
+    records_before_opening = await history.list()
+    submissions_before_opening = [port.submissions for port in ports.values()]
+    reservations_before_opening = dict(capital.reservations)
+    control.set_opening(True, "operator enabled real ordering")
     second = await runtime.run_once(NOW)
     restarted_runtime = LiveRuntimeService(
         integrations=integrations,
@@ -266,15 +337,18 @@ async def test_live_cycle_executes_reviewed_profitable_pair_once_per_book_sequen
         runtime_status=status,
         market_data_factory=lambda _bundle: FakeMarketData(),
         trading_ports_factory=lambda _bundle: ports,
-        trading_mode=TradingMode.LIMITED_AUTO,
         optimizer=QuoteOptimizer(fee_engine()),
         capital_ledger=capital,
     )
     after_restart = await restarted_runtime.run_once(NOW)
 
     records = await history.list()
-    assert first == 1
-    assert second == 0
+    assert first == 0
+    assert published.rejection_reasons == ()
+    assert records_before_opening == []
+    assert submissions_before_opening == [0, 0]
+    assert reservations_before_opening == {}
+    assert second == 1
     assert after_restart == 0
     assert len(records) == 1
     assert records[0].state is ExecutionState.PAIRED
@@ -339,7 +413,6 @@ async def test_live_cycle_releases_reservation_when_order_outcome_stays_unknown(
         runtime_status=status,
         market_data_factory=lambda _bundle: FakeMarketData(),
         trading_ports_factory=lambda _bundle: ports,
-        trading_mode=TradingMode.LIMITED_AUTO,
         optimizer=QuoteOptimizer(fee_engine()),
         capital_ledger=capital,
     )
@@ -403,7 +476,6 @@ async def test_late_settlement_is_retained_as_structured_rejection() -> None:
         runtime_status=status,
         market_data_factory=lambda _bundle: FakeMarketData(),
         trading_ports_factory=lambda _bundle: ports,
-        trading_mode=TradingMode.LIMITED_AUTO,
         optimizer=QuoteOptimizer(fee_engine()),
         capital_ledger=CapitalLedger({}),
     )
@@ -448,7 +520,7 @@ async def test_stale_book_is_retained_as_structured_rejection() -> None:
         reviewer="human",
     )
     risk = InMemoryRiskPolicyStore(RiskPolicyInput.defaults())
-    control = SystemControl(opening_enabled=True)
+    control = SystemControl(opening_enabled=False)
     history = InMemoryExecutionStore()
     opportunities = InMemoryOpportunityStore()
     status = RuntimeStatusService(integrations, control)
@@ -456,6 +528,7 @@ async def test_stale_book_is_retained_as_structured_rejection() -> None:
         Venue.KALSHI: FakeTradingPort(Venue.KALSHI),
         Venue.POLYMARKET: FakeTradingPort(Venue.POLYMARKET),
     }
+    capital = CapitalLedger({})
     runtime = LiveRuntimeService(
         integrations=integrations,
         pairs=pairs,
@@ -466,9 +539,8 @@ async def test_stale_book_is_retained_as_structured_rejection() -> None:
         runtime_status=status,
         market_data_factory=lambda _bundle: StaleMarketData(),
         trading_ports_factory=lambda _bundle: ports,
-        trading_mode=TradingMode.LIMITED_AUTO,
         optimizer=QuoteOptimizer(fee_engine()),
-        capital_ledger=CapitalLedger({}),
+        capital_ledger=capital,
     )
 
     executions = await runtime.run_once(NOW)
@@ -477,3 +549,6 @@ async def test_stale_book_is_retained_as_structured_rejection() -> None:
     assert executions == 0
     assert record.rejection_reasons == ("STALE_BOOK",)
     assert record.book_sequences == ("k-seq-stale", "p-seq-stale")
+    assert await history.list() == []
+    assert capital.reservations == {}
+    assert all(port.submissions == 0 for port in ports.values())
