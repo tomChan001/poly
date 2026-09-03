@@ -1,3 +1,4 @@
+import asyncio
 import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -103,9 +104,14 @@ class LiveRuntimeService:
         self._capital_ledger = capital_ledger
         self._execution_supervisor = execution_supervisor
         self._processed_books: set[tuple[str, str, str]] = set()
+        self._cycle_lock = asyncio.Lock()
 
     async def run_once(self, now: datetime) -> int:
         """Run one polling cycle and return the number of executions started."""
+        async with self._cycle_lock:
+            return await self._run_once(now)
+
+    async def _run_once(self, now: datetime) -> int:
         bundle = await self._integrations.runtime_bundle()
         pairs = await self._pairs.list_executable()
         if not pairs:
@@ -159,9 +165,10 @@ class LiveRuntimeService:
             except KeyError:
                 existing = None
             if existing is not None:
-                self._processed_books.add(identity)
                 if existing.state is ExecutionState.SUBMITTED:
-                    await executor.recover_submitted(existing, now)
+                    recovered = await executor.recover_submitted(existing, now)
+                    await self._settle_capital(correlation_id, recovered.state)
+                self._processed_books.add(identity)
                 continue
 
             if not self._system_control.opening_enabled:
@@ -205,14 +212,21 @@ class LiveRuntimeService:
             except Exception:
                 await self._capital_ledger.release_pair(correlation_id)
                 raise
-            if record.state in {ExecutionState.PAIRED, ExecutionState.PARTIALLY_HEDGED}:
-                await self._capital_ledger.convert_pair(correlation_id)
-            else:
-                await self._capital_ledger.release_pair(correlation_id)
+            await self._settle_capital(correlation_id, record.state)
             executions += 1
 
         self._runtime_status.record_cycle(executions=executions)
         return executions
+
+    async def _settle_capital(
+        self,
+        correlation_id: str,
+        state: ExecutionState,
+    ) -> None:
+        if state in {ExecutionState.PAIRED, ExecutionState.PARTIALLY_HEDGED}:
+            await self._capital_ledger.convert_pair(correlation_id)
+        else:
+            await self._capital_ledger.release_pair(correlation_id)
 
     async def _evaluate_pair(
         self,
