@@ -1,5 +1,7 @@
 from dataclasses import asdict, dataclass, replace
+from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Protocol
 from uuid import UUID, uuid4
 
 
@@ -37,6 +39,7 @@ class RiskPolicyInput:
 @dataclass(frozen=True, slots=True)
 class RiskPolicy:
     version: UUID
+    created_at: datetime
     minimum_roi: Decimal
     maximum_settlement_days: int
     maximum_book_age_seconds: Decimal
@@ -50,18 +53,38 @@ class RiskPolicy:
     maximum_arrival_gap_seconds: Decimal = Decimal("0.5")
 
 
+class RiskPolicyStore(Protocol):
+    current: RiskPolicy | None
+
+    async def initialize(self) -> RiskPolicy: ...
+
+    async def create(self, value: RiskPolicyInput) -> RiskPolicy: ...
+
+    async def get(self, version: UUID) -> RiskPolicy: ...
+
+
 class InMemoryRiskPolicyStore:
-    def __init__(self) -> None:
+    def __init__(self, initial: RiskPolicyInput | None = None) -> None:
         self._versions: dict[UUID, RiskPolicy] = {}
         self.current: RiskPolicy | None = None
+        if initial is not None:
+            self._create(initial)
 
-    def create(self, value: RiskPolicyInput) -> RiskPolicy:
+    async def initialize(self) -> RiskPolicy:
+        if self.current is None:
+            return self._create(RiskPolicyInput.defaults())
+        return self.current
+
+    async def create(self, value: RiskPolicyInput) -> RiskPolicy:
+        return self._create(value)
+
+    async def get(self, version: UUID) -> RiskPolicy:
+        return self._versions[version]
+
+    def _create(self, value: RiskPolicyInput) -> RiskPolicy:
         # Copying isolates historical policy versions from later UI edits.
         snapshot = replace(value)
-        policy = RiskPolicy(uuid4(), **asdict(snapshot))
+        policy = RiskPolicy(uuid4(), datetime.now(UTC), **asdict(snapshot))
         self._versions[policy.version] = policy
         self.current = policy
         return policy
-
-    def get(self, version: UUID) -> RiskPolicy:
-        return self._versions[version]

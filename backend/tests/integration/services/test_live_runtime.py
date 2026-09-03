@@ -230,8 +230,7 @@ async def test_live_cycle_executes_reviewed_profitable_pair_once_per_book_sequen
         notes="exact",
         reviewer="human",
     )
-    risk = InMemoryRiskPolicyStore()
-    risk.create(RiskPolicyInput.defaults())
+    risk = InMemoryRiskPolicyStore(RiskPolicyInput.defaults())
     control = SystemControl(opening_enabled=True)
     history = InMemoryExecutionStore()
     status = RuntimeStatusService(integrations, control)
@@ -323,8 +322,7 @@ async def test_live_cycle_releases_reservation_when_order_outcome_stays_unknown(
         notes="exact",
         reviewer="human",
     )
-    risk = InMemoryRiskPolicyStore()
-    risk.create(RiskPolicyInput.defaults())
+    risk = InMemoryRiskPolicyStore(RiskPolicyInput.defaults())
     control = SystemControl(opening_enabled=True)
     history = InMemoryExecutionStore()
     status = RuntimeStatusService(integrations, control)
@@ -388,8 +386,7 @@ async def test_late_settlement_is_retained_as_structured_rejection() -> None:
         notes="exact",
         reviewer="human",
     )
-    risk = InMemoryRiskPolicyStore()
-    risk.create(RiskPolicyInput.defaults())
+    risk = InMemoryRiskPolicyStore(RiskPolicyInput.defaults())
     control = SystemControl(opening_enabled=True)
     history = InMemoryExecutionStore()
     opportunities = InMemoryOpportunityStore()
@@ -452,8 +449,7 @@ async def test_stale_book_is_retained_as_structured_rejection() -> None:
         notes="exact",
         reviewer="human",
     )
-    risk = InMemoryRiskPolicyStore()
-    risk.create(RiskPolicyInput.defaults())
+    risk = InMemoryRiskPolicyStore(RiskPolicyInput.defaults())
     control = SystemControl(opening_enabled=True)
     history = InMemoryExecutionStore()
     opportunities = InMemoryOpportunityStore()

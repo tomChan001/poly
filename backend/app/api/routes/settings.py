@@ -50,10 +50,10 @@ def get_risk_policy(
 
 
 @router.put("/risk")
-def update_risk_policy(
+async def update_risk_policy(
     payload: RiskPolicyRequest,
     container: Annotated[ApplicationContainer, Depends(get_container)],
     _principal: Annotated[Principal, Depends(require_role(Role.OPERATOR))],
 ) -> RiskPolicy:
     policy_input = RiskPolicyInput(**payload.model_dump())
-    return container.risk_policies.create(policy_input)
+    return await container.risk_policies.create(policy_input)
