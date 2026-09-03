@@ -102,17 +102,17 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
         runtime_task: asyncio.Task[None] | None = None
-        if owns_container and application_container.live_runtime is not None:
-            await application_container.system_control.load_async()
-            await application_container.risk_policies.initialize()
-            await _apply_startup_gate(application_container, settings.trading_mode)
-            runtime_task = asyncio.create_task(
-                _live_runtime_loop(
-                    application_container,
-                    poll_seconds=settings.runtime_poll_seconds,
-                )
-            )
         try:
+            if owns_container and application_container.live_runtime is not None:
+                await application_container.system_control.load_async()
+                await application_container.risk_policies.initialize()
+                await _apply_startup_gate(application_container, settings.trading_mode)
+                runtime_task = asyncio.create_task(
+                    _live_runtime_loop(
+                        application_container,
+                        poll_seconds=settings.runtime_poll_seconds,
+                    )
+                )
             yield
         finally:
             if runtime_task is not None:

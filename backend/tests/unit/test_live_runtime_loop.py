@@ -139,6 +139,7 @@ async def test_lifespan_does_not_start_runtime_loop_when_risk_policy_initializat
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
+    close_calls = 0
     container = ApplicationContainer()
 
     class SystemControl:
@@ -158,6 +159,10 @@ async def test_lifespan_does_not_start_runtime_loop_when_risk_policy_initializat
     async def apply_startup_gate(_container, _trading_mode) -> None:
         events.append("startup gate")
 
+    async def close() -> None:
+        nonlocal close_calls
+        close_calls += 1
+
     container.system_control = cast(SystemControlService, SystemControl())
     container.risk_policies = cast(RiskPolicyStore, RiskPolicies())
     container.live_runtime = cast(LiveRuntimeService, object())
@@ -166,6 +171,7 @@ async def test_lifespan_does_not_start_runtime_loop_when_risk_policy_initializat
         "runtime",
         classmethod(lambda _cls: container),
     )
+    monkeypatch.setattr(container, "close", close)
     monkeypatch.setattr(main, "_apply_startup_gate", apply_startup_gate)
     monkeypatch.setattr(main, "_live_runtime_loop", live_runtime_loop)
 
@@ -176,3 +182,4 @@ async def test_lifespan_does_not_start_runtime_loop_when_risk_policy_initializat
             pass
 
     assert events == ["system control", "risk policies"]
+    assert close_calls == 1
