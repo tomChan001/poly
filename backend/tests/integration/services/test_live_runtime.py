@@ -223,6 +223,18 @@ class ClosingOpportunityStore(InMemoryOpportunityStore):
         self._control.disable_opening("closed after evaluation")
 
 
+class FailOnceCapitalLedger(CapitalLedger):
+    def __init__(self) -> None:
+        super().__init__({})
+        self.fail_conversions = 1
+
+    async def convert_pair(self, correlation_id: str):
+        if self.fail_conversions:
+            self.fail_conversions -= 1
+            raise RuntimeError("capital settlement unavailable")
+        return await super().convert_pair(correlation_id)
+
+
 async def configured_integrations() -> IntegrationConfigService:
     service = IntegrationConfigService(
         InMemoryIntegrationConfigRepository(),
@@ -580,15 +592,32 @@ async def test_off_cycle_retries_submitted_recovery_and_converts_reservation() -
         reviewer="human",
     )
     correlation_id = str(
-        uuid5(NAMESPACE_URL, f"live-execution:{pair.id}:k-seq-1:p-seq-1")
+        uuid5(NAMESPACE_URL, f"live-execution:{pair.id}:old-k-seq:old-p-seq")
     )
-    control = SystemControl(opening_enabled=False)
+    control = SystemControl(opening_enabled=True)
     history = InMemoryExecutionStore()
     await history.save(
         ExecutionRecord(
             correlation_id=correlation_id,
             state=ExecutionState.SUBMITTED,
             requested_quantity=Decimal(10),
+            evidence=ExecutionEvidence(
+                quote_evaluation_id="old-quote",
+                rule_versions=("old-k-rule", "old-p-rule"),
+                book_sequences=("old-k-seq", "old-p-seq"),
+                balance_versions=("old-k-balance", "old-p-balance"),
+                risk_policy_version="risk-1",
+                capital_reservation_id="old-reservation",
+                quantity=Decimal(10),
+                kalshi_market_id="K-RECOVERY",
+                polymarket_market_id="P-RECOVERY",
+                kalshi_outcome="no",
+                polymarket_outcome="yes",
+                kalshi_limit_price=Decimal("0.70"),
+                polymarket_limit_price=Decimal("0.20"),
+                conservative_roi=Decimal("0.08"),
+                minimum_roi=Decimal("0.03"),
+            ),
         )
     )
     ports = {
@@ -624,7 +653,9 @@ async def test_off_cycle_retries_submitted_recovery_and_converts_reservation() -
         await runtime.run_once(NOW)
     assert (await history.get(correlation_id)).state is ExecutionState.SUBMITTED
     assert capital.get_pair(correlation_id) is not None
+    assert all(port.submissions == 0 for port in ports.values())
 
+    control.disable_opening("recover before opening a new position")
     executions = await runtime.run_once(NOW)
 
     assert executions == 0
@@ -638,6 +669,120 @@ async def test_off_cycle_retries_submitted_recovery_and_converts_reservation() -
     assert await runtime.run_once(NOW) == 0
     assert ports[Venue.KALSHI].lookups == 2
     assert ports[Venue.POLYMARKET].lookups == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_settlement_failure_retries_without_resubmitting_orders() -> None:
+    integrations = await configured_integrations()
+    pairs = ExecutablePairService(InMemoryExecutablePairRepository())
+    pair = await pairs.create(
+        ExecutablePairInput(
+            title="Settlement retry pair",
+            kalshi_market_id="K-SETTLEMENT",
+            kalshi_outcome="no",
+            kalshi_rule_text="K rule",
+            kalshi_rule_url="https://kalshi.test/rule",
+            polymarket_market_id="P-SETTLEMENT",
+            polymarket_outcome="yes",
+            polymarket_rule_text="P rule",
+            polymarket_rule_url="https://poly.test/rule",
+            minimum_quantity=Decimal(10),
+            quantity_step=Decimal(1),
+            enabled=True,
+            kalshi_category="standard",
+            polymarket_category="standard",
+        )
+    )
+    await pairs.review(
+        pair.id,
+        status=MappingStatus.EXACT,
+        checklist={item: True for item in REQUIRED_REVIEW_ITEMS},
+        truth_table=[{"kalshi": Decimal(1), "polymarket": Decimal(0)}],
+        notes="exact",
+        reviewer="human",
+    )
+    control = SystemControl(opening_enabled=True)
+    history = InMemoryExecutionStore()
+    ports = {
+        Venue.KALSHI: FakeTradingPort(Venue.KALSHI),
+        Venue.POLYMARKET: FakeTradingPort(Venue.POLYMARKET),
+    }
+    capital = FailOnceCapitalLedger()
+    runtime = LiveRuntimeService(
+        integrations=integrations,
+        pairs=pairs,
+        risk_policies=InMemoryRiskPolicyStore(RiskPolicyInput.defaults()),
+        system_control=control,
+        execution_store=history,
+        opportunities=InMemoryOpportunityStore(),
+        runtime_status=RuntimeStatusService(integrations, control),
+        market_data_factory=lambda _bundle: FakeMarketData(),
+        trading_ports_factory=lambda _bundle: ports,
+        optimizer=QuoteOptimizer(fee_engine()),
+        capital_ledger=capital,
+    )
+
+    with pytest.raises(RuntimeError, match="capital settlement unavailable"):
+        await runtime.run_once(NOW)
+    [record] = await history.list()
+    assert record.state is ExecutionState.PAIRED
+    assert all(port.submissions == 1 for port in ports.values())
+    assert len(capital.reservations) == 2
+
+    executions = await runtime.run_once(NOW)
+
+    assert executions == 0
+    assert all(port.submissions == 1 for port in ports.values())
+    assert capital.reservations == {}
+    assert len(capital.consumed_pairs) == 1
+
+
+@pytest.mark.asyncio
+async def test_off_cycle_recovers_submitted_execution_without_current_pairs() -> None:
+    integrations = await configured_integrations()
+    control = SystemControl(opening_enabled=False)
+    history = InMemoryExecutionStore()
+    correlation_id = "old-submitted-execution"
+    await history.save(
+        ExecutionRecord(
+            correlation_id=correlation_id,
+            state=ExecutionState.SUBMITTED,
+            requested_quantity=Decimal(10),
+        )
+    )
+    ports = {
+        Venue.KALSHI: RetryableRecoveryPort(Venue.KALSHI),
+        Venue.POLYMARKET: RetryableRecoveryPort(Venue.POLYMARKET),
+    }
+    capital = CapitalLedger({})
+    capital.sync_available_balances(
+        kalshi_available=Decimal(100),
+        polymarket_available=Decimal(100),
+    )
+    await capital.reserve_pair(correlation_id, Decimal(7), Decimal(2))
+    opportunities = InMemoryOpportunityStore()
+    runtime = LiveRuntimeService(
+        integrations=integrations,
+        pairs=ExecutablePairService(InMemoryExecutablePairRepository()),
+        risk_policies=InMemoryRiskPolicyStore(RiskPolicyInput.defaults()),
+        system_control=control,
+        execution_store=history,
+        opportunities=opportunities,
+        runtime_status=RuntimeStatusService(integrations, control),
+        market_data_factory=lambda _bundle: FakeMarketData(),
+        trading_ports_factory=lambda _bundle: ports,
+        optimizer=QuoteOptimizer(fee_engine()),
+        capital_ledger=capital,
+    )
+
+    executions = await runtime.run_once(NOW)
+
+    assert executions == 0
+    assert opportunities.list_ranked() == []
+    assert (await history.get(correlation_id)).state is ExecutionState.PAIRED
+    assert all(port.submissions == 0 for port in ports.values())
+    assert all(port.lookups == 1 for port in ports.values())
+    assert correlation_id in capital.consumed_pairs
 
 
 @pytest.mark.asyncio

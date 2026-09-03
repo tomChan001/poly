@@ -16,6 +16,7 @@ from backend.app.services.execution import (
     ControlledExecutionService,
     ExecutionAuthorizationService,
     ExecutionEvidence,
+    ExecutionRecord,
     ExecutionStore,
     ExecutionSupervisorPort,
     ExecutionTradingPort,
@@ -114,34 +115,46 @@ class LiveRuntimeService:
     async def _run_once(self, now: datetime) -> int:
         bundle = await self._integrations.runtime_bundle()
         pairs = await self._pairs.list_executable()
-        if not pairs:
-            self._opportunities.replace([])
-            self._runtime_status.record_cycle(error="no enabled EXACT market pair")
-            return 0
-
         policy = self._risk_policies.current
-        if policy is None:
-            self._runtime_status.record_cycle(error="risk policy is not configured")
-            return 0
-
-        market_data = await _resolve(self._market_data_factory(bundle))
-        ports = await _resolve(self._trading_ports_factory(bundle))
-        if self._execution_supervisor is not None:
-            self._execution_supervisor.bind_emergency_ports(ports)
         observed: list[OpportunityRecord] = []
         evaluated: list[tuple[ExecutablePair, PairEvaluation]] = []
-        for pair in pairs:
-            evaluation = await self._evaluate_pair(
-                pair, policy, market_data, ports, now
-            )
-            if evaluation is None:
-                continue
-            observed.append(evaluation.opportunity)
-            evaluated.append((pair, evaluation))
+        ports: dict[Venue, BalanceTradingPort] | None = None
+        if pairs and policy is not None:
+            market_data = await _resolve(self._market_data_factory(bundle))
+            ports = await _resolve(self._trading_ports_factory(bundle))
+            self._bind_emergency_ports(ports)
+            for pair in pairs:
+                evaluation = await self._evaluate_pair(
+                    pair, policy, market_data, ports, now
+                )
+                if evaluation is None:
+                    continue
+                observed.append(evaluation.opportunity)
+                evaluated.append((pair, evaluation))
 
         # Publication is the boundary between evaluating the market and acting
         # on it. If it fails, do not reserve capital or submit any orders.
         self._opportunities.replace(observed)
+
+        records = await self._execution_store.list()
+        if records:
+            if ports is None:
+                ports = await _resolve(self._trading_ports_factory(bundle))
+                self._bind_emergency_ports(ports)
+            await self._reconcile_persisted_executions(
+                records,
+                ports,
+                policy.maximum_unhedged_loss if policy is not None else Decimal(0),
+                now,
+            )
+
+        if not pairs:
+            self._runtime_status.record_cycle(error="no enabled EXACT market pair")
+            return 0
+        if policy is None:
+            self._runtime_status.record_cycle(error="risk policy is not configured")
+            return 0
+        assert ports is not None
 
         executions = 0
         for pair, evaluation in evaluated:
@@ -217,6 +230,35 @@ class LiveRuntimeService:
 
         self._runtime_status.record_cycle(executions=executions)
         return executions
+
+    def _bind_emergency_ports(self, ports: dict[Venue, BalanceTradingPort]) -> None:
+        if self._execution_supervisor is not None:
+            self._execution_supervisor.bind_emergency_ports(ports)
+
+    async def _reconcile_persisted_executions(
+        self,
+        records: list[ExecutionRecord],
+        ports: dict[Venue, BalanceTradingPort],
+        maximum_unhedged_loss: Decimal,
+        now: datetime,
+    ) -> None:
+        executor = ControlledExecutionService(
+            ports,
+            self._system_control,
+            self._execution_store,
+            self._execution_supervisor,
+            maximum_unhedged_loss,
+        )
+        for record in records:
+            if record.state is ExecutionState.SUBMITTED:
+                record = await executor.recover_submitted(record, now)
+            if record.state in {
+                ExecutionState.PAIRED,
+                ExecutionState.PARTIALLY_HEDGED,
+                ExecutionState.EXCEPTION,
+                ExecutionState.CANCELLED,
+            }:
+                await self._settle_capital(record.correlation_id, record.state)
 
     async def _settle_capital(
         self,
