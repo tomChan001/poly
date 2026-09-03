@@ -35,6 +35,7 @@ EXPECTED_TABLES = {
     "audit_event",
     "outbox_event",
     "system_control",
+    "risk_policy_version",
 }
 
 

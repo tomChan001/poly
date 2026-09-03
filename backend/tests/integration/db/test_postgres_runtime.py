@@ -19,6 +19,7 @@ from backend.app.db.incidents import PostgresIncidentStore
 from backend.app.db.integration_config import PostgresIntegrationConfigRepository
 from backend.app.db.operational_control import PostgresOperationalControlStore
 from backend.app.db.outbox import PostgresOutbox
+from backend.app.db.risk_policy import PostgresRiskPolicyStore
 from backend.app.domain.enums import ExecutionState
 from backend.app.services.execution_supervisor import ExecutionIncident
 from backend.app.services.integration_config import (
@@ -28,6 +29,7 @@ from backend.app.services.integration_config import (
     IntegrationProvider,
 )
 from backend.app.services.notifications import NotificationService
+from backend.app.services.settings import RiskPolicyInput
 from backend.app.services.system_control import SystemControl
 
 ADMIN_URL_ENV = "TEST_POSTGRES_ADMIN_URL"
@@ -97,8 +99,55 @@ async def test_initial_migration_runs_on_postgres_and_protects_audit_events() ->
                 "updated_by",
             }
 
+            risk_policy_columns = set(
+                await connection.fetchval(
+                    """
+                    SELECT array_agg(column_name)
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = 'risk_policy_version'
+                    """
+                )
+            )
+            assert risk_policy_columns == {
+                "version",
+                "created_at",
+                "minimum_roi",
+                "maximum_settlement_days",
+                "maximum_book_age_seconds",
+                "per_trade_limit",
+                "per_event_limit",
+                "portfolio_limit",
+                "explicit_cost",
+                "risk_buffer",
+                "maximum_unhedged_seconds",
+                "maximum_unhedged_loss",
+                "maximum_arrival_gap_seconds",
+            }
+
             engine = create_async_engine(migration_url)
             sessions = async_sessionmaker(engine, expire_on_commit=False)
+            policy_store = PostgresRiskPolicyStore(sessions)
+            default_policy = await policy_store.initialize()
+            changed_policy = await policy_store.create(
+                RiskPolicyInput(
+                    minimum_roi=Decimal("0.08"),
+                    maximum_settlement_days=default_policy.maximum_settlement_days,
+                    maximum_book_age_seconds=default_policy.maximum_book_age_seconds,
+                    per_trade_limit=default_policy.per_trade_limit,
+                    per_event_limit=default_policy.per_event_limit,
+                    portfolio_limit=default_policy.portfolio_limit,
+                    explicit_cost=default_policy.explicit_cost,
+                    risk_buffer=default_policy.risk_buffer,
+                    maximum_unhedged_seconds=default_policy.maximum_unhedged_seconds,
+                    maximum_unhedged_loss=default_policy.maximum_unhedged_loss,
+                    maximum_arrival_gap_seconds=default_policy.maximum_arrival_gap_seconds,
+                )
+            )
+            restarted_policy_store = PostgresRiskPolicyStore(sessions)
+            restored_policy = await restarted_policy_store.initialize()
+            assert default_policy.minimum_roi == Decimal("0.03")
+            assert restored_policy == changed_policy
+            assert restored_policy.minimum_roi == Decimal("0.08")
             repository = PostgresIntegrationConfigRepository(sessions)
             try:
                 first = await repository.upsert(

@@ -68,3 +68,13 @@ def test_projection_migrations_tolerate_preexisting_test_tables(monkeypatch) -> 
             {"if_not_exists": True},
             {"if_not_exists": True},
         ]
+
+
+def test_risk_policy_migration_tolerates_table_created_by_current_metadata(monkeypatch) -> None:
+    migration = load_migration("0007_risk_policy_versions.py")
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(migration.op, "create_table", record_kwargs(calls))
+
+    migration.upgrade()
+
+    assert calls == [{"if_not_exists": True}]

@@ -11,6 +11,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    Uuid,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -19,6 +20,24 @@ from backend.app.db.base import Base, IdTimestampMixin
 
 # Financial values retain venue precision and are never stored as IEEE floats.
 MONEY = Numeric(38, 18)
+
+
+class RiskPolicyVersion(Base):
+    __tablename__ = "risk_policy_version"
+
+    version: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    minimum_roi: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    maximum_settlement_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    maximum_book_age_seconds: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    per_trade_limit: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    per_event_limit: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    portfolio_limit: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    explicit_cost: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    risk_buffer: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    maximum_unhedged_seconds: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    maximum_unhedged_loss: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    maximum_arrival_gap_seconds: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
 
 
 class VenueMarket(IdTimestampMixin, Base):

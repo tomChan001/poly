@@ -20,6 +20,7 @@ def test_initial_schema_contains_all_durable_business_tables() -> None:
         "audit_event",
         "outbox_event",
         "system_control",
+        "risk_policy_version",
     }
 
     assert set(Base.metadata.tables) == expected
