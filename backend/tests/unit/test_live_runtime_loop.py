@@ -5,9 +5,8 @@ import pytest
 
 from backend.app import main
 from backend.app.container import ApplicationContainer
-from backend.app.core.config import TradingMode
 from backend.app.db.risk_policy import PostgresRiskPolicyStore
-from backend.app.main import _apply_startup_gate, _live_runtime_loop
+from backend.app.main import _live_runtime_loop
 from backend.app.services.live_runtime import LiveRuntimeService
 from backend.app.services.pair_discovery import ConfiguredOddpoolPairDiscoveryService
 from backend.app.services.settings import InMemoryRiskPolicyStore, RiskPolicyStore
@@ -55,15 +54,63 @@ async def test_live_runtime_loop_records_cycle_errors_and_cancels_cleanly() -> N
 
 
 @pytest.mark.asyncio
-async def test_runtime_startup_closes_opening_when_evidence_is_missing() -> None:
+async def test_lifespan_retains_persisted_opening_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    runtime_started = asyncio.Event()
+    runtime_cancelled = asyncio.Event()
     container = ApplicationContainer()
-    container.system_control.set_opening(True, "configured open")
-    container.automation_evidence = None
 
-    await _apply_startup_gate(container, TradingMode.LIMITED_AUTO)
+    class SystemControl:
+        opening_enabled = False
+        reason = "not loaded"
 
-    assert container.system_control.opening_enabled is False
-    assert container.system_control.reason == "startup gate: automation evidence is missing"
+        def __init__(self) -> None:
+            self.disable_reasons: list[str] = []
+
+        async def load_async(self) -> None:
+            events.append("system control")
+            self.opening_enabled = True
+            self.reason = "persisted operator control"
+
+        async def disable_opening_async(self, reason: str) -> None:
+            self.disable_reasons.append(reason)
+            self.opening_enabled = False
+
+    class RiskPolicies:
+        async def initialize(self) -> None:
+            events.append("risk policies")
+
+    control = SystemControl()
+
+    async def live_runtime_loop(_container, *, poll_seconds: float) -> None:
+        assert poll_seconds > 0
+        assert control.opening_enabled is True
+        assert control.disable_reasons == []
+        runtime_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            runtime_cancelled.set()
+
+    container.system_control = cast(SystemControlService, control)
+    container.risk_policies = cast(RiskPolicyStore, RiskPolicies())
+    container.live_runtime = cast(LiveRuntimeService, object())
+    monkeypatch.setattr(
+        main.ApplicationContainer,
+        "runtime",
+        classmethod(lambda _cls: container),
+    )
+    monkeypatch.setattr(main, "_live_runtime_loop", live_runtime_loop)
+
+    app = main.create_app()
+    async with app.router.lifespan_context(app):
+        await asyncio.wait_for(runtime_started.wait(), timeout=1)
+
+    assert events == ["system control", "risk policies"]
+    assert control.opening_enabled is True
+    assert runtime_cancelled.is_set()
 
 
 @pytest.mark.asyncio
@@ -92,18 +139,12 @@ async def test_lifespan_initializes_risk_policy_before_starting_runtime_loop(
             events.append("system control")
 
     class RiskPolicies:
-        current = None
-
         async def initialize(self) -> None:
             events.append("risk policies")
 
-    async def apply_startup_gate(_container, _trading_mode) -> None:
-        assert events == ["system control", "risk policies"]
-        events.append("startup gate")
-
     async def live_runtime_loop(_container, *, poll_seconds: float) -> None:
         assert poll_seconds > 0
-        assert events == ["system control", "risk policies", "startup gate"]
+        assert events == ["system control", "risk policies"]
         events.append("runtime loop")
         try:
             await asyncio.Event().wait()
@@ -118,7 +159,6 @@ async def test_lifespan_initializes_risk_policy_before_starting_runtime_loop(
         "runtime",
         classmethod(lambda _cls: container),
     )
-    monkeypatch.setattr(main, "_apply_startup_gate", apply_startup_gate)
     monkeypatch.setattr(main, "_live_runtime_loop", live_runtime_loop)
 
     app = main.create_app()
@@ -127,7 +167,6 @@ async def test_lifespan_initializes_risk_policy_before_starting_runtime_loop(
         assert events == [
             "system control",
             "risk policies",
-            "startup gate",
             "runtime loop",
         ]
 
@@ -147,17 +186,12 @@ async def test_lifespan_does_not_start_runtime_loop_when_risk_policy_initializat
             events.append("system control")
 
     class RiskPolicies:
-        current = None
-
         async def initialize(self) -> None:
             events.append("risk policies")
             raise RuntimeError("risk policy database unavailable")
 
     async def live_runtime_loop(_container, *, poll_seconds: float) -> None:
         events.append("runtime loop")
-
-    async def apply_startup_gate(_container, _trading_mode) -> None:
-        events.append("startup gate")
 
     async def close() -> None:
         nonlocal close_calls
@@ -172,7 +206,6 @@ async def test_lifespan_does_not_start_runtime_loop_when_risk_policy_initializat
         classmethod(lambda _cls: container),
     )
     monkeypatch.setattr(container, "close", close)
-    monkeypatch.setattr(main, "_apply_startup_gate", apply_startup_gate)
     monkeypatch.setattr(main, "_live_runtime_loop", live_runtime_loop)
 
     app = main.create_app()

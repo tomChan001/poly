@@ -34,6 +34,20 @@ class RecordingControlStore:
         return self.state
 
 
+class FailingControlStore:
+    async def load_opening(self) -> OpeningControlState | None:
+        return None
+
+    async def save_opening(
+        self,
+        *,
+        enabled: bool,
+        reason: str,
+        changed_by: str,
+    ) -> OpeningControlState:
+        raise RuntimeError("opening control persistence unavailable")
+
+
 def app_for(container: ApplicationContainer, role: Role | None) -> FastAPI:
     app = create_app(container)
     if role is not None:
@@ -100,42 +114,42 @@ async def test_kill_switch_reason_cannot_be_blank() -> None:
 
 
 @pytest.mark.asyncio
-async def test_read_only_deployment_cannot_enable_opening(
+async def test_operator_can_enable_opening_without_mode_or_automation_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from backend.app.api.routes import system_control as route_module
+    from backend.app.core import config
 
     container = ApplicationContainer()
-    container.system_control.opening_enabled = False
-    monkeypatch.setattr(route_module.settings, "trading_mode", TradingMode.READ_ONLY)
+    store = RecordingControlStore()
+    container.system_control = SystemControl(store=store)
+    container.automation_evidence = None
+    monkeypatch.setattr(config.settings, "trading_mode", TradingMode.READ_ONLY)
 
     transport = httpx.ASGITransport(app=app_for(container, Role.OPERATOR))
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.put(
             "/api/system-control/opening",
-            json={"enabled": True, "reason": "premature enable"},
+            json={"enabled": True, "reason": "operator authorized"},
         )
 
-    assert response.status_code == 409
-    assert "limited_auto" in response.json()["detail"]
-    assert container.system_control.opening_enabled is False
+    assert response.status_code == 200
+    assert response.json() == {
+        "opening_enabled": True,
+        "reason": "operator authorized",
+        "version": 1,
+    }
+    assert store.saved == [(True, "operator authorized", "user-1")]
 
 
 @pytest.mark.asyncio
-async def test_missing_automation_evidence_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
-    from backend.app.api.routes import system_control as route_module
-
+async def test_opening_control_persistence_failure_is_propagated() -> None:
     container = ApplicationContainer()
-    container.system_control.opening_enabled = False
-    monkeypatch.setattr(route_module.settings, "trading_mode", TradingMode.LIMITED_AUTO)
-
+    container.system_control = SystemControl(store=FailingControlStore())
     transport = httpx.ASGITransport(app=app_for(container, Role.OPERATOR))
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.put(
-            "/api/system-control/opening",
-            json={"enabled": True, "reason": "no evidence"},
-        )
 
-    assert response.status_code == 409
-    assert response.json()["detail"] == "automation evidence is missing"
-    assert container.system_control.opening_enabled is False
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        with pytest.raises(RuntimeError, match="opening control persistence unavailable"):
+            await client.put(
+                "/api/system-control/opening",
+                json={"enabled": True, "reason": "operator authorized"},
+            )

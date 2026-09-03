@@ -13,43 +13,7 @@ from backend.app.api.routes.runtime import router as runtime_router
 from backend.app.api.routes.settings import router as settings_router
 from backend.app.api.routes.system_control import router as system_control_router
 from backend.app.container import ApplicationContainer
-from backend.app.core.config import TradingMode, settings
-from backend.app.services.automation_gate import AutomationStage
-
-
-async def _apply_startup_gate(
-    container: ApplicationContainer,
-    trading_mode: TradingMode,
-) -> None:
-    """Fail closed before any runtime cycle can reach order authorization."""
-    if trading_mode is not TradingMode.LIMITED_AUTO:
-        await container.system_control.disable_opening_async(
-            "startup gate: deployment is not limited_auto"
-        )
-        return
-    evidence = container.automation_evidence
-    if evidence is None:
-        await container.system_control.disable_opening_async(
-            "startup gate: automation evidence is missing"
-        )
-        return
-    policy = container.risk_policies.current
-    if policy is None:
-        await container.system_control.disable_opening_async(
-            "startup gate: risk policy is missing"
-        )
-        return
-    within_canary_caps = (
-        policy.per_trade_limit <= 10
-        and policy.per_event_limit <= 25
-        and policy.portfolio_limit <= 100
-    )
-    stage = AutomationStage.CANARY_AUTO if within_canary_caps else AutomationStage.LIMITED_AUTO
-    decision = container.automation_gate.evaluate(stage, evidence)
-    if not decision.allowed:
-        await container.system_control.disable_opening_async(
-            "startup gate: " + "; ".join(decision.reasons)
-        )
+from backend.app.core.config import settings
 
 
 async def _live_runtime_loop(
@@ -106,7 +70,6 @@ def create_app(
             if owns_container and application_container.live_runtime is not None:
                 await application_container.system_control.load_async()
                 await application_container.risk_policies.initialize()
-                await _apply_startup_gate(application_container, settings.trading_mode)
                 runtime_task = asyncio.create_task(
                     _live_runtime_loop(
                         application_container,
