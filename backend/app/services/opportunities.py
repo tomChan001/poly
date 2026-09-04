@@ -10,17 +10,17 @@ class OpportunityRecord:
     kalshi_outcome: str
     polymarket_outcome: str
     mapping_status: str
-    quantity: Decimal
-    kalshi_vwap: Decimal
-    polymarket_vwap: Decimal
-    total_fees: Decimal
-    deployed_capital: Decimal
-    payout: Decimal
-    profit_floor: Decimal
-    conservative_roi: Decimal
+    quantity: Decimal | None
+    kalshi_vwap: Decimal | None
+    polymarket_vwap: Decimal | None
+    total_fees: Decimal | None
+    deployed_capital: Decimal | None
+    payout: Decimal | None
+    profit_floor: Decimal | None
+    conservative_roi: Decimal | None
     expected_settlement_at: datetime
     worst_case_settlement_at: datetime
-    book_age_ms: int
+    book_age_ms: int | None
     rejection_reasons: tuple[str, ...]
     rule_versions: tuple[str, str] = field(default_factory=lambda: ("unavailable", "unavailable"))
     book_sequences: tuple[str, str] = field(
@@ -73,7 +73,12 @@ class InMemoryOpportunityStore:
     def list_ranked(self) -> list[OpportunityRecord]:
         return sorted(
             self._records.values(),
-            key=lambda item: (item.conservative_roi, item.profit_floor),
+            key=lambda item: (
+                item.conservative_roi is not None,
+                item.conservative_roi or Decimal(0),
+                item.profit_floor is not None,
+                item.profit_floor or Decimal(0),
+            ),
             reverse=True,
         )
 

@@ -1,3 +1,4 @@
+from dataclasses import replace
 from decimal import Decimal
 
 import httpx
@@ -12,11 +13,23 @@ from backend.app.services.opportunities import OpportunityRecord
 @pytest.mark.asyncio
 async def test_opportunities_are_sorted_by_roi_and_explain_rejections() -> None:
     container = ApplicationContainer()
+    rejected = replace(
+        OpportunityRecord.example("rejected", Decimal(0), ("STALE_BOOK",)),
+        quantity=None,
+        kalshi_vwap=None,
+        polymarket_vwap=None,
+        total_fees=None,
+        deployed_capital=None,
+        payout=None,
+        profit_floor=None,
+        conservative_roi=None,
+        book_age_ms=None,
+    )
     container.opportunities.replace(
         [
             OpportunityRecord.example("low", Decimal("0.04"), ()),
             OpportunityRecord.example("high", Decimal("0.08"), ()),
-            OpportunityRecord.example("rejected", Decimal(0), ("STALE_BOOK",)),
+            rejected,
         ]
     )
     app = create_app(container)
@@ -35,6 +48,13 @@ async def test_opportunities_are_sorted_by_roi_and_explain_rejections() -> None:
     assert body[-1]["rejection_reasons"] == ["STALE_BOOK"]
     assert body[-1]["rule_versions"] == ["unavailable", "unavailable"]
     assert body[-1]["fee_status"] == "unknown"
+    assert body[-1]["quantity"] is None
+    assert body[-1]["kalshi_vwap"] is None
+    assert body[-1]["polymarket_vwap"] is None
+    assert body[-1]["deployed_capital"] is None
+    assert body[-1]["profit_floor"] is None
+    assert body[-1]["conservative_roi"] is None
+    assert body[-1]["book_age_ms"] is None
 
 
 @pytest.mark.asyncio
