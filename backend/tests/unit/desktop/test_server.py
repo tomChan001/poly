@@ -1,11 +1,14 @@
 import asyncio
 import socket
+import sys
+from collections.abc import Coroutine, Generator
 from pathlib import Path
 from typing import Any, cast
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from backend.app.container import ApplicationContainer
 from backend.app.core.config import settings
@@ -38,6 +41,21 @@ def test_closing_server_socket_releases_the_listener() -> None:
         replacement.close()
 
 
+def test_live_server_socket_does_not_allow_a_second_listener() -> None:
+    sock = bind_loopback_socket()
+    competitor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) == 0
+        if sys.platform == "win32":
+            competitor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        with pytest.raises(OSError):
+            competitor.bind(sock.getsockname())
+            competitor.listen(socket.SOMAXCONN)
+    finally:
+        competitor.close()
+        sock.close()
+
+
 @pytest.mark.asyncio
 async def test_packaged_frontend_is_served_after_api_routes(tmp_path: Path) -> None:
     (tmp_path / "index.html").write_text(
@@ -58,6 +76,48 @@ def test_static_directory_requires_an_index_file(tmp_path: Path) -> None:
         ValueError, match="desktop static directory has no index.html"
     ):
         create_app(ApplicationContainer(), static_dir=tmp_path)
+
+
+def test_static_index_validation_uses_staticfiles_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "index.html").write_text("outside boundary", encoding="utf-8")
+    lookup_called = False
+
+    def reject_index(
+        _static_files: StaticFiles, path: str
+    ) -> tuple[str, None]:
+        nonlocal lookup_called
+        assert path == "index.html"
+        lookup_called = True
+        return "", None
+
+    monkeypatch.setattr(StaticFiles, "lookup_path", reject_index)
+
+    with pytest.raises(
+        ValueError, match="desktop static directory has no index.html"
+    ):
+        create_app(ApplicationContainer(), static_dir=tmp_path)
+
+    assert lookup_called is True
+
+
+def test_static_index_symlink_cannot_escape_static_directory(tmp_path: Path) -> None:
+    static_dir = tmp_path / "static"
+    static_dir.mkdir()
+    outside_index = tmp_path / "outside-index.html"
+    outside_index.write_text("outside boundary", encoding="utf-8")
+    try:
+        (static_dir / "index.html").symlink_to(outside_index)
+    except OSError as exc:
+        if sys.platform == "win32" and exc.winerror == 1314:
+            pytest.skip("creating symlinks requires Windows developer privileges")
+        raise
+
+    with pytest.raises(
+        ValueError, match="desktop static directory has no index.html"
+    ):
+        create_app(ApplicationContainer(), static_dir=static_dir)
 
 
 @pytest.mark.asyncio
@@ -144,6 +204,68 @@ class _StalledUvicornServer:
             raise
 
 
+class _SystemExitUvicornServer:
+    def __init__(self, _config: object) -> None:
+        self.started = False
+        self.should_exit = False
+
+    async def serve(self, *, sockets: list[socket.socket]) -> None:
+        del sockets
+        raise SystemExit(3)
+
+
+class _CompletedSystemExitTask:
+    def __init__(self) -> None:
+        self.failure = SystemExit(3)
+        self.exception_calls = 0
+
+    def done(self) -> bool:
+        return True
+
+    def cancelled(self) -> bool:
+        return False
+
+    def cancel(self) -> bool:
+        return False
+
+    def exception(self) -> BaseException:
+        self.exception_calls += 1
+        return self.failure
+
+    def __await__(self) -> Generator[Any, None, None]:
+        if False:
+            yield None
+        raise self.failure
+
+
+@pytest.mark.asyncio
+async def test_system_exit_during_start_is_observed_and_closes_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server_module.uvicorn, "Server", _SystemExitUvicornServer)
+    completed_task = _CompletedSystemExitTask()
+
+    def controlled_create_task(
+        coroutine: Coroutine[Any, Any, None],
+    ) -> _CompletedSystemExitTask:
+        coroutine.close()
+        return completed_task
+
+    monkeypatch.setattr(server_module.asyncio, "create_task", controlled_create_task)
+    subject = LoopbackServer(FastAPI())
+    owned_socket = subject.socket
+
+    with pytest.raises(SystemExit) as raised:
+        await subject.start()
+
+    assert raised.value is completed_task.failure
+    assert raised.value.code == 3
+    assert completed_task.exception_calls == 1
+    assert owned_socket.fileno() == -1
+    assert subject.server.should_exit is True
+    assert subject._stopped is True
+
+
 @pytest.mark.asyncio
 async def test_start_timeout_cancels_task_and_closes_socket(
     monkeypatch: pytest.MonkeyPatch,
@@ -159,6 +281,26 @@ async def test_start_timeout_cancels_task_and_closes_socket(
     stalled_server = cast(_StalledUvicornServer, subject.server)
     assert stalled_server.cancelled is True
     assert owned_socket.fileno() == -1
+
+
+@pytest.mark.asyncio
+async def test_external_start_cancellation_is_not_suppressed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server_module.uvicorn, "Server", _StalledUvicornServer)
+    subject = LoopbackServer(FastAPI())
+    start_task = asyncio.create_task(subject.start())
+    while subject._task is None:
+        await asyncio.sleep(0)
+
+    start_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await start_task
+
+    stalled_server = cast(_StalledUvicornServer, subject.server)
+    assert stalled_server.cancelled is True
+    assert subject.socket.fileno() == -1
+    assert subject._stopped is True
 
 
 class _FailingOnStopUvicornServer(_RecordingUvicornServer):

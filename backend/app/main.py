@@ -1,4 +1,5 @@
 import asyncio
+import stat
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -153,11 +154,15 @@ def create_app(
         }
 
     if static_dir is not None:
-        if not (static_dir / "index.html").is_file():
-            raise ValueError("desktop static directory has no index.html")
-        application.mount(
-            "/", StaticFiles(directory=static_dir, html=True), name="desktop-ui"
+        desktop_ui = StaticFiles(
+            directory=static_dir,
+            html=True,
+            check_dir=False,
         )
+        _, index_stat = desktop_ui.lookup_path("index.html")
+        if index_stat is None or not stat.S_ISREG(index_stat.st_mode):
+            raise ValueError("desktop static directory has no index.html")
+        application.mount("/", desktop_ui, name="desktop-ui")
 
     return application
 

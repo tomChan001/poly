@@ -12,7 +12,6 @@ _STARTUP_POLL_SECONDS = 0.01
 def bind_loopback_socket() -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("127.0.0.1", 0))
         sock.listen(socket.SOMAXCONN)
         sock.setblocking(False)
@@ -82,9 +81,29 @@ class LoopbackServer:
     async def _abort_startup(self) -> None:
         self._stopped = True
         self.server.should_exit = True
-        if self._task is not None:
-            if not self._task.done():
-                self._task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
+        try:
+            if self._task is None:
+                return
+            if self._task.done():
+                with suppress(BaseException):
+                    self._task.exception()
+                return
+
+            current_task = asyncio.current_task()
+            cancellation_count = (
+                current_task.cancelling() if current_task is not None else 0
+            )
+            self._task.cancel()
+            try:
                 await self._task
-        self.socket.close()
+            except asyncio.CancelledError:
+                externally_cancelled = (
+                    current_task is not None
+                    and current_task.cancelling() > cancellation_count
+                )
+                if externally_cancelled or not self._task.cancelled():
+                    raise
+            except BaseException:  # noqa: BLE001 - preserve the startup failure
+                return
+        finally:
+            self.socket.close()
