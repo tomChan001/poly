@@ -63,12 +63,7 @@ def get_current_principal(request: Request) -> Principal:
     # Local setup is restricted to the machine running this desktop service.
     # The loopback check keeps remote callers out while allowing the local web
     # configuration screen to work when real trading is the configured mode.
-    if (
-        settings.local_setup_enabled
-        and is_loopback_request(request)
-        and _has_trusted_local_origin(request)
-        and request.app.state.allow_local_setup
-    ):
+    if is_local_setup_request(request):
         desktop_session = getattr(request.app.state, "desktop_session", None)
         if desktop_session is not None and not desktop_session.is_authorized(request):
             raise HTTPException(
@@ -84,6 +79,15 @@ def get_current_principal(request: Request) -> Principal:
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="local access only",
+    )
+
+
+def is_local_setup_request(request: Request) -> bool:
+    return bool(
+        settings.local_setup_enabled
+        and is_loopback_request(request)
+        and _has_trusted_local_origin(request)
+        and request.app.state.allow_local_setup
     )
 
 

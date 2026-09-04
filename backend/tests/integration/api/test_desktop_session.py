@@ -1,3 +1,5 @@
+from dataclasses import fields
+
 import httpx
 import pytest
 
@@ -16,6 +18,7 @@ async def test_desktop_api_requires_capability_cookie(monkeypatch) -> None:
         allow_local_setup=True,
         desktop_session=session,
     )
+    bootstrap_path = session.bootstrap_path
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 51000))
     async with httpx.AsyncClient(
         transport=transport,
@@ -23,13 +26,13 @@ async def test_desktop_api_requires_capability_cookie(monkeypatch) -> None:
     ) as client:
         denied = await client.get("/api/opportunities")
         denied_health = await client.get("/health")
-        bootstrap = await client.get(session.bootstrap_path, follow_redirects=False)
+        bootstrap = await client.get(bootstrap_path, follow_redirects=False)
         allowed = await client.get(
             "/api/opportunities",
             headers={"Origin": "http://127.0.0.1:49152"},
         )
         allowed_health = await client.get("/health")
-        replay = await client.get(session.bootstrap_path, follow_redirects=False)
+        replay = await client.get(bootstrap_path, follow_redirects=False)
 
     assert denied.status_code == 403
     assert denied_health.status_code == 403
@@ -40,6 +43,31 @@ async def test_desktop_api_requires_capability_cookie(monkeypatch) -> None:
     assert allowed.status_code == 200
     assert allowed_health.status_code == 200
     assert replay.status_code == 403
+
+
+def test_desktop_session_repr_redacts_secrets_and_exchange_discards_token() -> None:
+    session = DesktopSession.create()
+    bootstrap_path = session.bootstrap_path
+    bootstrap_token = bootstrap_path.rsplit("/", maxsplit=1)[-1]
+    before_exchange = repr(session)
+
+    cookie_value = session.exchange(bootstrap_token)
+
+    assert cookie_value is not None
+    assert bootstrap_token not in before_exchange
+    assert cookie_value not in before_exchange
+    assert bootstrap_token not in repr(session)
+    assert cookie_value not in repr(session)
+    with pytest.raises(RuntimeError, match="desktop bootstrap already used"):
+        session.bootstrap_path.startswith("/desktop/")
+
+    stored_string_values = [
+        value
+        for descriptor in fields(session)
+        if isinstance(value := getattr(session, descriptor.name), str)
+    ]
+    assert bootstrap_path not in stored_string_values
+    assert bootstrap_token not in stored_string_values
 
 
 @pytest.mark.asyncio
@@ -125,6 +153,91 @@ async def test_bootstrap_cookie_flags_and_value_are_not_the_url_token() -> None:
     assert "SameSite=strict" in set_cookie
     assert "Path=/" in set_cookie
     assert "Secure" not in set_cookie
+
+
+@pytest.mark.asyncio
+async def test_desktop_health_rejects_bogus_cookie_from_loopback(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "local_setup_enabled", True)
+    session = DesktopSession.create()
+    app = create_app(
+        ApplicationContainer(),
+        allow_local_setup=True,
+        desktop_session=session,
+    )
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 51000))
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        response = await client.get(
+            "/health",
+            headers={"Cookie": f"{COOKIE_NAME}=bogus"},
+        )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "desktop session required"}
+
+
+@pytest.mark.asyncio
+async def test_desktop_health_rejects_valid_cookie_from_remote_client(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(settings, "local_setup_enabled", True)
+    session = DesktopSession.create()
+    app = create_app(
+        ApplicationContainer(),
+        allow_local_setup=True,
+        desktop_session=session,
+    )
+    bootstrap_path = session.bootstrap_path
+    loopback_transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 51000))
+    async with httpx.AsyncClient(
+        transport=loopback_transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        bootstrap = await client.get(bootstrap_path, follow_redirects=False)
+    cookie_value = bootstrap.cookies[COOKIE_NAME]
+
+    remote_transport = httpx.ASGITransport(app=app, client=("192.0.2.10", 51000))
+    async with httpx.AsyncClient(
+        transport=remote_transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        response = await client.get(
+            "/health",
+            headers={"Cookie": f"{COOKIE_NAME}={cookie_value}"},
+        )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "local access only"}
+
+
+@pytest.mark.asyncio
+async def test_desktop_health_rejects_valid_cookie_with_hostile_origin(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(settings, "local_setup_enabled", True)
+    session = DesktopSession.create()
+    app = create_app(
+        ApplicationContainer(),
+        allow_local_setup=True,
+        desktop_session=session,
+    )
+    bootstrap_path = session.bootstrap_path
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 51000))
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.get(bootstrap_path, follow_redirects=False)
+        response = await client.get(
+            "/health",
+            headers={"Origin": "https://evil.example"},
+        )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "local access only"}
 
 
 @pytest.mark.asyncio

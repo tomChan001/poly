@@ -15,7 +15,7 @@ from backend.app.api.routes.settings import router as settings_router
 from backend.app.api.routes.system_control import router as system_control_router
 from backend.app.container import ApplicationContainer
 from backend.app.core.config import settings
-from backend.app.core.security import is_loopback_request
+from backend.app.core.security import is_local_setup_request, is_loopback_request
 from backend.app.desktop.session import COOKIE_NAME, DesktopSession
 from backend.app.services.system_control import OpeningControlPersistenceError
 
@@ -129,8 +129,11 @@ def create_app(
 
     @application.get("/health")
     async def health(request: Request) -> dict[str, object]:
-        if desktop_session is not None and not desktop_session.is_authorized(request):
-            raise HTTPException(status_code=403, detail="desktop session required")
+        if desktop_session is not None:
+            if not is_local_setup_request(request):
+                raise HTTPException(status_code=403, detail="local access only")
+            if not desktop_session.is_authorized(request):
+                raise HTTPException(status_code=403, detail="desktop session required")
         # The UI must display the same two switches used by order execution;
         # returning both prevents a hard-coded banner from drifting from reality.
         try:

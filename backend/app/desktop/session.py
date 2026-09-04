@@ -9,13 +9,9 @@ COOKIE_NAME = "poly_desktop_session"
 
 @dataclass(slots=True)
 class DesktopSession:
-    _bootstrap_token: str
-    _cookie_value: str
+    _bootstrap_token: str = field(repr=False)
+    _cookie_value: str = field(repr=False)
     _bootstrap_used: bool = field(default=False, init=False)
-    _bootstrap_path: str = field(init=False)
-
-    def __post_init__(self) -> None:
-        self._bootstrap_path = f"/desktop/bootstrap/{self._bootstrap_token}"
 
     @classmethod
     def create(cls) -> "DesktopSession":
@@ -23,7 +19,9 @@ class DesktopSession:
 
     @property
     def bootstrap_path(self) -> str:
-        return self._bootstrap_path
+        if self._bootstrap_used:
+            raise RuntimeError("desktop bootstrap already used")
+        return f"/desktop/bootstrap/{self._bootstrap_token}"
 
     def exchange(self, supplied: str) -> str | None:
         if self._bootstrap_used or not compare_digest(supplied, self._bootstrap_token):
