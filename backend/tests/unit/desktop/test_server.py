@@ -1,7 +1,6 @@
 import asyncio
 import socket
 import sys
-from collections.abc import Coroutine, Generator
 from pathlib import Path
 from typing import Any, cast
 
@@ -13,7 +12,11 @@ from fastapi.staticfiles import StaticFiles
 from backend.app.container import ApplicationContainer
 from backend.app.core.config import settings
 from backend.app.desktop import server as server_module
-from backend.app.desktop.server import LoopbackServer, bind_loopback_socket
+from backend.app.desktop.server import (
+    LoopbackServer,
+    LoopbackStartupError,
+    bind_loopback_socket,
+)
 from backend.app.desktop.session import DesktopSession
 from backend.app.main import create_app
 
@@ -214,53 +217,22 @@ class _SystemExitUvicornServer:
         raise SystemExit(3)
 
 
-class _CompletedSystemExitTask:
-    def __init__(self) -> None:
-        self.failure = SystemExit(3)
-        self.exception_calls = 0
-
-    def done(self) -> bool:
-        return True
-
-    def cancelled(self) -> bool:
-        return False
-
-    def cancel(self) -> bool:
-        return False
-
-    def exception(self) -> BaseException:
-        self.exception_calls += 1
-        return self.failure
-
-    def __await__(self) -> Generator[Any, None, None]:
-        if False:
-            yield None
-        raise self.failure
-
-
 @pytest.mark.asyncio
 async def test_system_exit_during_start_is_observed_and_closes_resources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(server_module.uvicorn, "Server", _SystemExitUvicornServer)
-    completed_task = _CompletedSystemExitTask()
-
-    def controlled_create_task(
-        coroutine: Coroutine[Any, Any, None],
-    ) -> _CompletedSystemExitTask:
-        coroutine.close()
-        return completed_task
-
-    monkeypatch.setattr(server_module.asyncio, "create_task", controlled_create_task)
     subject = LoopbackServer(FastAPI())
     owned_socket = subject.socket
 
-    with pytest.raises(SystemExit) as raised:
+    with pytest.raises(LoopbackStartupError) as raised:
         await subject.start()
 
-    assert raised.value is completed_task.failure
-    assert raised.value.code == 3
-    assert completed_task.exception_calls == 1
+    assert isinstance(raised.value.__cause__, SystemExit)
+    assert raised.value.__cause__.code == 3
+    assert subject._task is not None
+    assert subject._task.done()
+    assert subject._task.exception() is raised.value
     assert owned_socket.fileno() == -1
     assert subject.server.should_exit is True
     assert subject._stopped is True

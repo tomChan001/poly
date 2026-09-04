@@ -9,6 +9,10 @@ STARTUP_TIMEOUT_SECONDS = 10.0
 _STARTUP_POLL_SECONDS = 0.01
 
 
+class LoopbackStartupError(RuntimeError):
+    """Raised when Uvicorn exits instead of starting the loopback server."""
+
+
 def bind_loopback_socket() -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -47,9 +51,7 @@ class LoopbackServer:
         if self._stopped:
             raise RuntimeError("loopback server is already stopped")
         if self._task is None:
-            self._task = asyncio.create_task(
-                self.server.serve(sockets=[self.socket])
-            )
+            self._task = asyncio.create_task(self._serve())
         elif self.server.started and not self._task.done():
             return
 
@@ -66,6 +68,12 @@ class LoopbackServer:
         except BaseException:
             await self._abort_startup()
             raise
+
+    async def _serve(self) -> None:
+        try:
+            await self.server.serve(sockets=[self.socket])
+        except SystemExit as exc:
+            raise LoopbackStartupError("uvicorn exited during startup") from exc
 
     async def stop(self) -> None:
         if self._stopped:
