@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path, PurePath, PurePosixPath
+from pathlib import PurePath, PurePosixPath
 from typing import Any
 
 PROTOCOL_VERSION = 1
@@ -69,8 +69,5 @@ def parse_command(line: str) -> StartCommand | ShutdownCommand:
     return StartCommand(data_dir, runtime_dir, token)
 
 
-def _desktop_path(value: object) -> PurePath:
-    path = Path(str(value))
-    if path.is_absolute():
-        return path
+def _desktop_path(value: object) -> PurePosixPath:
     return PurePosixPath(str(value))

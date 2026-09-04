@@ -35,6 +35,17 @@ def test_protocol_rejects_relative_paths_and_unknown_fields() -> None:
         }))
 
 
+def test_protocol_rejects_windows_absolute_paths() -> None:
+    with pytest.raises(ValueError, match="absolute"):
+        parse_command(json.dumps({
+            "version": PROTOCOL_VERSION,
+            "command": "start",
+            "data_dir": r"C:\Users\alice\Library\Application Support\Poly",
+            "runtime_dir": "/private/tmp/poly-123",
+            "launch_token": "a" * 43,
+        }))
+
+
 def test_event_serialization_never_contains_launch_token() -> None:
     event = RuntimeEvent(RuntimeState.READY, {"port": 49152})
 
