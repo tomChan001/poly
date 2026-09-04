@@ -1,9 +1,11 @@
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 from backend.app.api.routes.executions import router as executions_router
 from backend.app.api.routes.integrations import router as integrations_router
@@ -64,6 +66,7 @@ def create_app(
     *,
     allow_local_setup: bool | None = None,
     desktop_session: DesktopSession | None = None,
+    static_dir: Path | None = None,
 ) -> FastAPI:
     owns_container = container is None
     application_container = container or ApplicationContainer.runtime()
@@ -148,6 +151,13 @@ def create_app(
             "opening_enabled": state.opening_enabled,
             "reason": state.reason,
         }
+
+    if static_dir is not None:
+        if not (static_dir / "index.html").is_file():
+            raise ValueError("desktop static directory has no index.html")
+        application.mount(
+            "/", StaticFiles(directory=static_dir, html=True), name="desktop-ui"
+        )
 
     return application
 
