@@ -11,8 +11,24 @@ interface OpportunitiesPageProps {
 }
 
 
-const money = (value: string) => `$${Number(value).toFixed(2)}`
-const percent = (value: string) => `${(Number(value) * 100).toFixed(2)}%`
+const unavailableValue = '—'
+const isUnavailable = <T,>(value: T | null | undefined): value is null | undefined => value == null
+const formatNumericString = (
+  value: string | null | undefined,
+  formatter: (numericValue: number) => string,
+) => {
+  if (isUnavailable(value)) {
+    return unavailableValue
+  }
+
+  return formatter(Number(value))
+}
+const money = (value: string | null | undefined) => formatNumericString(value, (numericValue) => `$${numericValue.toFixed(2)}`)
+const price = (value: string | null | undefined) => formatNumericString(value, (numericValue) => numericValue.toFixed(2))
+const percent = (value: string | null | undefined) => formatNumericString(value, (numericValue) => `${(numericValue * 100).toFixed(2)}%`)
+const quantity = (value: string | null | undefined) => formatNumericString(value, (numericValue) => numericValue.toFixed(0))
+const age = (value: number | null | undefined) => (isUnavailable(value) ? unavailableValue : `${value} ms`)
+const isStaleAge = (value: number | null | undefined) => !isUnavailable(value) && value > 2000
 const rejectionLabels: Record<string, string> = {
   FEE_UNKNOWN: '手续费规则未知',
   BELOW_MINIMUM_QUANTITY: '可执行数量低于市场最小值',
@@ -47,11 +63,13 @@ export function OpportunitiesPage({ opportunities, activeCount, loading }: Oppor
     })
   }, [opportunities, query, status])
 
-  const bestRoi = opportunities.length > 0
-    ? Math.max(...opportunities.map((item) => Number(item.conservative_roi)))
-    : 0
+  const roiValues = opportunities
+    .map((item) => item.conservative_roi)
+    .filter((value): value is string => value != null)
+    .map((value) => Number(value))
+  const bestRoi = roiValues.length > 0 ? Math.max(...roiValues) : null
   const totalCapital = opportunities.reduce(
-    (sum, item) => sum + Number(item.deployed_capital),
+    (sum, item) => sum + (item.deployed_capital == null ? 0 : Number(item.deployed_capital)),
     0,
   )
 
@@ -59,7 +77,7 @@ export function OpportunitiesPage({ opportunities, activeCount, loading }: Oppor
     <div className="page">
       <section className="metric-strip" aria-label="机会概览">
         <div><span>可执行机会</span><strong>{activeCount}</strong><small>当前快照</small></div>
-        <div><span>最高保守 ROI</span><strong className="positive">{(bestRoi * 100).toFixed(2)}%</strong><small>扣除费用与缓冲</small></div>
+        <div><span>最高保守 ROI</span><strong className={bestRoi == null ? '' : 'positive'}>{percent(bestRoi == null ? null : String(bestRoi))}</strong><small>扣除费用与缓冲</small></div>
         <div><span>预计占用资本</span><strong>${totalCapital.toFixed(2)}</strong><small>未提交</small></div>
         <div><span>待审核映射</span><strong className="warning">0</strong><small>需人工判断</small></div>
       </section>
@@ -117,20 +135,20 @@ export function OpportunitiesPage({ opportunities, activeCount, loading }: Oppor
                     <td>
                       <strong className="event-name">{item.event}</strong>
                       <span className={rejected ? 'status rejected' : 'status eligible'}>
-                        {rejected ? '已拒绝' : item.mapping_status.toUpperCase()}
+                        {rejected ? `已拒绝 · ${rejectionLabel(item.rejection_reasons[0])}` : item.mapping_status.toUpperCase()}
                       </span>
                     </td>
                     <td>
                       <div className="venue-pair">
-                        <span><i className="venue-dot kalshi" />K {item.kalshi_outcome} @{Number(item.kalshi_vwap).toFixed(2)}</span>
-                        <span><i className="venue-dot poly" />P {item.polymarket_outcome} @{Number(item.polymarket_vwap).toFixed(2)}</span>
+                        <span><i className="venue-dot kalshi" />K {item.kalshi_outcome} @{price(item.kalshi_vwap)}</span>
+                        <span><i className="venue-dot poly" />P {item.polymarket_outcome} @{price(item.polymarket_vwap)}</span>
                       </div>
                     </td>
-                    <td>{Number(item.quantity).toFixed(0)}</td>
+                    <td>{quantity(item.quantity)}</td>
                     <td>{money(item.deployed_capital)}</td>
-                    <td className={rejected ? '' : 'positive'}>{money(item.profit_floor)}</td>
-                    <td><strong className={rejected ? '' : 'positive'}>{percent(item.conservative_roi)}</strong></td>
-                    <td><span className={item.book_age_ms > 2000 ? 'age stale' : 'age'}>{item.book_age_ms} ms</span></td>
+                    <td className={rejected || item.profit_floor == null ? '' : 'positive'}>{money(item.profit_floor)}</td>
+                    <td><strong className={rejected || item.conservative_roi == null ? '' : 'positive'}>{percent(item.conservative_roi)}</strong></td>
+                    <td><span className={isStaleAge(item.book_age_ms) ? 'age stale' : 'age'}>{age(item.book_age_ms)}</span></td>
                     <td><ChevronRight size={17} /></td>
                   </tr>
                 )
@@ -156,13 +174,13 @@ export function OpportunitiesPage({ opportunities, activeCount, loading }: Oppor
           </div>
           <dl className="detail-grid">
             <div><dt>映射状态</dt><dd>{selected.mapping_status.toUpperCase()}</dd></div>
-            <div><dt>最优数量</dt><dd>{selected.quantity}</dd></div>
+            <div><dt>最优数量</dt><dd>{quantity(selected.quantity)}</dd></div>
             <div><dt>Kalshi VWAP</dt><dd>{money(selected.kalshi_vwap)}</dd></div>
             <div><dt>Polymarket VWAP</dt><dd>{money(selected.polymarket_vwap)}</dd></div>
             <div><dt>费用</dt><dd>{money(selected.total_fees)}</dd></div>
             <div><dt>费用状态</dt><dd>{selected.fee_status === 'unknown' || selected.rejection_reasons.includes('FEE_UNKNOWN') ? '未知（禁止执行）' : '已计算'}</dd></div>
-            <div><dt>行情年龄</dt><dd>{selected.book_age_ms} ms</dd></div>
-            <div><dt>保守 ROI</dt><dd className="positive">{percent(selected.conservative_roi)}</dd></div>
+            <div><dt>行情年龄</dt><dd>{age(selected.book_age_ms)}</dd></div>
+            <div><dt>保守 ROI</dt><dd className={selected.conservative_roi == null ? '' : 'positive'}>{percent(selected.conservative_roi)}</dd></div>
           </dl>
           <div className="drawer-section">
             <h3>拒绝原因</h3>
