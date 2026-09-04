@@ -1,4 +1,6 @@
 import asyncio
+import sys
+import traceback
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -9,6 +11,7 @@ import pytest
 
 from backend.app.desktop.postgres import (
     SHUTDOWN_TIMEOUT_SECONDS,
+    AsyncioSubprocessRunner,
     CompletedResult,
     PostgresManager,
     PostgresPaths,
@@ -29,12 +32,21 @@ class _Result(CompletedResult):
 
 
 class _Child:
-    def __init__(self, *, returncode: int | None = None, stall_once: bool = False):
+    def __init__(
+        self,
+        *,
+        returncode: int | None = None,
+        stall_once: bool = False,
+        fail_wait_once: bool = False,
+    ) -> None:
         self.returncode = returncode
         self.stall_once = stall_once
+        self.fail_wait_once = fail_wait_once
         self.terminate_calls = 0
         self.kill_calls = 0
         self.wait_calls = 0
+        self.wait_started = asyncio.Event()
+        self.release_wait = asyncio.Event()
 
     def terminate(self) -> None:
         self.terminate_calls += 1
@@ -44,6 +56,10 @@ class _Child:
 
     async def wait(self) -> int:
         self.wait_calls += 1
+        self.wait_started.set()
+        if self.fail_wait_once and self.wait_calls == 1:
+            await self.release_wait.wait()
+            raise RuntimeError("cleanup failed")
         if self.stall_once and self.wait_calls == 1:
             await asyncio.Event().wait()
         self.returncode = 0
@@ -194,6 +210,61 @@ def test_client_command_builders_use_only_the_private_socket(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_asyncio_runner_captures_output_and_exit_code() -> None:
+    runner = AsyncioSubprocessRunner()
+
+    result = await runner.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; print('runner stdout'); "
+                "print('runner stderr', file=sys.stderr); sys.exit(7)"
+            ),
+        ],
+        timeout=2,
+    )
+
+    assert result.returncode == 7
+    assert result.stdout.strip() == "runner stdout"
+    assert result.stderr.strip() == "runner stderr"
+
+
+@pytest.mark.asyncio
+async def test_asyncio_runner_enforces_run_timeout() -> None:
+    runner = AsyncioSubprocessRunner()
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            runner.run(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                timeout=0.03,
+            ),
+            timeout=1,
+        )
+    assert loop.time() - started_at < 0.5
+
+
+@pytest.mark.asyncio
+async def test_asyncio_runner_spawns_terminates_and_waits_for_child(
+    tmp_path: Path,
+) -> None:
+    runner = AsyncioSubprocessRunner()
+    child = await runner.spawn(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        log_file=tmp_path / "child.log",
+    )
+
+    child.terminate()
+    await asyncio.wait_for(child.wait(), timeout=2)
+
+    assert child.returncode is not None
+    assert (tmp_path / "child.log").is_file()
+
+
+@pytest.mark.asyncio
 async def test_first_start_runs_commands_in_security_order(tmp_path: Path) -> None:
     paths = PostgresPaths.for_test(tmp_path)
     runner = _successful_runner(database_exists=False)
@@ -245,6 +316,31 @@ async def test_existing_database_skips_createdb(tmp_path: Path) -> None:
     await subject.start()
 
     assert build_createdb_command(paths) not in [call[1] for call in runner.calls]
+    await subject.stop()
+
+
+@pytest.mark.asyncio
+async def test_restart_reaps_exited_owned_child_before_replacement(
+    tmp_path: Path,
+) -> None:
+    paths = PostgresPaths.for_test(tmp_path)
+    paths.data_dir.mkdir()
+    (paths.data_dir / "PG_VERSION").write_text("16", encoding="ascii")
+    first_child = _Child()
+    runner = _Runner(
+        [_Result(), _Result(stdout="1"), _Result(), _Result(stdout="1")],
+        child=first_child,
+    )
+    subject = PostgresManager(paths, runner=runner)
+    await subject.start()
+    first_child.returncode = 1
+    replacement_child = _Child()
+    runner.child = replacement_child
+
+    await subject.start()
+
+    assert first_child.wait_calls == 1
+    assert [kind for kind, _, _ in runner.calls].count("spawn") == 2
     await subject.stop()
 
 
@@ -369,6 +465,64 @@ async def test_start_failures_are_sanitized_and_clean_up_owned_child(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("results", "spawn_error", "expected_message"),
+    [
+        pytest.param(
+            [RuntimeError("SECRET from cause")],
+            None,
+            "postgres init failed",
+            id="init",
+        ),
+        pytest.param(
+            [_Result()],
+            RuntimeError("SECRET from cause"),
+            "postgres start failed",
+            id="spawn",
+        ),
+        pytest.param(
+            [_Result(), RuntimeError("SECRET from cause")],
+            None,
+            "postgres readiness failed",
+            id="readiness",
+        ),
+        pytest.param(
+            [_Result(), _Result(), RuntimeError("SECRET from cause")],
+            None,
+            "postgres database check failed",
+            id="query",
+        ),
+        pytest.param(
+            [
+                _Result(),
+                _Result(),
+                _Result(stdout=""),
+                RuntimeError("SECRET from cause"),
+            ],
+            None,
+            "postgres database creation failed",
+            id="createdb",
+        ),
+    ],
+)
+async def test_runner_exception_cause_is_not_exposed(
+    tmp_path: Path,
+    results: list[_Result | BaseException],
+    spawn_error: BaseException | None,
+    expected_message: str,
+) -> None:
+    runner = _Runner(results, spawn_error=spawn_error)
+    subject = PostgresManager(PostgresPaths.for_test(tmp_path), runner=runner)
+
+    with pytest.raises(PostgresRuntimeError, match=expected_message) as raised:
+        await subject.start()
+
+    formatted = "".join(traceback.format_exception(raised.value))
+    assert "SECRET from cause" not in formatted
+    assert raised.value.__cause__ is None
+
+
+@pytest.mark.asyncio
 async def test_cancellation_after_spawn_cleans_up_and_propagates(
     tmp_path: Path,
 ) -> None:
@@ -381,6 +535,23 @@ async def test_cancellation_after_spawn_cleans_up_and_propagates(
 
     assert child.terminate_calls == 1
     assert child.wait_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_start_failure_is_not_overwritten_by_cleanup_failure(
+    tmp_path: Path,
+) -> None:
+    child = _Child(fail_wait_once=True)
+    child.release_wait.set()
+    runner = _Runner([_Result(), _Result(returncode=3)], child=child)
+    subject = PostgresManager(PostgresPaths.for_test(tmp_path), runner=runner)
+
+    with pytest.raises(PostgresRuntimeError, match="postgres readiness failed"):
+        await subject.start()
+
+    await subject.stop()
+    assert child.terminate_calls == 2
+    assert child.wait_calls == 2
 
 
 @pytest.mark.asyncio
@@ -484,6 +655,64 @@ async def test_stop_kills_owned_child_after_graceful_timeout(tmp_path: Path) -> 
 
     assert child.terminate_calls == 1
     assert child.kill_calls == 1
+    assert child.wait_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stop_finishes_owned_cleanup_before_propagating(
+    tmp_path: Path,
+) -> None:
+    paths = PostgresPaths.for_test(tmp_path)
+    child = _Child(stall_once=True)
+    runner = _successful_runner()
+    runner.child = child
+    subject = PostgresManager(paths, runner=runner, shutdown_timeout=0.03)
+    await subject.start()
+
+    stop_task = asyncio.create_task(subject.stop())
+    await asyncio.wait_for(child.wait_started.wait(), timeout=0.1)
+    stop_task.cancel()
+    await asyncio.sleep(0)
+
+    assert stop_task.done() is False
+    assert child.terminate_calls == 1
+    concurrent_stop = asyncio.create_task(subject.stop())
+    await asyncio.sleep(0)
+    assert concurrent_stop.done() is False
+    with pytest.raises(asyncio.CancelledError):
+        await stop_task
+    await concurrent_stop
+    assert child.kill_calls == 1
+    assert child.wait_calls == 2
+
+    await subject.stop()
+    assert child.terminate_calls == 1
+    assert child.kill_calls == 1
+    assert child.wait_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stop_preserves_cancellation_and_failed_child_ownership(
+    tmp_path: Path,
+) -> None:
+    paths = PostgresPaths.for_test(tmp_path)
+    child = _Child(fail_wait_once=True)
+    runner = _successful_runner()
+    runner.child = child
+    subject = PostgresManager(paths, runner=runner, shutdown_timeout=1)
+    await subject.start()
+
+    stop_task = asyncio.create_task(subject.stop())
+    await asyncio.wait_for(child.wait_started.wait(), timeout=0.1)
+    stop_task.cancel()
+    await asyncio.sleep(0)
+    child.release_wait.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await stop_task
+    await subject.stop()
+
+    assert child.terminate_calls == 2
     assert child.wait_calls == 2
 
 

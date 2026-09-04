@@ -262,12 +262,14 @@ class PostgresManager:
         self._monotonic = monotonic or time.monotonic
         self._sleep = sleep or asyncio.sleep
         self._child: OwnedChild | None = None
+        self._cleanup_child: OwnedChild | None = None
+        self._cleanup_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         if self._child is not None:
             if self._child.returncode is None:
                 return
-            self._child = None
+            await self.stop()
 
         try:
             self._prepare_directories()
@@ -282,8 +284,8 @@ class PostgresManager:
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                raise PostgresRuntimeError("postgres start failed") from exc
+            except Exception:  # noqa: BLE001 - sanitize the process boundary
+                raise PostgresRuntimeError("postgres start failed") from None
             self._child = child
 
             await self._wait_until_ready(child)
@@ -297,14 +299,43 @@ class PostgresManager:
                     "postgres database creation failed",
                 )
         except BaseException:
-            await self.stop()
+            try:
+                await self.stop()
+            except asyncio.CancelledError:
+                raise
+            except Exception as cleanup_error:  # noqa: BLE001
+                del cleanup_error  # Preserve the original startup failure.
             raise
 
     async def stop(self) -> None:
         child = self._child
-        self._child = None
         if child is None:
             return
+
+        cleanup_task = self._cleanup_task
+        if cleanup_task is None:
+            cleanup_task = asyncio.create_task(self._stop_child(child))
+            self._cleanup_child = child
+            self._cleanup_task = cleanup_task
+        elif self._cleanup_child is not child:
+            raise PostgresRuntimeError("postgres shutdown ownership conflict")
+
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            while not cleanup_task.done():
+                with suppress(BaseException):
+                    await asyncio.shield(cleanup_task)
+            cleanup_succeeded = self._task_succeeded(cleanup_task)
+            self._finish_cleanup(child, cleanup_task, cleanup_succeeded)
+            raise
+        except BaseException:
+            self._finish_cleanup(child, cleanup_task, succeeded=False)
+            raise
+        else:
+            self._finish_cleanup(child, cleanup_task, succeeded=True)
+
+    async def _stop_child(self, child: OwnedChild) -> None:
         if child.returncode is not None:
             await child.wait()
             return
@@ -316,6 +347,27 @@ class PostgresManager:
             child.kill()
             await child.wait()
 
+    @staticmethod
+    def _task_succeeded(task: asyncio.Task[None]) -> bool:
+        try:
+            task.result()
+        except BaseException:  # noqa: BLE001 - inspect the task without leaking it
+            return False
+        return True
+
+    def _finish_cleanup(
+        self,
+        child: OwnedChild,
+        cleanup_task: asyncio.Task[None],
+        succeeded: bool,
+    ) -> None:
+        if self._cleanup_task is not cleanup_task:
+            return
+        self._cleanup_task = None
+        self._cleanup_child = None
+        if succeeded and self._child is child:
+            self._child = None
+
     def _prepare_directories(self) -> None:
         try:
             self._reject_symlink_directories()
@@ -326,8 +378,8 @@ class PostgresManager:
                 self._filesystem.chmod(directory, 0o700)
         except PostgresRuntimeError:
             raise
-        except Exception as exc:
-            raise PostgresRuntimeError("postgres filesystem setup failed") from exc
+        except Exception:  # noqa: BLE001 - sanitize the filesystem boundary
+            raise PostgresRuntimeError("postgres filesystem setup failed") from None
 
     def _reject_symlink_directories(self) -> None:
         checked_paths = (
@@ -345,8 +397,8 @@ class PostgresManager:
             result = await self._runner.run(command, timeout=self._command_timeout)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            raise PostgresRuntimeError(error_message) from exc
+        except Exception:  # noqa: BLE001 - sanitize the process boundary
+            raise PostgresRuntimeError(error_message) from None
         if result.returncode != 0:
             raise PostgresRuntimeError(error_message)
         return result
@@ -367,8 +419,8 @@ class PostgresManager:
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                raise PostgresRuntimeError("postgres readiness failed") from exc
+            except Exception:  # noqa: BLE001 - sanitize the process boundary
+                raise PostgresRuntimeError("postgres readiness failed") from None
 
             if child.returncode is not None:
                 raise PostgresRuntimeError("postgres exited during readiness")
