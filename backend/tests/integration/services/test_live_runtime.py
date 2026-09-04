@@ -33,7 +33,7 @@ from backend.app.services.integration_config import (
     IntegrationEnvironment,
     IntegrationProvider,
 )
-from backend.app.services.live_runtime import LiveRuntimeService
+from backend.app.services.live_runtime import BalanceTradingPort, LiveRuntimeService
 from backend.app.services.mappings import REQUIRED_REVIEW_ITEMS
 from backend.app.services.opportunities import (
     InMemoryOpportunityStore,
@@ -476,7 +476,7 @@ async def test_live_cycle_executes_reviewed_profitable_pair_once_per_book_sequen
     history = InMemoryExecutionStore()
     opportunities = InMemoryOpportunityStore()
     status = RuntimeStatusService(integrations, control)
-    ports = {
+    ports: dict[Venue, BalanceTradingPort] = {
         Venue.KALSHI: FakeTradingPort(Venue.KALSHI),
         Venue.POLYMARKET: FakeTradingPort(Venue.POLYMARKET),
     }
@@ -1148,7 +1148,7 @@ async def test_late_settlement_is_retained_as_structured_rejection() -> None:
     history = InMemoryExecutionStore()
     opportunities = InMemoryOpportunityStore()
     status = RuntimeStatusService(integrations, control)
-    ports = {
+    ports: dict[Venue, BalanceTradingPort] = {
         Venue.KALSHI: FakeTradingPort(Venue.KALSHI),
         Venue.POLYMARKET: FakeTradingPort(Venue.POLYMARKET),
     }
@@ -1219,9 +1219,11 @@ async def test_stale_book_is_retained_as_structured_rejection() -> None:
     history = InMemoryExecutionStore()
     opportunities = InMemoryOpportunityStore()
     status = RuntimeStatusService(integrations, control)
-    ports = {
-        Venue.KALSHI: FakeTradingPort(Venue.KALSHI),
-        Venue.POLYMARKET: FakeTradingPort(Venue.POLYMARKET),
+    kalshi_port = FakeTradingPort(Venue.KALSHI)
+    polymarket_port = FakeTradingPort(Venue.POLYMARKET)
+    ports: dict[Venue, BalanceTradingPort] = {
+        Venue.KALSHI: kalshi_port,
+        Venue.POLYMARKET: polymarket_port,
     }
     capital = CapitalLedger({})
     runtime = LiveRuntimeService(
@@ -1253,7 +1255,8 @@ async def test_stale_book_is_retained_as_structured_rejection() -> None:
     assert record.book_sequences == ("k-seq-stale", "p-seq-stale")
     assert await history.list() == []
     assert capital.reservations == {}
-    assert all(port.submissions == 0 for port in ports.values())
+    assert kalshi_port.submissions == 0
+    assert polymarket_port.submissions == 0
     runtime_view = await status.view()
     assert runtime_view.ready is True
     assert runtime_view.opening_enabled is False
@@ -1302,9 +1305,11 @@ async def test_below_minimum_quantity_retains_calculated_quote_metrics() -> None
     history = InMemoryExecutionStore()
     opportunities = InMemoryOpportunityStore()
     status = RuntimeStatusService(integrations, control)
-    ports = {
-        Venue.KALSHI: FakeTradingPort(Venue.KALSHI),
-        Venue.POLYMARKET: FakeTradingPort(Venue.POLYMARKET),
+    kalshi_port = FakeTradingPort(Venue.KALSHI)
+    polymarket_port = FakeTradingPort(Venue.POLYMARKET)
+    ports: dict[Venue, BalanceTradingPort] = {
+        Venue.KALSHI: kalshi_port,
+        Venue.POLYMARKET: polymarket_port,
     }
     runtime = LiveRuntimeService(
         integrations=integrations,
@@ -1333,4 +1338,5 @@ async def test_below_minimum_quantity_retains_calculated_quote_metrics() -> None
     assert record.conservative_roi is not None
     assert record.book_age_ms == 0
     assert await history.list() == []
-    assert all(port.submissions == 0 for port in ports.values())
+    assert kalshi_port.submissions == 0
+    assert polymarket_port.submissions == 0
