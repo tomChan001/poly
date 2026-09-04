@@ -27,6 +27,10 @@ def test_execution_capital_settlement_migration_backfills_and_indexes_candidates
 
     sql = "\n".join(statements)
     assert migration.down_revision == "0008_incident_remediation"
+    assert statements[0] == (
+        "ALTER TABLE alembic_version "
+        "ALTER COLUMN version_num TYPE VARCHAR(64)"
+    )
     assert "ADD COLUMN IF NOT EXISTS capital_settled BOOLEAN" in sql
     assert "WHEN record.state = 'submitted' THEN FALSE" in sql
     assert "FROM capital_reservation AS reservation" in sql
