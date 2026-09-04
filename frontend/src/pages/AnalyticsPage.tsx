@@ -11,7 +11,7 @@ interface AnalyticsPageProps {
 
 export function AnalyticsPage({ opportunities, executions }: AnalyticsPageProps) {
   const exact = opportunities.filter((item) => item.mapping_status === 'exact').length
-  const fresh = opportunities.filter((item) => item.book_age_ms <= 2000).length
+  const fresh = opportunities.filter((item) => item.book_age_ms != null && item.book_age_ms <= 2000).length
 
   return (
     <div className="page">
