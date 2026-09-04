@@ -13,3 +13,7 @@ test-results/
 *.log
 .idea/
 .vscode/
+build/
+packaging/macos/postgres/
+src-tauri/resources/poly-runtime/
+src-tauri/target/
