@@ -29,6 +29,15 @@ if [[ ! -x "${RUNTIME_EXECUTABLE}" ]]; then
   exit 1
 fi
 
+for program in initdb postgres pg_isready psql createdb; do
+  postgres_executable="${BUNDLE_DIR}/postgres/bin/${program}"
+  if [[ ! -x "${postgres_executable}" ]]; then
+    printf 'required PostgreSQL program is missing or not executable: %s\n' \
+      "${postgres_executable}" >&2
+    exit 1
+  fi
+done
+
 "${RUNTIME_EXECUTABLE}" --self-test
 file "${RUNTIME_EXECUTABLE}"
 find "${BUNDLE_DIR}" -type f -perm -111 -print0 | xargs -0 file

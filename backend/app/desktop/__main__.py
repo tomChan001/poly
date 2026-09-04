@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import inspect
+import os
 import stat
 import sys
 import tempfile
@@ -152,20 +153,15 @@ def self_test(
     *, project_root: Path | None = None, temp_root: Path | None = None
 ) -> RuntimeEvent:
     root = (project_root or packaged_project_root()).resolve()
-    required = [
+    required_files = [
         (root / "frontend" / "dist" / "index.html", root / "frontend" / "dist"),
         (root / "alembic.ini", root),
         (root / "migrations" / "env.py", root / "migrations"),
-        *(
-            (root / "postgres" / "bin" / name, root / "postgres" / "bin")
-            for name in (
-                "initdb",
-                "postgres",
-                "pg_isready",
-                "psql",
-                "createdb",
-            )
-        ),
+    ]
+    postgres_bin = root / "postgres" / "bin"
+    required_executables = [
+        (postgres_bin / name, postgres_bin)
+        for name in ("initdb", "postgres", "pg_isready", "psql", "createdb")
     ]
     library_root = root / "postgres" / "lib"
     try:
@@ -173,7 +169,14 @@ def self_test(
     except OSError:
         shared_libraries = []
     if (
-        any(not _is_safe_packaged_file(path, boundary) for path, boundary in required)
+        any(
+            not _is_safe_packaged_file(path, boundary)
+            for path, boundary in required_files
+        )
+        or any(
+            not _is_safe_packaged_executable(path, boundary)
+            for path, boundary in required_executables
+        )
         or not shared_libraries
         or any(
             not _is_safe_packaged_file(path, library_root) for path in shared_libraries
@@ -203,6 +206,10 @@ def _is_safe_packaged_file(path: Path, expected_subtree: Path) -> bool:
         and stat.S_ISREG(metadata.st_mode)
         and metadata.st_nlink == 1
     )
+
+
+def _is_safe_packaged_executable(path: Path, expected_subtree: Path) -> bool:
+    return _is_safe_packaged_file(path, expected_subtree) and os.access(path, os.X_OK)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

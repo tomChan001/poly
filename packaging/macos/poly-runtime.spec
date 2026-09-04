@@ -3,7 +3,7 @@
 import os
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import copy_metadata
 
 
 ROOT = Path(SPECPATH).resolve().parents[1]
@@ -48,22 +48,72 @@ datas = [
     (str(FRONTEND_DIST), "frontend/dist"),
     (str(POSTGRES_DIST), "postgres"),
 ]
+datas.extend(copy_metadata("keyring"))
 binaries = []
-hiddenimports = []
 
-# These packages use runtime imports, entry points, or optional native modules that
-# PyInstaller cannot reliably discover from the desktop entry point alone.
-for package_name in (
-    "keyring",
-    "sqlalchemy",
-    "asyncpg",
-    "uvicorn",
-    "py_clob_client_v2",
-):
-    package_datas, package_binaries, package_hiddenimports = collect_all(package_name)
-    datas.extend(package_datas)
-    binaries.extend(package_binaries)
-    hiddenimports.extend(package_hiddenimports)
+# Only modules reached through entry points, extension-module imports, or string
+# configuration need to be named here. Ordinary Python imports remain discoverable
+# by Analysis and must not be duplicated as data files.
+REQUIRED_HIDDENIMPORTS = (
+    "keyring.backends.chainer",
+    "keyring.backends.fail",
+    "keyring.backends.macOS",
+    "keyring.backends.macOS.api",
+    "sqlalchemy.dialects.postgresql.asyncpg",
+    "asyncpg.pgproto.pgproto",
+    "asyncpg.protocol.protocol",
+    "asyncpg.protocol.record",
+    "uvicorn.loops.auto",
+    "uvicorn.loops.uvloop",
+    "uvicorn.protocols.http.auto",
+    "uvicorn.protocols.http.httptools_impl",
+    "uvicorn.protocols.websockets.auto",
+    "uvicorn.protocols.websockets.websockets_sansio_impl",
+    "uvicorn.lifespan.on",
+    "py_clob_client_v2.client",
+    "py_clob_client_v2.clob_types",
+)
+FORBIDDEN_HIDDENIMPORT_PARTS = (".testing", ".tests", "_testbase")
+hiddenimports = sorted(set(REQUIRED_HIDDENIMPORTS))
+missing_hiddenimports = sorted(set(REQUIRED_HIDDENIMPORTS) - set(hiddenimports))
+forbidden_hiddenimports = [
+    name
+    for name in hiddenimports
+    if any(part in name for part in FORBIDDEN_HIDDENIMPORT_PARTS)
+]
+if missing_hiddenimports or forbidden_hiddenimports:
+    raise SystemExit(
+        "invalid targeted hidden imports: "
+        f"missing={missing_hiddenimports}, forbidden={forbidden_hiddenimports}"
+    )
+
+EXCLUDED_IMPORTS = (
+    "asyncpg._testbase",
+    "keyring.testing",
+    "keyring.backends.kwallet",
+    "keyring.backends.libsecret",
+    "keyring.backends.null",
+    "keyring.backends.SecretService",
+    "keyring.backends.Windows",
+    "sqlalchemy.testing",
+    "sqlalchemy.dialects.mssql",
+    "sqlalchemy.dialects.mysql",
+    "sqlalchemy.dialects.oracle",
+    "sqlalchemy.dialects.sqlite",
+    "sqlalchemy.ext.baked",
+    "MySQLdb",
+    "psycopg2",
+    "pysqlite2",
+    "uvicorn.__main__",
+    "uvicorn.lifespan.off",
+    "uvicorn.loops.asyncio",
+    "uvicorn.protocols.http.h11_impl",
+    "uvicorn.protocols.http.zttp_impl",
+    "uvicorn.protocols.websockets.websockets_impl",
+    "uvicorn.protocols.websockets.wsproto_impl",
+    "uvicorn.supervisors.statreload",
+    "uvicorn.workers",
+)
 
 a = Analysis(
     [str(ENTRY_POINT)],
@@ -74,7 +124,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=list(EXCLUDED_IMPORTS),
     noarchive=False,
     optimize=0,
 )

@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import stat
 import sys
 import threading
 import types
@@ -48,6 +49,9 @@ def populate_self_test_layout(root: Path) -> dict[str, Path]:
     for path in paths.values():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"packaged")
+    for name in ("initdb", "postgres", "pg_isready", "psql", "createdb"):
+        executable = paths[name]
+        executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
     return paths
 
 
@@ -837,6 +841,36 @@ def test_self_test_checks_resources_and_writable_temp_directory(tmp_path: Path) 
     event = desktop_main.self_test(project_root=tmp_path, temp_root=tmp_path)
 
     assert event == RuntimeEvent(RuntimeState.STOPPED, {"self_test": "ok"})
+
+
+@pytest.mark.parametrize(
+    "program", ["initdb", "postgres", "pg_isready", "psql", "createdb"]
+)
+def test_self_test_requires_each_postgres_binary_to_be_executable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    program: str,
+) -> None:
+    resources = populate_self_test_layout(tmp_path)
+    executable = resources[program]
+    executable.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+    assert executable.is_file()
+    assert executable.resolve().is_relative_to(tmp_path / "postgres" / "bin")
+    assert not executable.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    def executable_access(path: os.PathLike[str] | str, mode: int) -> bool:
+        assert mode == os.X_OK
+        return Path(path) != executable
+
+    monkeypatch.setattr(os, "access", executable_access)
+
+    event = desktop_main.self_test(project_root=tmp_path, temp_root=tmp_path)
+
+    assert event.fields == {
+        "code": "resource_missing",
+        "detail": "required packaged resource is unavailable",
+    }
 
 
 def test_self_test_requires_a_postgres_shared_library(tmp_path: Path) -> None:
