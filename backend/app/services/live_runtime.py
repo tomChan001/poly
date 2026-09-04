@@ -30,7 +30,7 @@ from backend.app.services.opportunities import (
     InMemoryOpportunityStore,
     OpportunityRecord,
 )
-from backend.app.services.optimizer import QuoteOptimizer, QuotePolicy
+from backend.app.services.optimizer import ExecutableQuote, QuoteOptimizer, QuotePolicy
 from backend.app.services.orderbooks import BookSynchronizationError, synchronize_books
 from backend.app.services.runtime_status import RuntimeStatusService
 from backend.app.services.settings import RiskPolicy, RiskPolicyStore
@@ -440,6 +440,7 @@ class LiveRuntimeService:
                 kalshi_book=books.kalshi,
                 polymarket_book=books.polymarket,
                 balance_versions=(str(kalshi_balance), str(polymarket_balance)),
+                quote=quote,
             )
 
         kalshi_limit = _limit_price(books.kalshi.asks, quote.quantity)
@@ -545,11 +546,13 @@ def _rejected_evaluation(
     kalshi_book: NormalizedBook | None = None,
     polymarket_book: NormalizedBook | None = None,
     balance_versions: tuple[str, str] = ("unavailable", "unavailable"),
+    quote: ExecutableQuote | None = None,
 ) -> PairEvaluation:
     books = tuple(book for book in (kalshi_book, polymarket_book) if book is not None)
-    age_ms = max(
-        (int((now - book.received_at).total_seconds() * 1000) for book in books),
-        default=0,
+    age_ms = (
+        max(int((now - book.received_at).total_seconds() * 1000) for book in books)
+        if books
+        else None
     )
     opportunity = OpportunityRecord(
         id=pair.id,
@@ -557,14 +560,18 @@ def _rejected_evaluation(
         kalshi_outcome=pair.kalshi_outcome,
         polymarket_outcome=pair.polymarket_outcome,
         mapping_status=pair.status.value,
-        quantity=Decimal(0),
-        kalshi_vwap=Decimal(0),
-        polymarket_vwap=Decimal(0),
-        total_fees=Decimal(0),
-        deployed_capital=Decimal(0),
-        payout=Decimal(0),
-        profit_floor=Decimal(0),
-        conservative_roi=Decimal(0),
+        quantity=quote.quantity if quote is not None else None,
+        kalshi_vwap=quote.kalshi_cost / quote.quantity if quote is not None else None,
+        polymarket_vwap=(
+            quote.polymarket_cost / quote.quantity if quote is not None else None
+        ),
+        total_fees=(
+            quote.kalshi_fee + quote.polymarket_fee if quote is not None else None
+        ),
+        deployed_capital=quote.deployed_capital if quote is not None else None,
+        payout=quote.quantity if quote is not None else None,
+        profit_floor=quote.profit_floor if quote is not None else None,
+        conservative_roi=quote.conservative_roi if quote is not None else None,
         expected_settlement_at=pair.kalshi_expected_settlement_at
         or pair.polymarket_expected_settlement_at
         or now,

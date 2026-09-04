@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import NAMESPACE_URL, uuid5
@@ -1170,6 +1171,15 @@ async def test_late_settlement_is_retained_as_structured_rejection() -> None:
     [record] = opportunities.list_ranked()
     assert executions == 0
     assert record.rejection_reasons == ("SETTLEMENT_TOO_LATE",)
+    assert record.quantity is None
+    assert record.kalshi_vwap is None
+    assert record.polymarket_vwap is None
+    assert record.total_fees is None
+    assert record.deployed_capital is None
+    assert record.payout is None
+    assert record.profit_floor is None
+    assert record.conservative_roi is None
+    assert record.book_age_ms is None
     assert record.risk_policy_version != "unavailable"
     assert all(version.startswith("sha256:") for version in record.rule_versions)
 
@@ -1233,6 +1243,13 @@ async def test_stale_book_is_retained_as_structured_rejection() -> None:
     [record] = opportunities.list_ranked()
     assert executions == 0
     assert record.rejection_reasons == ("STALE_BOOK",)
+    assert record.quantity is None
+    assert record.kalshi_vwap is None
+    assert record.polymarket_vwap is None
+    assert record.deployed_capital is None
+    assert record.profit_floor is None
+    assert record.conservative_roi is None
+    assert record.book_age_ms == 5000
     assert record.book_sequences == ("k-seq-stale", "p-seq-stale")
     assert await history.list() == []
     assert capital.reservations == {}
@@ -1241,3 +1258,79 @@ async def test_stale_book_is_retained_as_structured_rejection() -> None:
     assert runtime_view.ready is True
     assert runtime_view.opening_enabled is False
     assert runtime_view.last_error is None
+
+
+@pytest.mark.asyncio
+async def test_below_minimum_quantity_retains_calculated_quote_metrics() -> None:
+    integrations = await configured_integrations()
+    pairs = ExecutablePairService(InMemoryExecutablePairRepository())
+    pair = await pairs.create(
+        ExecutablePairInput(
+            title="Below minimum quantity pair",
+            kalshi_market_id="K-MIN",
+            kalshi_outcome="no",
+            kalshi_rule_text="K rule",
+            kalshi_rule_url="https://kalshi.test/rule",
+            polymarket_market_id="P-MIN",
+            polymarket_outcome="yes",
+            polymarket_rule_text="P rule",
+            polymarket_rule_url="https://poly.test/rule",
+            minimum_quantity=Decimal(21),
+            quantity_step=Decimal(1),
+            enabled=True,
+            kalshi_category="standard",
+            polymarket_category="standard",
+        )
+    )
+    await pairs.review(
+        pair.id,
+        status=MappingStatus.EXACT,
+        checklist={item: True for item in REQUIRED_REVIEW_ITEMS},
+        truth_table=[{"kalshi": Decimal(1), "polymarket": Decimal(0)}],
+        notes="exact",
+        reviewer="human",
+    )
+    risk = InMemoryRiskPolicyStore(
+        replace(
+            RiskPolicyInput.defaults(),
+            per_trade_limit=Decimal(100),
+            per_event_limit=Decimal(100),
+            portfolio_limit=Decimal(100),
+        )
+    )
+    control = SystemControl(opening_enabled=False)
+    history = InMemoryExecutionStore()
+    opportunities = InMemoryOpportunityStore()
+    status = RuntimeStatusService(integrations, control)
+    ports = {
+        Venue.KALSHI: FakeTradingPort(Venue.KALSHI),
+        Venue.POLYMARKET: FakeTradingPort(Venue.POLYMARKET),
+    }
+    runtime = LiveRuntimeService(
+        integrations=integrations,
+        pairs=pairs,
+        risk_policies=risk,
+        system_control=control,
+        execution_store=history,
+        opportunities=opportunities,
+        runtime_status=status,
+        market_data_factory=lambda _bundle: FakeMarketData(),
+        trading_ports_factory=lambda _bundle: ports,
+        optimizer=QuoteOptimizer(fee_engine()),
+        capital_ledger=CapitalLedger({}),
+    )
+
+    executions = await runtime.run_once(NOW)
+
+    [record] = opportunities.list_ranked()
+    assert executions == 0
+    assert record.rejection_reasons == ("BELOW_MINIMUM_QUANTITY",)
+    assert record.quantity == Decimal(20)
+    assert record.kalshi_vwap == Decimal("0.70")
+    assert record.polymarket_vwap == Decimal("0.20")
+    assert record.deployed_capital is not None
+    assert record.profit_floor is not None
+    assert record.conservative_roi is not None
+    assert record.book_age_ms == 0
+    assert await history.list() == []
+    assert all(port.submissions == 0 for port in ports.values())
