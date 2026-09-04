@@ -2,7 +2,8 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import RedirectResponse
 
 from backend.app.api.routes.executions import router as executions_router
 from backend.app.api.routes.integrations import router as integrations_router
@@ -14,6 +15,8 @@ from backend.app.api.routes.settings import router as settings_router
 from backend.app.api.routes.system_control import router as system_control_router
 from backend.app.container import ApplicationContainer
 from backend.app.core.config import settings
+from backend.app.core.security import is_loopback_request
+from backend.app.desktop.session import COOKIE_NAME, DesktopSession
 from backend.app.services.system_control import OpeningControlPersistenceError
 
 
@@ -60,6 +63,7 @@ def create_app(
     container: ApplicationContainer | None = None,
     *,
     allow_local_setup: bool | None = None,
+    desktop_session: DesktopSession | None = None,
 ) -> FastAPI:
     owns_container = container is None
     application_container = container or ApplicationContainer.runtime()
@@ -90,6 +94,7 @@ def create_app(
 
     application = FastAPI(title="Cross-Market Control Plane", lifespan=lifespan)
     application.state.container = application_container
+    application.state.desktop_session = desktop_session
     application.state.allow_local_setup = (
         owns_container if allow_local_setup is None else allow_local_setup
     )
@@ -102,8 +107,30 @@ def create_app(
     application.include_router(settings_router)
     application.include_router(system_control_router)
 
+    @application.get("/desktop/bootstrap/{token}", include_in_schema=False)
+    async def desktop_bootstrap(token: str, request: Request) -> Response:
+        if desktop_session is None:
+            raise HTTPException(status_code=404)
+        if not is_loopback_request(request):
+            raise HTTPException(status_code=403, detail="local access only")
+        cookie_value = desktop_session.exchange(token)
+        if cookie_value is None:
+            raise HTTPException(status_code=403, detail="invalid desktop bootstrap")
+        response = RedirectResponse("/", status_code=303)
+        response.set_cookie(
+            COOKIE_NAME,
+            cookie_value,
+            httponly=True,
+            secure=False,
+            samesite="strict",
+            path="/",
+        )
+        return response
+
     @application.get("/health")
-    async def health() -> dict[str, object]:
+    async def health(request: Request) -> dict[str, object]:
+        if desktop_session is not None and not desktop_session.is_authorized(request):
+            raise HTTPException(status_code=403, detail="desktop session required")
         # The UI must display the same two switches used by order execution;
         # returning both prevents a hard-coded banner from drifting from reality.
         try:

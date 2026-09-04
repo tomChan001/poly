@@ -39,7 +39,9 @@ def redact_sensitive(value: object) -> object:
         redacted: dict[object, object] = {}
         for key, item in value.items():
             normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
-            redacted[key] = REDACTED if normalized in _SENSITIVE_KEYS else redact_sensitive(item)
+            redacted[key] = (
+                REDACTED if normalized in _SENSITIVE_KEYS else redact_sensitive(item)
+            )
         return redacted
     if isinstance(value, list):
         return [redact_sensitive(item) for item in value]
@@ -58,23 +60,21 @@ def redact_text(message: str) -> str:
 
 
 def get_current_principal(request: Request) -> Principal:
-    client = request.client
-    is_loopback = False
-    if client is not None:
-        try:
-            is_loopback = ip_address(client.host).is_loopback
-        except ValueError:
-            is_loopback = False
-
     # Local setup is restricted to the machine running this desktop service.
     # The loopback check keeps remote callers out while allowing the local web
     # configuration screen to work when real trading is the configured mode.
     if (
         settings.local_setup_enabled
-        and is_loopback
+        and is_loopback_request(request)
         and _has_trusted_local_origin(request)
         and request.app.state.allow_local_setup
     ):
+        desktop_session = getattr(request.app.state, "desktop_session", None)
+        if desktop_session is not None and not desktop_session.is_authorized(request):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="desktop session required",
+            )
         # The local operator is also the only human reviewer in this
         # single-machine deployment; order execution itself remains automatic.
         return Principal("local-setup", frozenset(Role))
@@ -87,6 +87,16 @@ def get_current_principal(request: Request) -> Principal:
     )
 
 
+def is_loopback_request(request: Request) -> bool:
+    client = request.client
+    if client is None:
+        return False
+    try:
+        return ip_address(client.host).is_loopback
+    except ValueError:
+        return False
+
+
 def _has_trusted_local_origin(request: Request) -> bool:
     origin = request.headers.get("origin")
     if origin is None:
@@ -95,7 +105,9 @@ def _has_trusted_local_origin(request: Request) -> bool:
         return True
     try:
         host = urlsplit(origin).hostname
-        return host == "localhost" or (host is not None and ip_address(host).is_loopback)
+        return host == "localhost" or (
+            host is not None and ip_address(host).is_loopback
+        )
     except ValueError:
         return False
 
