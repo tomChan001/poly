@@ -476,9 +476,11 @@ async def test_live_cycle_executes_reviewed_profitable_pair_once_per_book_sequen
     history = InMemoryExecutionStore()
     opportunities = InMemoryOpportunityStore()
     status = RuntimeStatusService(integrations, control)
+    kalshi_port = FakeTradingPort(Venue.KALSHI)
+    polymarket_port = FakeTradingPort(Venue.POLYMARKET)
     ports: dict[Venue, BalanceTradingPort] = {
-        Venue.KALSHI: FakeTradingPort(Venue.KALSHI),
-        Venue.POLYMARKET: FakeTradingPort(Venue.POLYMARKET),
+        Venue.KALSHI: kalshi_port,
+        Venue.POLYMARKET: polymarket_port,
     }
     capital = CapitalLedger({})
     supervisor = RecordingExecutionSupervisor()
@@ -500,7 +502,7 @@ async def test_live_cycle_executes_reviewed_profitable_pair_once_per_book_sequen
     first = await runtime.run_once(NOW)
     [published] = opportunities.list_ranked()
     records_before_opening = await history.list()
-    submissions_before_opening = [port.submissions for port in ports.values()]
+    submissions_before_opening = [kalshi_port.submissions, polymarket_port.submissions]
     reservations_before_opening = dict(capital.reservations)
     control.set_opening(True, "operator enabled real ordering")
     second = await runtime.run_once(NOW)
@@ -529,7 +531,8 @@ async def test_live_cycle_executes_reviewed_profitable_pair_once_per_book_sequen
     assert after_restart == 0
     assert len(records) == 1
     assert records[0].state is ExecutionState.PAIRED
-    assert all(port.submissions == 1 for port in ports.values())
+    assert kalshi_port.submissions == 1
+    assert polymarket_port.submissions == 1
     assert len(capital.consumed_pairs) == 1
     assert capital.reservations == {}
     assert status.executions_started == 1
