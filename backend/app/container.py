@@ -7,7 +7,7 @@ from backend.app.adapters.kalshi.trading import KalshiTradingAdapter
 from backend.app.adapters.native_market_data import NativeMarketDataClient
 from backend.app.adapters.polymarket.sdk_transport import PolymarketSdkTransport
 from backend.app.adapters.polymarket.trading import PolymarketTradingAdapter
-from backend.app.core.config import settings
+from backend.app.core.config import Settings, settings
 from backend.app.core.secrets import InMemorySecretStore, KeyringSecretStore
 from backend.app.db.capital import PostgresCapitalLedger
 from backend.app.db.executable_pairs import PostgresExecutablePairRepository
@@ -57,7 +57,8 @@ from backend.app.services.system_control import SystemControl
 class ApplicationContainer:
     """Owns process-local services; durable repositories can replace stores later."""
 
-    def __init__(self) -> None:
+    def __init__(self, configured_settings: Settings | None = None) -> None:
+        active_settings = configured_settings or settings
         self._engine: AsyncEngine | None = None
         self._http_client: httpx.AsyncClient | None = None
         self.rule_store = InMemoryRuleStore()
@@ -73,7 +74,7 @@ class ApplicationContainer:
         self.notifications = NotificationService(self.outbox)
         self.incidents: IncidentStore = InMemoryIncidentStore()
         self.system_control = SystemControl(
-            opening_enabled=settings.opening_enabled,
+            opening_enabled=active_settings.opening_enabled,
             reason="configured default",
         )
         self.execution_supervisor = ExecutionSupervisor(
@@ -82,7 +83,9 @@ class ApplicationContainer:
             notifications=self.notifications,
         )
         self.executions: ExecutionStore = InMemoryExecutionStore()
-        self.executable_pairs = ExecutablePairService(InMemoryExecutablePairRepository())
+        self.executable_pairs = ExecutablePairService(
+            InMemoryExecutablePairRepository()
+        )
         self.integration_configs = IntegrationConfigService(
             InMemoryIntegrationConfigRepository(),
             InMemorySecretStore(),
@@ -95,35 +98,32 @@ class ApplicationContainer:
         self.pair_discovery: ConfiguredOddpoolPairDiscoveryService | None = None
 
     @classmethod
-    def runtime(cls) -> "ApplicationContainer":
-        container = cls()
-        engine = create_async_engine(settings.database_url, pool_pre_ping=True)
+    def runtime(
+        cls, configured_settings: Settings | None = None
+    ) -> "ApplicationContainer":
+        active_settings = configured_settings or settings
+        container = cls(active_settings)
+        engine = create_async_engine(active_settings.database_url, pool_pre_ping=True)
         sessions = async_sessionmaker(engine, expire_on_commit=False)
         http_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
         container._engine = engine
         container._http_client = http_client
         container.risk_policies = PostgresRiskPolicyStore(sessions)
         container.integration_configs = IntegrationConfigService(
-            PostgresIntegrationConfigRepository(
-                sessions
-            ),
-            KeyringSecretStore(settings.credential_service_name),
+            PostgresIntegrationConfigRepository(sessions),
+            KeyringSecretStore(active_settings.credential_service_name),
             HttpIntegrationConnectionProbe(http_client),
         )
-        container.executions = PostgresExecutionStore(
-            sessions
-        )
+        container.executions = PostgresExecutionStore(sessions)
         container.executable_pairs = ExecutablePairService(
-            PostgresExecutablePairRepository(
-                sessions
-            )
+            PostgresExecutablePairRepository(sessions)
         )
         container.capital_ledger = PostgresCapitalLedger(sessions)
         container.outbox = PostgresOutbox(sessions)
         container.notifications = NotificationService(container.outbox)
         container.incidents = PostgresIncidentStore(sessions)
         container.system_control = SystemControl(
-            opening_enabled=settings.opening_enabled,
+            opening_enabled=active_settings.opening_enabled,
             reason="configured default",
             store=PostgresOperationalControlStore(sessions),
         )
@@ -140,7 +140,7 @@ class ApplicationContainer:
             container.integration_configs,
             container.executable_pairs,
             http_client,
-            polymarket_gamma_url=settings.polymarket_gamma_url,
+            polymarket_gamma_url=active_settings.polymarket_gamma_url,
         )
         ports_cache: dict[Venue, BalanceTradingPort] = {}
         ports_cache_version: tuple[int, int] | None = None

@@ -17,7 +17,7 @@ from backend.app.api.routes.runtime import router as runtime_router
 from backend.app.api.routes.settings import router as settings_router
 from backend.app.api.routes.system_control import router as system_control_router
 from backend.app.container import ApplicationContainer
-from backend.app.core.config import settings
+from backend.app.core.config import Settings, settings
 from backend.app.core.security import is_local_setup_request, is_loopback_request
 from backend.app.desktop.session import COOKIE_NAME, DesktopSession
 from backend.app.services.system_control import OpeningControlPersistenceError
@@ -65,24 +65,37 @@ async def _live_runtime_loop(
 def create_app(
     container: ApplicationContainer | None = None,
     *,
+    configured_settings: Settings | None = None,
+    manage_runtime_lifespan: bool | None = None,
     allow_local_setup: bool | None = None,
     desktop_session: DesktopSession | None = None,
     static_dir: Path | None = None,
 ) -> FastAPI:
     owns_container = container is None
-    application_container = container or ApplicationContainer.runtime()
+    active_settings = configured_settings or settings
+    if container is not None:
+        application_container = container
+    elif configured_settings is None:
+        application_container = ApplicationContainer.runtime()
+    else:
+        application_container = ApplicationContainer.runtime(
+            configured_settings=active_settings
+        )
+    manages_runtime = (
+        owns_container if manage_runtime_lifespan is None else manage_runtime_lifespan
+    )
 
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
         runtime_task: asyncio.Task[None] | None = None
         try:
-            if owns_container and application_container.live_runtime is not None:
+            if manages_runtime and application_container.live_runtime is not None:
                 await application_container.system_control.load_async()
                 await application_container.risk_policies.initialize()
                 runtime_task = asyncio.create_task(
                     _live_runtime_loop(
                         application_container,
-                        poll_seconds=settings.runtime_poll_seconds,
+                        poll_seconds=active_settings.runtime_poll_seconds,
                     )
                 )
             yield
@@ -93,11 +106,12 @@ def create_app(
                     await runtime_task
                 except asyncio.CancelledError:
                     pass
-            if owns_container:
+            if manages_runtime:
                 await application_container.close()
 
     application = FastAPI(title="Cross-Market Control Plane", lifespan=lifespan)
     application.state.container = application_container
+    application.state.settings = active_settings
     application.state.desktop_session = desktop_session
     application.state.allow_local_setup = (
         owns_container if allow_local_setup is None else allow_local_setup

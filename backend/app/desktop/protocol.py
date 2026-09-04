@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import PurePath, PurePosixPath
 from typing import Any
@@ -24,7 +24,7 @@ class RuntimeState(StrEnum):
 class StartCommand:
     data_dir: PurePath
     runtime_dir: PurePath
-    launch_token: str
+    launch_token: str = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)

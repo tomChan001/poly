@@ -83,8 +83,9 @@ def get_current_principal(request: Request) -> Principal:
 
 
 def is_local_setup_request(request: Request) -> bool:
+    configured_settings = getattr(request.app.state, "settings", settings)
     return bool(
-        settings.local_setup_enabled
+        configured_settings.local_setup_enabled
         and is_loopback_request(request)
         and _has_trusted_local_origin(request)
         and request.app.state.allow_local_setup
