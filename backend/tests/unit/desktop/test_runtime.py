@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import os
 import sys
+import threading
 import types
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from pathlib import Path, PurePosixPath
 from typing import cast
 
@@ -28,6 +31,24 @@ from backend.app.main import create_app
 from backend.app.services.live_runtime import LiveRuntimeService
 from backend.app.services.settings import RiskPolicyStore
 from backend.app.services.system_control import SystemControl
+
+
+def populate_self_test_layout(root: Path) -> dict[str, Path]:
+    paths = {
+        "frontend": root / "frontend" / "dist" / "index.html",
+        "alembic": root / "alembic.ini",
+        "migration": root / "migrations" / "env.py",
+        "initdb": root / "postgres" / "bin" / "initdb",
+        "postgres": root / "postgres" / "bin" / "postgres",
+        "pg_isready": root / "postgres" / "bin" / "pg_isready",
+        "psql": root / "postgres" / "bin" / "psql",
+        "createdb": root / "postgres" / "bin" / "createdb",
+        "library": root / "postgres" / "lib" / "libpq.5.dylib",
+    }
+    for path in paths.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"packaged")
+    return paths
 
 
 class FakePostgres:
@@ -709,6 +730,95 @@ async def test_stdio_malformed_command_emits_sanitized_failure() -> None:
     assert "secret" not in output[0]
 
 
+def test_cancelling_default_stdin_read_does_not_hold_asyncio_run_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    read_started = threading.Event()
+    run_finished = threading.Event()
+    failures: list[BaseException] = []
+
+    class PipeInput:
+        def readline(self) -> bytes:
+            read_started.set()
+            return os.read(read_fd, 4096)
+
+    monkeypatch.setattr(
+        desktop_main.sys,
+        "stdin",
+        types.SimpleNamespace(buffer=PipeInput()),
+    )
+
+    def consume() -> None:
+        async def cancel_read() -> None:
+            task = asyncio.create_task(desktop_main._read_line(None))
+            while not read_started.is_set():
+                await asyncio.sleep(0.001)
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        try:
+            asyncio.run(cancel_read())
+        except BaseException as exc:  # noqa: BLE001 - asserted below
+            failures.append(exc)
+        finally:
+            run_finished.set()
+
+    consumer = threading.Thread(target=consume, daemon=True)
+    consumer.start()
+    try:
+        assert read_started.wait(timeout=1)
+        assert run_finished.wait(timeout=0.25)
+    finally:
+        os.close(write_fd)
+        consumer.join(timeout=1)
+        os.close(read_fd)
+    assert failures == []
+
+
+@pytest.mark.asyncio
+async def test_default_stdin_pipe_eof_stops_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    read_stream = os.fdopen(read_fd, "rb", buffering=0)
+    monkeypatch.setattr(
+        desktop_main.sys,
+        "stdin",
+        types.SimpleNamespace(buffer=read_stream),
+    )
+    command = (
+        b'{"version":1,"command":"start","data_dir":"/data",'
+        b'"runtime_dir":"/run","launch_token":"' + b"x" * 43 + b'"}\n'
+    )
+    os.write(write_fd, command)
+    os.close(write_fd)
+    stop_reasons: list[str] = []
+
+    class Runtime:
+        async def start(self, _command: StartCommand) -> RuntimeEvent:
+            return RuntimeEvent(
+                RuntimeState.READY,
+                {"port": 49152, "bootstrap_path": "/desktop/bootstrap/safe"},
+            )
+
+        async def stop(self, reason: str) -> RuntimeEvent:
+            stop_reasons.append(reason)
+            return RuntimeEvent(RuntimeState.STOPPED, {})
+
+    try:
+        result = await desktop_main.run_stdio(
+            runtime=cast(DesktopRuntime, Runtime()),
+            event_writer=lambda _line: None,
+        )
+    finally:
+        read_stream.close()
+
+    assert result == 0
+    assert stop_reasons == ["parent process ended"]
+
+
 def test_self_test_reports_missing_resource_without_starting_runtime(
     tmp_path: Path,
 ) -> None:
@@ -722,27 +832,7 @@ def test_self_test_reports_missing_resource_without_starting_runtime(
 
 
 def test_self_test_checks_resources_and_writable_temp_directory(tmp_path: Path) -> None:
-    required = [
-        tmp_path / "frontend" / "dist" / "index.html",
-        tmp_path / "alembic.ini",
-        tmp_path / "migrations" / "env.py",
-        *(
-            tmp_path / "postgres" / "bin" / name
-            for name in (
-                "initdb",
-                "postgres",
-                "pg_isready",
-                "psql",
-                "createdb",
-            )
-        ),
-    ]
-    for path in required:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"packaged")
-    shared_library = tmp_path / "postgres" / "lib" / "libpq.5.dylib"
-    shared_library.parent.mkdir(parents=True)
-    shared_library.write_bytes(b"packaged")
+    populate_self_test_layout(tmp_path)
 
     event = desktop_main.self_test(project_root=tmp_path, temp_root=tmp_path)
 
@@ -772,3 +862,47 @@ def test_self_test_requires_a_postgres_shared_library(tmp_path: Path) -> None:
     event = desktop_main.self_test(project_root=tmp_path, temp_root=tmp_path)
 
     assert event.fields["code"] == "resource_missing"
+
+
+@pytest.mark.parametrize("resource", ["postgres", "library"])
+def test_self_test_rejects_symlinked_resource_escaping_its_subtree(
+    tmp_path: Path,
+    resource: str,
+) -> None:
+    resources = populate_self_test_layout(tmp_path)
+    target = resources[resource]
+    target.unlink()
+    outside = tmp_path.parent / f"{tmp_path.name}-{resource}-outside"
+    outside.write_bytes(b"external content must not be read")
+    try:
+        target.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"file symlinks unavailable: {exc}")
+
+    event = desktop_main.self_test(project_root=tmp_path, temp_root=tmp_path)
+
+    assert event.fields == {
+        "code": "resource_missing",
+        "detail": "required packaged resource is unavailable",
+    }
+    assert "external content" not in event.to_json()
+
+
+def test_self_test_rejects_hard_linked_library_to_outside_file(tmp_path: Path) -> None:
+    resources = populate_self_test_layout(tmp_path)
+    library = resources["library"]
+    library.unlink()
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.dylib"
+    outside.write_bytes(b"external content must not be read")
+    try:
+        os.link(outside, library)
+    except OSError as exc:
+        pytest.skip(f"hard links unavailable: {exc}")
+
+    event = desktop_main.self_test(project_root=tmp_path, temp_root=tmp_path)
+
+    assert event.fields == {
+        "code": "resource_missing",
+        "detail": "required packaged resource is unavailable",
+    }
+    assert "external content" not in event.to_json()
