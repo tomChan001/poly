@@ -14,6 +14,79 @@ macho_is_macho() {
   esac
 }
 
+macho_validate_architecture() {
+  local owner="$1"
+  local output
+  local -a architectures
+  if ! output="$("${MACHO_AUDIT_LIPO_BIN}" -archs "${owner}")"; then
+    die "lipo architecture inspection failed for ${owner}"
+  fi
+  read -r -a architectures <<<"${output}"
+  [[ "${#architectures[@]}" -eq 1 ]] ||
+    die "bundled Mach-O is not thin: ${owner} (${output:-no architectures})"
+  [[ "${architectures[0]}" == "${MACHO_AUDIT_EXPECTED_ARCH}" ]] ||
+    die "architecture mismatch for ${owner}: expected ${MACHO_AUDIT_EXPECTED_ARCH}, got ${architectures[0]}"
+}
+
+macho_otool_minimum_versions() {
+  local owner="$1"
+  local output
+  if ! output="$("${MACHO_AUDIT_OTOOL_BIN}" -l "${owner}")"; then
+    die "otool -l failed for ${owner}"
+  fi
+  if ! printf '%s\n' "${output}" | awk '
+    $1 == "cmd" {
+      command = $2
+      next
+    }
+    command == "LC_BUILD_VERSION" && $1 == "minos" {
+      print $2
+      command = ""
+      next
+    }
+    command == "LC_VERSION_MIN_MACOSX" && $1 == "version" {
+      print $2
+      command = ""
+    }
+  '; then
+    die "could not parse deployment target metadata for ${owner}"
+  fi
+}
+
+macho_version_at_most() {
+  local actual="$1"
+  local maximum="$2"
+  awk -v actual="${actual}" -v maximum="${maximum}" 'BEGIN {
+    actual_parts = split(actual, a, ".")
+    maximum_parts = split(maximum, m, ".")
+    part_count = actual_parts > maximum_parts ? actual_parts : maximum_parts
+    for (part_index = 1; part_index <= part_count; part_index++) {
+      actual_part = part_index <= actual_parts ? a[part_index] + 0 : 0
+      maximum_part = part_index <= maximum_parts ? m[part_index] + 0 : 0
+      if (actual_part < maximum_part) exit 0
+      if (actual_part > maximum_part) exit 1
+    }
+    exit 0
+  }'
+}
+
+macho_validate_minimum_version() {
+  local owner="$1"
+  local work_dir="$2"
+  local version
+  if ! macho_otool_minimum_versions "${owner}" >"${work_dir}/minimum-versions"; then
+    die "deployment target inspection failed for ${owner}"
+  fi
+  [[ -s "${work_dir}/minimum-versions" ]] ||
+    die "bundled Mach-O lacks macOS deployment target metadata: ${owner}"
+  while IFS= read -r version; do
+    [[ "${version}" =~ ^[0-9]+([.][0-9]+){0,3}$ ]] ||
+      die "invalid macOS deployment target metadata in ${owner}: ${version}"
+    macho_version_at_most "${version}" "${MACHO_AUDIT_MAX_MIN_OS}" ||
+      die "macOS deployment target exceeds ${MACHO_AUDIT_MAX_MIN_OS} in ${owner}: ${version}"
+  done <"${work_dir}/minimum-versions"
+}
+
 macho_otool_dependencies() {
   local owner="$1"
   local output
@@ -210,6 +283,12 @@ macho_audit_tree() {
     die "could not canonicalize packaged root: ${tree}"
   fi
   [[ -d "${MACHO_AUDIT_CANONICAL_ROOT}" ]] || die "packaged root is not a directory: ${tree}"
+  if [[ -n "${MACHO_AUDIT_EXPECTED_ARCH:-}" || -n "${MACHO_AUDIT_MAX_MIN_OS:-}" ]]; then
+    [[ -n "${MACHO_AUDIT_EXPECTED_ARCH:-}" && -n "${MACHO_AUDIT_MAX_MIN_OS:-}" ]] ||
+      die "architecture and deployment-target audit settings must be supplied together"
+    [[ "${MACHO_AUDIT_EXPECTED_ARCH}" == "arm64" || "${MACHO_AUDIT_EXPECTED_ARCH}" == "x86_64" ]] ||
+      die "unsupported expected Mach-O architecture: ${MACHO_AUDIT_EXPECTED_ARCH}"
+  fi
   case "${MACHO_AUDIT_CANONICAL_ROOT}" in
     "${canonical_boundary}"|"${canonical_boundary}/"*) ;;
     *)
@@ -231,9 +310,16 @@ macho_audit_tree() {
       continue
     fi
     [[ -f "${canonical_candidate}" ]] || die "packaged file does not exist: ${candidate}"
+    # Static archives and ordinary resource files are explicit exceptions: file(1)
+    # does not identify them as Mach-O. System dylibs are dependencies, never
+    # bundled candidates, and are handled by macho_check_dependency().
     macho_is_macho "${candidate}" || continue
+    if [[ -n "${MACHO_AUDIT_EXPECTED_ARCH:-}" ]]; then
+      macho_validate_architecture "${candidate}"
+      macho_validate_minimum_version "${candidate}" "${work_dir}"
+    fi
     if [[ "${MACHO_AUDIT_CODESIGN:-0}" -eq 1 ]]; then
-      codesign --verify --strict --verbose=2 "${candidate}"
+      "${MACHO_AUDIT_CODESIGN_BIN}" --verify --strict --verbose=2 "${candidate}"
     fi
     macho_otool_dependencies "${candidate}" >"${work_dir}/dependencies"
     macho_otool_rpaths "${candidate}" >"${work_dir}/rpaths"

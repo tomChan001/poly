@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
-BUNDLE_DIR="${REPO_ROOT}/dist/poly-runtime"
-RUNTIME_EXECUTABLE="${BUNDLE_DIR}/poly-runtime"
+die() {
+  printf 'verify-runtime: %s\n' "$*" >&2
+  exit 1
+}
+
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
+readonly BUNDLE_DIR="${REPO_ROOT}/dist/poly-runtime"
+readonly RUNTIME_EXECUTABLE="${BUNDLE_DIR}/poly-runtime"
+readonly POLY_REQUIRED_MACOS_TARGET="12.0"
 
 : "${POLY_TARGET_ARCH:?POLY_TARGET_ARCH must be set to arm64 or x86_64}"
 : "${POLY_TARGET_TRIPLE:?POLY_TARGET_TRIPLE must be set to a macOS target triple}"
+[[ -z "${MACOSX_DEPLOYMENT_TARGET:-}" || "${MACOSX_DEPLOYMENT_TARGET}" == "${POLY_REQUIRED_MACOS_TARGET}" ]] ||
+  die "MACOSX_DEPLOYMENT_TARGET must be ${POLY_REQUIRED_MACOS_TARGET}"
+export MACOSX_DEPLOYMENT_TARGET="${POLY_REQUIRED_MACOS_TARGET}"
 
 case "${POLY_TARGET_ARCH}:${POLY_TARGET_TRIPLE}" in
   arm64:aarch64-apple-darwin)
@@ -17,71 +26,46 @@ case "${POLY_TARGET_ARCH}:${POLY_TARGET_TRIPLE}" in
     EXPECTED_ARCH='x86_64'
     ;;
   *)
-    printf '%s\n' \
-      'POLY_TARGET_ARCH and POLY_TARGET_TRIPLE must be a supported matching pair' >&2
-    exit 2
+    die 'POLY_TARGET_ARCH and POLY_TARGET_TRIPLE must be a supported matching pair'
     ;;
 esac
 
-if [[ ! -x "${RUNTIME_EXECUTABLE}" ]]; then
-  printf 'built runtime executable is missing or not executable: %s\n' \
-    "${RUNTIME_EXECUTABLE}" >&2
-  exit 1
-fi
+for command_name in awk file find lipo otool realpath; do
+  command -v "${command_name}" >/dev/null 2>&1 || die "required command not found: ${command_name}"
+done
 
+[[ -x "${RUNTIME_EXECUTABLE}" ]] ||
+  die "built runtime executable is missing or not executable: ${RUNTIME_EXECUTABLE}"
 for program in initdb postgres pg_isready psql createdb; do
   postgres_executable="${BUNDLE_DIR}/postgres/bin/${program}"
-  if [[ ! -x "${postgres_executable}" ]]; then
-    printf 'required PostgreSQL program is missing or not executable: %s\n' \
-      "${postgres_executable}" >&2
-    exit 1
-  fi
+  [[ -x "${postgres_executable}" ]] ||
+    die "required PostgreSQL program is missing or not executable: ${postgres_executable}"
 done
 
 "${RUNTIME_EXECUTABLE}" --self-test
 file "${RUNTIME_EXECUTABLE}"
-find "${BUNDLE_DIR}" -type f -perm -111 -print0 | xargs -0 file
 
-while IFS= read -r -d '' candidate; do
-  description="$(file -b "${candidate}")"
-  if [[ "${description}" != *Mach-O* ]]; then
-    continue
-  fi
-  if [[ "${description}" != *"${EXPECTED_ARCH}"* ]]; then
-    printf 'architecture mismatch for %s: expected %s, got %s\n' \
-      "${candidate}" "${EXPECTED_ARCH}" "${description}" >&2
-    exit 1
-  fi
+VERIFY_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/poly-runtime-verify.XXXXXXXX")"
+cleanup() {
+  [[ -n "${VERIFY_TEMP:-}" && -d "${VERIFY_TEMP}" ]] && rm -rf -- "${VERIFY_TEMP}"
+}
+trap cleanup EXIT INT TERM
 
-  dependencies="$(otool -L "${candidate}"; otool -l "${candidate}")"
-  if grep -Eq \
-    '^[[:space:]]+.*(/opt/homebrew/|/usr/local/(Cellar|opt)/|/opt/local/|/Users/|/Volumes/|/private/var/folders/)' \
-    <<<"${dependencies}"; then
-    printf 'forbidden non-system dependency path in %s\n' "${candidate}" >&2
-    exit 1
-  fi
-done < <(
-  find "${BUNDLE_DIR}" -type f \
-    \( -perm -111 -o -name '*.dylib' -o -name '*.so' \) -print0
-)
+MACHO_AUDIT_FIND_BIN="find"
+MACHO_AUDIT_FILE_BIN="file"
+MACHO_AUDIT_LIPO_BIN="lipo"
+MACHO_AUDIT_OTOOL_BIN="otool"
+MACHO_AUDIT_CODESIGN_BIN="codesign"
+MACHO_AUDIT_CODESIGN=0
+MACHO_AUDIT_BOUNDARY="${BUNDLE_DIR}"
+MACHO_AUDIT_CONTEXTS_FILE="${VERIFY_TEMP}/executable-contexts"
+MACHO_AUDIT_EXPECTED_ARCH="${EXPECTED_ARCH}"
+MACHO_AUDIT_MAX_MIN_OS="${POLY_REQUIRED_MACOS_TARGET}"
+# shellcheck source=packaging/macos/macho-audit.sh
+source "${SCRIPT_DIR}/macho-audit.sh"
 
-while IFS= read -r -d '' link; do
-  if [[ ! -e "${link}" ]]; then
-    printf 'broken symlink in packaged runtime: %s\n' "${link}" >&2
-    exit 1
-  fi
-  target="$(readlink "${link}")"
-  if [[ "${target}" = /* ]]; then
-    printf 'absolute symlink escapes packaged runtime: %s\n' "${link}" >&2
-    exit 1
-  fi
-  target_parent="$(cd -- "$(dirname -- "${link}")/$(dirname -- "${target}")" && pwd -P)"
-  resolved_target="${target_parent}/$(basename -- "${target}")"
-  case "${resolved_target}" in
-    "${BUNDLE_DIR}"/*) ;;
-    *)
-      printf 'symlink escapes packaged runtime: %s\n' "${link}" >&2
-      exit 1
-      ;;
-  esac
-done < <(find "${BUNDLE_DIR}" -type l -print0)
+printf '%s\t%s\n' "${BUNDLE_DIR}" "${RUNTIME_EXECUTABLE}" >"${MACHO_AUDIT_CONTEXTS_FILE}"
+printf '%s\t%s\n' "${BUNDLE_DIR}/postgres" "${BUNDLE_DIR}/postgres/bin/postgres" >>"${MACHO_AUDIT_CONTEXTS_FILE}"
+macho_audit_tree "${BUNDLE_DIR}" "${VERIFY_TEMP}"
+printf 'Runtime is thin %s and compatible with macOS %s: %s\n' \
+  "${EXPECTED_ARCH}" "${POLY_REQUIRED_MACOS_TARGET}" "${BUNDLE_DIR}"

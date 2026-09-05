@@ -1,13 +1,13 @@
-import json
 import importlib.util
+import json
 import os
 import plistlib
-import re
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -119,7 +119,16 @@ class DistributionContractTests(unittest.TestCase):
 
     def test_tauri_maps_complete_runtime_to_expected_bundle_layout(self) -> None:
         config = json.loads((ROOT / "src-tauri" / "tauri.conf.json").read_text())
+        cargo = tomllib.loads(
+            (ROOT / "src-tauri" / "Cargo.toml").read_text(encoding="utf-8")
+        )
         bundle = config["bundle"]
+        self.assertEqual(config["mainBinaryName"], "Poly")
+        self.assertNotIn("mainBinaryName", config["build"])
+        self.assertEqual(
+            cargo["bin"],
+            [{"name": "Poly", "path": "src/main.rs"}],
+        )
         self.assertEqual(bundle["targets"], ["app", "dmg"])
         self.assertEqual(
             bundle["resources"],
@@ -134,6 +143,184 @@ class DistributionContractTests(unittest.TestCase):
         )
         self.assertIs(bundle["macOS"]["hardenedRuntime"], True)
         self.assertNotIn("signingIdentity", bundle["macOS"])
+
+    def test_macos_distribution_scripts_pin_the_12_0_deployment_target(self) -> None:
+        for name in (
+            "fetch-postgres.sh",
+            "verify-runtime.sh",
+            "verify-bundle.sh",
+        ):
+            with self.subTest(name=name):
+                script = self.read(name)
+                self.assertIn('POLY_REQUIRED_MACOS_TARGET="12.0"', script)
+                self.assertIn("MACOSX_DEPLOYMENT_TARGET", script)
+
+    def test_macho_audit_rejects_fat_wrong_arch_new_or_missing_minos(self) -> None:
+        bash = bash_executable()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "fake").write_bytes(b"Mach-O fixture")
+            stubs = root / "stubs"
+            stubs.mkdir()
+            write_stub(stubs, "find", "printf '%s\\0' \"$1/fake\"")
+            write_stub(stubs, "file", "printf 'Mach-O 64-bit executable\\n'")
+            write_stub(
+                stubs,
+                "lipo",
+                "[[ \"$1\" == '-archs' ]] || exit 2\n"
+                "printf '%s\\n' \"${POLY_STUB_ARCHS:-x86_64}\"",
+            )
+            write_stub(
+                stubs,
+                "otool",
+                "if [[ \"$1\" == '-L' ]]; then\n"
+                "  printf '%s:\\n\\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\\n' \"$2\"\n"
+                "elif [[ \"${POLY_STUB_NO_METADATA:-0}\" -eq 0 ]]; then\n"
+                "  printf 'Load command 0\\n      cmd LC_BUILD_VERSION\\n  cmdsize 32\\n platform 1\\n    minos %s\\n      sdk 15.0\\n' \"${POLY_STUB_MINOS:-12.0}\"\n"
+                "fi",
+            )
+            base_env = os.environ.copy()
+            base_env.update(
+                PATH=f"{git_bash_path(stubs)}:/usr/bin:/bin",
+                POLY_TEST_FIND=git_bash_path(stubs / "find"),
+                POLY_TEST_FILE=git_bash_path(stubs / "file"),
+                POLY_TEST_LIPO=git_bash_path(stubs / "lipo"),
+                POLY_TEST_OTOOL=git_bash_path(stubs / "otool"),
+                POLY_TEST_EXPECTED_ARCH="x86_64",
+                POLY_TEST_MAX_MIN_OS="12.0",
+            )
+            cases = (
+                ({"POLY_STUB_ARCHS": "x86_64 arm64"}, "not thin"),
+                ({"POLY_STUB_ARCHS": "arm64"}, "architecture mismatch"),
+                ({"POLY_STUB_MINOS": "13.0"}, "deployment target"),
+                ({"POLY_STUB_NO_METADATA": "1"}, "deployment target metadata"),
+            )
+            for overrides, expected_error in cases:
+                with self.subTest(overrides=overrides):
+                    env = base_env | overrides
+                    result = subprocess.run(
+                        [
+                            bash,
+                            str(MACOS / "verify-bundle.sh"),
+                            "--audit-tree",
+                            git_bash_path(root),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn(expected_error, result.stderr)
+
+    def test_macho_audit_accepts_thin_arch_and_legacy_macos_metadata(self) -> None:
+        bash = bash_executable()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "fake").write_bytes(b"Mach-O fixture")
+            stubs = root / "stubs"
+            stubs.mkdir()
+            write_stub(stubs, "find", "printf '%s\\0' \"$1/fake\"")
+            write_stub(stubs, "file", "printf 'Mach-O 64-bit executable\\n'")
+            write_stub(stubs, "lipo", "printf 'x86_64\\n'")
+            write_stub(
+                stubs,
+                "otool",
+                "if [[ \"$1\" == '-L' ]]; then\n"
+                "  printf '%s:\\n\\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\\n' \"$2\"\n"
+                "else\n"
+                "  printf 'Load command 0\\n      cmd LC_VERSION_MIN_MACOSX\\n  cmdsize 16\\n  version 10.13\\n      sdk 11.0\\n'\n"
+                "fi",
+            )
+            env = os.environ.copy()
+            env.update(
+                PATH=f"{git_bash_path(stubs)}:/usr/bin:/bin",
+                POLY_TEST_FIND=git_bash_path(stubs / "find"),
+                POLY_TEST_FILE=git_bash_path(stubs / "file"),
+                POLY_TEST_LIPO=git_bash_path(stubs / "lipo"),
+                POLY_TEST_OTOOL=git_bash_path(stubs / "otool"),
+                POLY_TEST_EXPECTED_ARCH="x86_64",
+                POLY_TEST_MAX_MIN_OS="12.0",
+            )
+            result = subprocess.run(
+                [
+                    bash,
+                    str(MACOS / "verify-bundle.sh"),
+                    "--audit-tree",
+                    git_bash_path(root),
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_audit_bundle_runs_real_bundle_checks_without_release_services(self) -> None:
+        bash = bash_executable()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "Poly.app"
+            main = app / "Contents" / "MacOS" / "Poly"
+            runtime = app / "Contents" / "Resources" / "poly-runtime" / "poly-runtime"
+            for executable in (main, runtime):
+                executable.parent.mkdir(parents=True, exist_ok=True)
+                executable.write_bytes(b"Mach-O fixture")
+                executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+            stubs = root / "stubs"
+            stubs.mkdir()
+            write_stub(
+                stubs,
+                "find",
+                "printf '%s\\0%s\\0' \"$1/MacOS/Poly\" \"$1/Resources/poly-runtime/poly-runtime\"",
+            )
+            write_stub(stubs, "file", "printf 'Mach-O 64-bit executable\\n'")
+            write_stub(stubs, "lipo", "printf 'x86_64\\n'")
+            write_stub(
+                stubs,
+                "otool",
+                "if [[ \"$1\" == '-L' ]]; then\n"
+                "  printf '%s:\\n\\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\\n' \"$2\"\n"
+                "else\n"
+                "  printf 'Load command 0\\n      cmd LC_BUILD_VERSION\\n  cmdsize 32\\n platform 1\\n    minos 12.0\\n      sdk 15.0\\n'\n"
+                "fi",
+            )
+            codesign_log = root / "codesign.log"
+            write_stub(
+                stubs,
+                "codesign",
+                f"printf '%s\\n' \"$*\" >> '{git_bash_path(codesign_log)}'",
+            )
+            env = os.environ.copy()
+            env.update(
+                PATH=f"{git_bash_path(stubs)}:/usr/bin:/bin",
+                MACOSX_DEPLOYMENT_TARGET="12.0",
+                POLY_TARGET_ARCH="x86_64",
+                POLY_TARGET_TRIPLE="x86_64-apple-darwin",
+                POLY_TEST_CODESIGN=git_bash_path(stubs / "codesign"),
+                POLY_TEST_FILE=git_bash_path(stubs / "file"),
+                POLY_TEST_FIND=git_bash_path(stubs / "find"),
+                POLY_TEST_LIPO=git_bash_path(stubs / "lipo"),
+                POLY_TEST_OTOOL=git_bash_path(stubs / "otool"),
+            )
+            result = subprocess.run(
+                [
+                    bash,
+                    str(MACOS / "verify-bundle.sh"),
+                    "--audit-bundle",
+                    git_bash_path(app),
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Bundle path, signature, and Mach-O audit passed", result.stdout)
+            log = codesign_log.read_text(encoding="utf-8")
+            self.assertIn("--verify --deep --strict", log)
+            self.assertNotIn("stapler", log)
+            self.assertNotIn("spctl", log)
 
     def test_dependency_checks_reject_unsafe_and_unknown_absolute_paths(self) -> None:
         audit = self.read("macho-audit.sh")

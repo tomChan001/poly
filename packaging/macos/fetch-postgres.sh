@@ -6,6 +6,7 @@ readonly ARCHIVE="postgresql-${POSTGRES_VERSION}.tar.bz2"
 readonly SOURCE_URL="https://ftp.postgresql.org/pub/source/v16.15/postgresql-16.15.tar.bz2"
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly CHECKSUM_FILE="${SCRIPT_DIR}/postgres-SHA256SUMS"
+readonly POLY_REQUIRED_MACOS_TARGET="12.0"
 
 die() {
   printf 'fetch-postgres: %s\n' "$*" >&2
@@ -14,10 +15,14 @@ die() {
 
 MACHO_AUDIT_FIND_BIN="find"
 MACHO_AUDIT_FILE_BIN="file"
+MACHO_AUDIT_LIPO_BIN="lipo"
 MACHO_AUDIT_OTOOL_BIN="otool"
+MACHO_AUDIT_CODESIGN_BIN="codesign"
 MACHO_AUDIT_CODESIGN=0
 MACHO_AUDIT_BOUNDARY=""
 MACHO_AUDIT_CONTEXTS_FILE=""
+MACHO_AUDIT_EXPECTED_ARCH=""
+MACHO_AUDIT_MAX_MIN_OS=""
 # shellcheck source=packaging/macos/macho-audit.sh
 source "${SCRIPT_DIR}/macho-audit.sh"
 
@@ -34,8 +39,13 @@ if [[ "${1:-}" == "--audit-tree" ]]; then
   # Fault-injection overrides are accepted only by this non-building test mode.
   MACHO_AUDIT_FIND_BIN="${POLY_TEST_FIND:-find}"
   MACHO_AUDIT_FILE_BIN="${POLY_TEST_FILE:-file}"
+  MACHO_AUDIT_LIPO_BIN="${POLY_TEST_LIPO:-lipo}"
   MACHO_AUDIT_OTOOL_BIN="${POLY_TEST_OTOOL:-otool}"
-  for command_name in awk realpath "${MACHO_AUDIT_FILE_BIN}" "${MACHO_AUDIT_FIND_BIN}" "${MACHO_AUDIT_OTOOL_BIN}"; do
+  MACHO_AUDIT_EXPECTED_ARCH="${POLY_TEST_EXPECTED_ARCH:-}"
+  MACHO_AUDIT_MAX_MIN_OS="${POLY_TEST_MAX_MIN_OS:-}"
+  audit_commands=(awk realpath "${MACHO_AUDIT_FILE_BIN}" "${MACHO_AUDIT_FIND_BIN}" "${MACHO_AUDIT_OTOOL_BIN}")
+  [[ -z "${MACHO_AUDIT_EXPECTED_ARCH}" ]] || audit_commands+=("${MACHO_AUDIT_LIPO_BIN}")
+  for command_name in "${audit_commands[@]}"; do
     command -v "${command_name}" >/dev/null 2>&1 || die "required command not found: ${command_name}"
   done
   AUDIT_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/poly-postgres-audit.XXXXXXXX")"
@@ -56,21 +66,30 @@ fi
 
 [[ "$#" -eq 0 ]] || die "usage: $0 [--check] | --audit-tree /absolute/tree"
 [[ "$(uname -s)" == "Darwin" ]] || die "PostgreSQL distribution must be built natively on macOS"
+[[ -z "${MACOSX_DEPLOYMENT_TARGET:-}" || "${MACOSX_DEPLOYMENT_TARGET}" == "${POLY_REQUIRED_MACOS_TARGET}" ]] ||
+  die "MACOSX_DEPLOYMENT_TARGET must be ${POLY_REQUIRED_MACOS_TARGET}"
+export MACOSX_DEPLOYMENT_TARGET="${POLY_REQUIRED_MACOS_TARGET}"
+export CFLAGS="${CFLAGS:+${CFLAGS} }-mmacosx-version-min=${POLY_REQUIRED_MACOS_TARGET}"
+export CXXFLAGS="${CXXFLAGS:+${CXXFLAGS} }-mmacosx-version-min=${POLY_REQUIRED_MACOS_TARGET}"
+export LDFLAGS="${LDFLAGS:+${LDFLAGS} }-mmacosx-version-min=${POLY_REQUIRED_MACOS_TARGET}"
 
 readonly TARGET_TRIPLE="${POLY_TARGET_TRIPLE:-}"
 case "${TARGET_TRIPLE}" in
   aarch64-apple-darwin)
     [[ "$(uname -m)" == "arm64" ]] || die "target ${TARGET_TRIPLE} requires a native arm64 runner"
+    MACHO_AUDIT_EXPECTED_ARCH="arm64"
     ;;
   x86_64-apple-darwin)
     [[ "$(uname -m)" == "x86_64" ]] || die "target ${TARGET_TRIPLE} requires a native x86_64 runner"
+    MACHO_AUDIT_EXPECTED_ARCH="x86_64"
     ;;
   *)
     die "unsupported POLY_TARGET_TRIPLE '${TARGET_TRIPLE}'; expected aarch64-apple-darwin or x86_64-apple-darwin"
     ;;
 esac
+MACHO_AUDIT_MAX_MIN_OS="${POLY_REQUIRED_MACOS_TARGET}"
 
-for command_name in awk curl file find install_name_tool make otool realpath shasum tar; do
+for command_name in awk curl file find install_name_tool lipo make otool realpath shasum tar; do
   command -v "${command_name}" >/dev/null 2>&1 || die "required command not found: ${command_name}"
 done
 

@@ -10,7 +10,7 @@ name = "poly_desktop_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [[bin]]
-name = "poly-desktop"
+name = "Poly"
 path = "src/main.rs"
 
 [build-dependencies]
