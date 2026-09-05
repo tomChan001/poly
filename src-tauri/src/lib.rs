@@ -1,5 +1,7 @@
 pub mod runtime;
 
+pub use runtime::process::{launch_runtime, ProductionLauncher, RunningRuntime};
+
 #[cfg(target_os = "macos")]
 pub fn run() {
     use tauri::Manager;
