@@ -1,13 +1,15 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as SyncMutex;
 
 use thiserror::Error;
 use tokio::sync::{mpsc, watch, Mutex};
 use url::Url;
 
+use crate::app_lifecycle::{RuntimeShutdown, ShutdownFuture};
 use crate::runtime::process::RuntimeLauncher;
 use crate::runtime::state::SupervisorState;
 use crate::runtime::supervisor::{RuntimeSupervisor, RuntimeSupervisorNotice, SupervisorClock};
@@ -227,6 +229,7 @@ pub enum DesktopDiagnosticEvent {
     NavigationFallbackFailed,
     SupervisionFailed,
     SetupFailed,
+    ShutdownFailed,
 }
 
 pub trait DesktopDiagnosticReporter: Send + Sync + 'static {
@@ -280,6 +283,9 @@ pub struct DesktopRuntimeService<R, N> {
     navigator: N,
     phase: AtomicU8,
     reporter: Arc<dyn DesktopDiagnosticReporter>,
+    shutdown: Arc<dyn RuntimeShutdown>,
+    supervision_task: SyncMutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    cleanup_requested: AtomicBool,
 }
 
 const PHASE_IDLE: u8 = 0;
@@ -301,11 +307,28 @@ where
         navigator: N,
         reporter: Arc<dyn DesktopDiagnosticReporter>,
     ) -> Self {
+        Self::with_reporter_and_shutdown(
+            runtime,
+            navigator,
+            reporter,
+            Arc::new(NoopRuntimeShutdown),
+        )
+    }
+
+    pub fn with_reporter_and_shutdown(
+        runtime: R,
+        navigator: N,
+        reporter: Arc<dyn DesktopDiagnosticReporter>,
+        shutdown: Arc<dyn RuntimeShutdown>,
+    ) -> Self {
         Self {
             runtime: Mutex::new(runtime),
             navigator,
             phase: AtomicU8::new(PHASE_IDLE),
             reporter,
+            shutdown,
+            supervision_task: SyncMutex::new(None),
+            cleanup_requested: AtomicBool::new(false),
         }
     }
 
@@ -357,7 +380,7 @@ where
         }
 
         let service = Arc::clone(self);
-        tauri::async_runtime::spawn(async move {
+        let task = tauri::async_runtime::spawn(async move {
             let mut runtime = service.runtime.lock().await;
             let result = runtime.supervise_until_terminal().await;
             let terminal = runtime.is_terminal() || result.is_err();
@@ -384,6 +407,10 @@ where
                 }
             }
         });
+        *self
+            .supervision_task
+            .lock()
+            .expect("desktop supervision task lock poisoned") = Some(task);
         true
     }
 
@@ -440,6 +467,53 @@ where
             }
         }
         false
+    }
+}
+
+struct NoopRuntimeShutdown;
+
+impl RuntimeShutdown for NoopRuntimeShutdown {
+    fn shutdown(&self, _reason: &'static str) -> ShutdownFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cleanup_owned(&self) {}
+}
+
+impl<R, N> RuntimeShutdown for DesktopRuntimeService<R, N>
+where
+    R: DesktopRuntime,
+    N: DesktopNavigator,
+{
+    fn shutdown(&self, reason: &'static str) -> ShutdownFuture<'_> {
+        Box::pin(async move {
+            let result = self.shutdown.shutdown(reason).await;
+            let task = self
+                .supervision_task
+                .lock()
+                .expect("desktop supervision task lock poisoned")
+                .take();
+            if let Some(task) = task {
+                let _ = task.await;
+            }
+            result
+        })
+    }
+
+    fn cleanup_owned(&self) {
+        if self.cleanup_requested.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(task) = self
+            .supervision_task
+            .lock()
+            .expect("desktop supervision task lock poisoned")
+            .take()
+        {
+            task.abort();
+        } else {
+            self.shutdown.cleanup_owned();
+        }
     }
 }
 

@@ -1,10 +1,12 @@
+pub mod app_lifecycle;
 pub mod desktop_service;
 pub mod runtime;
 pub mod webview;
 
 pub use runtime::process::{launch_runtime, ProductionLauncher, RunningRuntime};
 pub use runtime::supervisor::{
-    RuntimeSupervisor, RuntimeSupervisorNotice, SupervisionOutcome, SystemClock,
+    RuntimeShutdownControl, RuntimeSupervisor, RuntimeSupervisorNotice, SupervisionOutcome,
+    SystemClock,
 };
 use runtime::{
     protocol::{FailureCode, RuntimeEvent},
@@ -104,6 +106,7 @@ impl DesktopDiagnosticReporter for BoundedDesktopReporter {
             }
             DesktopDiagnosticEvent::SupervisionFailed => "desktop_supervision_failed\n",
             DesktopDiagnosticEvent::SetupFailed => "desktop_setup_failed\n",
+            DesktopDiagnosticEvent::ShutdownFailed => "desktop_shutdown_failed\n",
         };
         let result = self
             .log
@@ -124,6 +127,7 @@ struct ProductionDesktopInstaller {
     app: tauri::AppHandle,
     navigator: TauriDesktopNavigator,
     reporter: Arc<BoundedDesktopReporter>,
+    runtime_shutdown: Arc<app_lifecycle::RuntimeShutdownRegistry>,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -169,17 +173,28 @@ impl DesktopInstaller for ProductionDesktopInstaller {
                 paths.runtime_dir().to_path_buf(),
                 paths.application_support().to_path_buf(),
             );
+            let shutdown = Arc::new(supervisor.shutdown_control());
             let notices = supervisor.subscribe_notices();
-            let service = Arc::new(DesktopRuntimeService::with_reporter(
+            let service = Arc::new(DesktopRuntimeService::with_reporter_and_shutdown(
                 supervisor,
                 self.navigator.clone(),
                 self.reporter.clone(),
+                shutdown,
             ));
             let observer = Arc::clone(&service);
             tauri::async_runtime::spawn(async move {
                 let _ = observer.observe_notices(notices).await;
             });
             if !service.start_supervision() {
+                return Err(DesktopSetupFailure::RuntimeUnavailable {
+                    logs_dir: paths.revealable_logs_dir(),
+                });
+            }
+            if !self
+                .runtime_shutdown
+                .install(Arc::clone(&service) as Arc<dyn app_lifecycle::RuntimeShutdown>)
+            {
+                app_lifecycle::RuntimeShutdown::cleanup_owned(service.as_ref());
                 return Err(DesktopSetupFailure::RuntimeUnavailable {
                     logs_dir: paths.revealable_logs_dir(),
                 });
@@ -199,6 +214,15 @@ type ProductionDesktopSetup =
 #[cfg(any(target_os = "macos", test))]
 struct DesktopAppState {
     setup: Arc<ProductionDesktopSetup>,
+    lifecycle: Arc<app_lifecycle::AppLifecycle>,
+    runtime_shutdown: Arc<app_lifecycle::RuntimeShutdownRegistry>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Drop for DesktopAppState {
+    fn drop(&mut self) {
+        self.lifecycle.teardown(self.runtime_shutdown.as_ref());
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -238,6 +262,7 @@ fn setup_desktop_runtime(app: &mut tauri::App) -> Result<(), Box<dyn std::error:
     };
     let navigator = TauriDesktopNavigator { window };
     let reporter = Arc::new(BoundedDesktopReporter::new());
+    let runtime_shutdown = Arc::new(app_lifecycle::RuntimeShutdownRegistry::default());
     if navigator
         .navigate(status_url(DesktopUiState::Initializing))
         .is_err()
@@ -249,12 +274,15 @@ fn setup_desktop_runtime(app: &mut tauri::App) -> Result<(), Box<dyn std::error:
             app: app.handle().clone(),
             navigator: navigator.clone(),
             reporter: reporter.clone(),
+            runtime_shutdown: Arc::clone(&runtime_shutdown),
         },
         navigator,
         reporter,
     ));
     if !app.manage(DesktopAppState {
         setup: Arc::clone(&setup),
+        lifecycle: Arc::new(app_lifecycle::AppLifecycle::new()),
+        runtime_shutdown,
     }) {
         return Ok(());
     }
@@ -301,22 +329,10 @@ const fn ui_state_for_failure_code(code: FailureCode) -> DesktopUiState {
 
 #[cfg(target_os = "macos")]
 pub fn run() {
-    use tauri::Manager;
-
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
-        }))
-        .invoke_handler(tauri::generate_handler![
-            retry_desktop_runtime,
-            reveal_desktop_logs
-        ])
-        .setup(setup_desktop_runtime)
-        .run(tauri::generate_context!())
-        .expect("failed to run Poly desktop shell");
+    let app = app_lifecycle::configure_tauri_builder(tauri::Builder::default())
+        .build(tauri::generate_context!())
+        .expect("failed to build Poly desktop shell");
+    app.run(app_lifecycle::handle_tauri_run_event);
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -636,5 +652,7 @@ mod tests {
         let _setup = super::setup_desktop_runtime;
         let _retry = super::retry_desktop_runtime;
         let _reveal = super::reveal_desktop_logs;
+        let _configure = crate::app_lifecycle::configure_tauri_builder;
+        let _run_event = crate::app_lifecycle::handle_tauri_run_event;
     }
 }

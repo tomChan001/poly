@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 use rand::Rng as _;
 use thiserror::Error;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
+
+use crate::app_lifecycle::{RuntimeShutdown, ShutdownFuture};
 
 use super::process::{
     drain_stderr, launch_runtime, read_runtime_event, DiagnosticLog, LaunchError, ProcessError,
@@ -191,6 +193,53 @@ pub enum RuntimeSupervisorError {
     State(#[from] TransitionError),
 }
 
+#[derive(Clone)]
+pub struct RuntimeShutdownControl {
+    requests: mpsc::UnboundedSender<RuntimeControlMessage>,
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum RuntimeShutdownError {
+    #[error("desktop runtime shutdown is unavailable")]
+    Unavailable,
+    #[error("desktop runtime shutdown failed")]
+    Failed,
+}
+
+impl RuntimeShutdownControl {
+    pub async fn shutdown(&self, reason: &'static str) -> Result<(), RuntimeShutdownError> {
+        let (completion, completed) = oneshot::channel();
+        self.requests
+            .send(RuntimeControlMessage::Shutdown { reason, completion })
+            .map_err(|_| RuntimeShutdownError::Unavailable)?;
+        completed
+            .await
+            .map_err(|_| RuntimeShutdownError::Unavailable)?
+    }
+}
+
+impl RuntimeShutdown for RuntimeShutdownControl {
+    fn shutdown(&self, reason: &'static str) -> ShutdownFuture<'_> {
+        Box::pin(async move {
+            RuntimeShutdownControl::shutdown(self, reason)
+                .await
+                .map_err(|_| ())
+        })
+    }
+
+    fn cleanup_owned(&self) {
+        let _ = self.requests.send(RuntimeControlMessage::CleanupOwned);
+    }
+}
+
+enum RuntimeControlMessage {
+    Shutdown {
+        reason: &'static str,
+        completion: oneshot::Sender<Result<(), RuntimeShutdownError>>,
+    },
+    CleanupOwned,
+}
+
 pub struct RuntimeSupervisor<L, C> {
     launcher: L,
     clock: C,
@@ -201,6 +250,8 @@ pub struct RuntimeSupervisor<L, C> {
     state: Supervisor,
     terminal_failure: Option<RuntimeFailure>,
     latest_notice: watch::Sender<Option<RuntimeSupervisorNotice>>,
+    shutdown_requests: mpsc::UnboundedReceiver<RuntimeControlMessage>,
+    shutdown_control: RuntimeShutdownControl,
 }
 
 impl<L> RuntimeSupervisor<L, SystemClock>
@@ -238,6 +289,7 @@ where
         policy: RestartPolicy,
     ) -> Self {
         let (latest_notice, _) = watch::channel(None);
+        let (requests, shutdown_requests) = mpsc::unbounded_channel();
         Self {
             launcher,
             clock,
@@ -248,6 +300,8 @@ where
             state: Supervisor::new(),
             terminal_failure: None,
             latest_notice,
+            shutdown_requests,
+            shutdown_control: RuntimeShutdownControl { requests },
         }
     }
 
@@ -257,6 +311,10 @@ where
 
     pub fn subscribe_notices(&self) -> watch::Receiver<Option<RuntimeSupervisorNotice>> {
         self.latest_notice.subscribe()
+    }
+
+    pub fn shutdown_control(&self) -> RuntimeShutdownControl {
+        self.shutdown_control.clone()
     }
 
     pub fn explicit_operator_retry(&mut self) -> Result<(), RuntimeSupervisorError> {
@@ -348,6 +406,7 @@ where
             let observed = loop {
                 let mut event_future = Box::pin(read_runtime_event(&mut stdout));
                 let mut wait_future = Box::pin(running.wait());
+                let mut shutdown_future = Box::pin(self.shutdown_requests.recv());
                 let signal = poll_fn(|context| {
                     if let Some(task) = stderr_drain.as_mut() {
                         if let std::task::Poll::Ready(result) = task.as_mut().poll(context) {
@@ -360,11 +419,16 @@ where
                     if let std::task::Poll::Ready(result) = wait_future.as_mut().poll(context) {
                         return std::task::Poll::Ready(AttemptSignal::Exit(result));
                     }
+                    if let std::task::Poll::Ready(request) = shutdown_future.as_mut().poll(context)
+                    {
+                        return std::task::Poll::Ready(AttemptSignal::Control(request));
+                    }
                     std::task::Poll::Pending
                 })
                 .await;
                 drop(event_future);
                 drop(wait_future);
+                drop(shutdown_future);
 
                 match signal {
                     AttemptSignal::Stderr(Ok(())) => {
@@ -446,6 +510,35 @@ where
                             drop_stderr: true,
                         };
                     }
+                    AttemptSignal::Control(Some(RuntimeControlMessage::Shutdown {
+                        reason,
+                        completion,
+                    })) => {
+                        debug_assert_eq!(reason, "application quit");
+                        drop(stderr_drain.take());
+                        let result = running
+                            .shutdown()
+                            .await
+                            .map_err(|_| RuntimeShutdownError::Failed);
+                        let _ = completion.send(result);
+                        publish_notice(
+                            &self.latest_notice,
+                            &notices,
+                            RuntimeSupervisorNotice::Stopped,
+                        );
+                        return Ok(SupervisionOutcome::Stopped);
+                    }
+                    AttemptSignal::Control(Some(RuntimeControlMessage::CleanupOwned)) => {
+                        drop(stderr_drain.take());
+                        let _ = running.force_owned_cleanup().await;
+                        publish_notice(
+                            &self.latest_notice,
+                            &notices,
+                            RuntimeSupervisorNotice::Stopped,
+                        );
+                        return Ok(SupervisionOutcome::Stopped);
+                    }
+                    AttemptSignal::Control(None) => {}
                 }
             };
 
@@ -558,6 +651,7 @@ enum AttemptSignal {
     Stderr(std::io::Result<()>),
     Stream(Result<RuntimeStreamItem, ProcessError>),
     Exit(Result<(), ProcessError>),
+    Control(Option<RuntimeControlMessage>),
 }
 
 fn publish_notice(
@@ -1731,6 +1825,52 @@ mod tests {
         ));
         assert_eq!(state.lock().unwrap().launches, 1);
         assert_eq!(state.lock().unwrap().drop_signals, 1);
+        std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
+    fn external_shutdown_reaches_the_currently_owned_running_runtime() {
+        let script = ChildScript {
+            stdout_pending: true,
+            wait_pending: true,
+            stderr_pending: true,
+            ..ChildScript::crash(
+                concat!(
+                    "{\"version\":1,\"state\":\"initializing\"}\n",
+                    "{\"version\":1,\"state\":\"preparing_database\"}\n",
+                    "{\"version\":1,\"state\":\"migrating\"}\n",
+                    "{\"version\":1,\"state\":\"starting_services\"}\n",
+                    "{\"version\":1,\"state\":\"ready\",\"port\":49152,\"bootstrap_path\":\"/desktop/bootstrap/safe\"}\n"
+                ),
+                Duration::ZERO,
+            )
+        };
+        let (mut supervisor, state, _clock, support_dir) =
+            fake_supervisor(vec![script], "external-shutdown");
+        let shutdown = supervisor.shutdown_control();
+        let (sender, _receiver) = mpsc::channel(16);
+
+        let observed_state = Arc::clone(&state);
+        let outcome = runtime().block_on(async move {
+            let supervision =
+                tokio::spawn(async move { supervisor.supervise_until_terminal(sender).await });
+            while observed_state.lock().unwrap().launches == 0 {
+                tokio::task::yield_now().await;
+            }
+            shutdown.shutdown("application quit").await.unwrap();
+            supervision.await.unwrap().unwrap()
+        });
+
+        assert_eq!(outcome, SupervisionOutcome::Stopped);
+        let state = state.lock().unwrap();
+        assert_eq!(state.launches, 1);
+        assert_eq!(state.kills, 1);
+        assert_eq!(state.drop_signals, 0);
+        assert_eq!(
+            state.writes.last().unwrap(),
+            b"{\"version\":1,\"command\":\"shutdown\"}\n"
+        );
+        drop(state);
         std::fs::remove_dir_all(support_dir).unwrap();
     }
 
