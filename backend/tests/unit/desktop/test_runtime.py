@@ -1094,8 +1094,11 @@ def test_cancelling_default_stdin_read_does_not_hold_asyncio_run_open(
         assert run_finished.wait(timeout=0.25)
     finally:
         os.close(write_fd)
-        consumer.join(timeout=1)
-        os.close(read_fd)
+        consumer.join(timeout=5)
+        try:
+            assert not consumer.is_alive()
+        finally:
+            os.close(read_fd)
     assert failures == []
 
 
