@@ -12,7 +12,9 @@ use url::Url;
 use crate::app_lifecycle::{RuntimeShutdown, ShutdownFuture};
 use crate::runtime::process::RuntimeLauncher;
 use crate::runtime::state::SupervisorState;
-use crate::runtime::supervisor::{RuntimeSupervisor, RuntimeSupervisorNotice, SupervisorClock};
+use crate::runtime::supervisor::{
+    RuntimeFailure, RuntimeSupervisor, RuntimeSupervisorNotice, SupervisionOutcome, SupervisorClock,
+};
 use crate::webview::{status_url, status_url_with_logs, DesktopUiState};
 use crate::DesktopNavigationController;
 
@@ -33,6 +35,8 @@ pub enum DesktopServiceError {
     Navigation,
     #[error("desktop runtime supervision failed")]
     Runtime,
+    #[error("desktop runtime owned cleanup was not confirmed")]
+    CleanupUnconfirmed,
     #[error("desktop runtime retry is only available from a terminal state")]
     RetryNotTerminal,
     #[error("desktop runtime supervision is already active")]
@@ -282,11 +286,20 @@ where
     fn supervise_until_terminal(&mut self) -> DesktopRuntimeFuture<'_> {
         Box::pin(async move {
             let (notices, _unused_receiver) = mpsc::channel(1);
-            RuntimeSupervisor::supervise_until_terminal(self, notices)
+            let outcome = RuntimeSupervisor::supervise_until_terminal(self, notices)
                 .await
-                .map(|_| ())
-                .map_err(|_| DesktopServiceError::Runtime)
+                .map_err(|_| DesktopServiceError::Runtime)?;
+            map_supervision_outcome(outcome)
         })
+    }
+}
+
+fn map_supervision_outcome(outcome: SupervisionOutcome) -> Result<(), DesktopServiceError> {
+    match outcome {
+        SupervisionOutcome::Terminal(RuntimeFailure::CleanupFailed) => {
+            Err(DesktopServiceError::CleanupUnconfirmed)
+        }
+        SupervisionOutcome::Terminal(_) | SupervisionOutcome::Stopped => Ok(()),
     }
 }
 
@@ -306,12 +319,12 @@ pub struct DesktopRuntimeService<R, N> {
 
 struct SupervisionTask {
     generation: u64,
-    task: tauri::async_runtime::JoinHandle<()>,
+    task: tauri::async_runtime::JoinHandle<Result<(), DesktopServiceError>>,
 }
 
 #[cfg(test)]
 impl SupervisionTask {
-    fn inner(&self) -> &tokio::task::JoinHandle<()> {
+    fn inner(&self) -> &tokio::task::JoinHandle<Result<(), DesktopServiceError>> {
         self.task.inner()
     }
 }
@@ -458,6 +471,7 @@ where
                         .report(DesktopDiagnosticEvent::NavigationFallbackFailed);
                 }
             }
+            result
         });
         *self
             .supervision_task
@@ -567,11 +581,11 @@ where
             };
             if task.inner().is_finished() {
                 return match task.await {
-                    Ok(()) => {
+                    Ok(Ok(())) => {
                         self.shutdown.finish_supervision_generation(generation);
                         Ok(())
                     }
-                    Err(_) => {
+                    Ok(Err(_)) | Err(_) => {
                         let retained_cleanup = self.shutdown.take_owned_cleanup_handle(generation);
                         let _ = self.confirm_retained_cleanup(retained_cleanup).await;
                         Err(())
@@ -593,8 +607,8 @@ where
             }
             let joined = match tokio::time::timeout(self.task_cancellation_timeout, &mut task).await
             {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(_)) => Err(()),
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(_))) | Ok(Err(_)) => Err(()),
                 Err(_) => {
                     task.abort();
                     aborted = true;
@@ -638,7 +652,8 @@ where
         Box::pin(async move {
             let task_result = if let Some(task) = task {
                 match tokio::time::timeout(self.task_cancellation_timeout, task.task).await {
-                    Ok(Ok(())) => Ok(()),
+                    Ok(Ok(Ok(()))) => Ok(()),
+                    Ok(Ok(Err(_))) => Err(()),
                     Ok(Err(tauri::Error::JoinError(error))) if error.is_cancelled() => Ok(()),
                     Ok(Err(_)) | Err(_) => Err(()),
                 }
@@ -868,10 +883,11 @@ mod tests {
     use url::Url;
 
     use super::{
-        finder_reveal_command, DesktopDiagnosticEvent, DesktopDiagnosticReporter, DesktopInstaller,
-        DesktopNavigator, DesktopPaths, DesktopRetryControl, DesktopRuntime, DesktopRuntimeService,
-        DesktopServiceError, DesktopSetupFailure, InstalledDesktopRuntime, RecoverableDesktopSetup,
-        RuntimeStartPermit, PHASE_TERMINAL, SHUTDOWN_COMPLETION_TIMEOUT,
+        finder_reveal_command, map_supervision_outcome, DesktopDiagnosticEvent,
+        DesktopDiagnosticReporter, DesktopInstaller, DesktopNavigator, DesktopPaths,
+        DesktopRetryControl, DesktopRuntime, DesktopRuntimeService, DesktopServiceError,
+        DesktopSetupFailure, InstalledDesktopRuntime, RecoverableDesktopSetup, RuntimeStartPermit,
+        PHASE_TERMINAL, SHUTDOWN_COMPLETION_TIMEOUT,
     };
     use crate::app_lifecycle::{
         cleanup_rejected_runtime, AppLifecycle, CloseDecision, LifecycleApplication,
@@ -879,9 +895,9 @@ mod tests {
         APPLICATION_QUIT_REASON,
     };
     use crate::runtime::process::OwnedRuntimeCleanup;
-    use crate::runtime::protocol::RuntimeEvent;
+    use crate::runtime::protocol::{FailureCode, RuntimeEvent};
     use crate::runtime::supervisor::{
-        RuntimeFailure, RuntimeSupervisorNotice, SHUTDOWN_CONTROL_TIMEOUT,
+        RuntimeFailure, RuntimeSupervisorNotice, SupervisionOutcome, SHUTDOWN_CONTROL_TIMEOUT,
     };
 
     type RuntimeFuture<'a> =
@@ -980,6 +996,54 @@ mod tests {
     struct CompletedRuntime {
         notices: watch::Sender<Option<RuntimeSupervisorNotice>>,
         terminal: bool,
+    }
+
+    struct FailedRuntime {
+        notices: watch::Sender<Option<RuntimeSupervisorNotice>>,
+    }
+
+    struct OrdinaryTerminalRuntime {
+        notices: watch::Sender<Option<RuntimeSupervisorNotice>>,
+    }
+
+    impl DesktopRuntime for FailedRuntime {
+        fn subscribe_notices(&self) -> watch::Receiver<Option<RuntimeSupervisorNotice>> {
+            self.notices.subscribe()
+        }
+
+        fn is_terminal(&self) -> bool {
+            true
+        }
+
+        fn explicit_operator_retry(&mut self) -> Result<(), DesktopServiceError> {
+            Ok(())
+        }
+
+        fn supervise_until_terminal(&mut self) -> RuntimeFuture<'_> {
+            Box::pin(async { Err(DesktopServiceError::Runtime) })
+        }
+    }
+
+    impl DesktopRuntime for OrdinaryTerminalRuntime {
+        fn subscribe_notices(&self) -> watch::Receiver<Option<RuntimeSupervisorNotice>> {
+            self.notices.subscribe()
+        }
+
+        fn is_terminal(&self) -> bool {
+            true
+        }
+
+        fn explicit_operator_retry(&mut self) -> Result<(), DesktopServiceError> {
+            Ok(())
+        }
+
+        fn supervise_until_terminal(&mut self) -> RuntimeFuture<'_> {
+            Box::pin(async {
+                map_supervision_outcome(SupervisionOutcome::Terminal(RuntimeFailure::Reported(
+                    FailureCode::MigrationFailed,
+                )))
+            })
+        }
     }
 
     struct PanickingRuntime {
@@ -1765,6 +1829,21 @@ mod tests {
     }
 
     #[test]
+    fn production_adapter_preserves_cleanup_failure_but_accepts_business_terminal_state() {
+        assert!(map_supervision_outcome(SupervisionOutcome::Terminal(
+            RuntimeFailure::CleanupFailed
+        ))
+        .is_err());
+        assert!(
+            map_supervision_outcome(SupervisionOutcome::Terminal(RuntimeFailure::Reported(
+                FailureCode::MigrationFailed
+            )))
+            .is_ok()
+        );
+        assert!(map_supervision_outcome(SupervisionOutcome::Stopped).is_ok());
+    }
+
+    #[test]
     fn shutdown_timeout_aborts_and_confirms_the_retained_owned_cleanup() {
         tauri::async_runtime::block_on(async {
             let (notices, _) = watch::channel(None);
@@ -1946,6 +2025,106 @@ mod tests {
             assert!(service.shutdown(APPLICATION_QUIT_REASON).await.is_err());
             assert_eq!(cleanup.signals.load(Ordering::SeqCst), 1);
             assert_eq!(cleanup.confirmations.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn failed_supervision_task_confirms_retained_cleanup_exactly_once() {
+        tauri::async_runtime::block_on(async {
+            let (notices, _) = watch::channel(None);
+            let cleanup = Arc::new(TestOwnedCleanup::default());
+            let shutdown = Arc::new(RetainingShutdown {
+                cleanup: Arc::clone(&cleanup),
+                pending: false,
+            });
+            let service = Arc::new(DesktopRuntimeService::with_reporter_and_shutdown(
+                FailedRuntime { notices },
+                FakeNavigator::default(),
+                Arc::new(RecordingReporter::default()),
+                shutdown as Arc<dyn RuntimeShutdown>,
+            ));
+            assert!(service.start_supervision());
+            wait_for(|| {
+                service
+                    .supervision_task
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|task| task.inner().is_finished())
+            })
+            .await;
+
+            assert!(service.shutdown(APPLICATION_QUIT_REASON).await.is_err());
+            assert_eq!(cleanup.signals.load(Ordering::SeqCst), 1);
+            assert_eq!(cleanup.confirmations.load(Ordering::SeqCst), 1);
+            assert!(service.shutdown(APPLICATION_QUIT_REASON).await.is_ok());
+            assert_eq!(cleanup.signals.load(Ordering::SeqCst), 1);
+            assert_eq!(cleanup.confirmations.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn failed_supervision_with_unconfirmed_cleanup_returns_an_error() {
+        tauri::async_runtime::block_on(async {
+            let (notices, _) = watch::channel(None);
+            let cleanup = Arc::new(TestOwnedCleanup::default());
+            cleanup.fail_confirmation.store(true, Ordering::SeqCst);
+            let shutdown = Arc::new(RetainingShutdown {
+                cleanup: Arc::clone(&cleanup),
+                pending: false,
+            });
+            let service = Arc::new(DesktopRuntimeService::with_reporter_and_shutdown(
+                FailedRuntime { notices },
+                FakeNavigator::default(),
+                Arc::new(RecordingReporter::default()),
+                shutdown as Arc<dyn RuntimeShutdown>,
+            ));
+            assert!(service.start_supervision());
+            wait_for(|| {
+                service
+                    .supervision_task
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|task| task.inner().is_finished())
+            })
+            .await;
+
+            assert!(service.shutdown(APPLICATION_QUIT_REASON).await.is_err());
+            assert_eq!(cleanup.signals.load(Ordering::SeqCst), 1);
+            assert_eq!(cleanup.confirmations.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn ordinary_business_terminal_does_not_trigger_owned_cleanup_failure() {
+        tauri::async_runtime::block_on(async {
+            let (notices, _) = watch::channel(None);
+            let cleanup = Arc::new(TestOwnedCleanup::default());
+            let shutdown = Arc::new(RetainingShutdown {
+                cleanup: Arc::clone(&cleanup),
+                pending: false,
+            });
+            let service = Arc::new(DesktopRuntimeService::with_reporter_and_shutdown(
+                OrdinaryTerminalRuntime { notices },
+                FakeNavigator::default(),
+                Arc::new(RecordingReporter::default()),
+                shutdown as Arc<dyn RuntimeShutdown>,
+            ));
+            assert!(service.start_supervision());
+            wait_for(|| {
+                service
+                    .supervision_task
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|task| task.inner().is_finished())
+            })
+            .await;
+
+            assert!(service.shutdown(APPLICATION_QUIT_REASON).await.is_ok());
+            assert_eq!(cleanup.signals.load(Ordering::SeqCst), 0);
+            assert_eq!(cleanup.confirmations.load(Ordering::SeqCst), 0);
         });
     }
 
