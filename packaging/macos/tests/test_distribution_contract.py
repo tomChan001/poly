@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -443,6 +444,7 @@ class DistributionContractTests(unittest.TestCase):
                 "_internal/postgres/bin/postgres",
                 "postgres/bin/psql",
                 "_internal/libpython3.12.dylib",
+                "libpython3.12.dylib",
             ]
             for relative in paths:
                 packaged = runtime / relative
@@ -465,6 +467,7 @@ class DistributionContractTests(unittest.TestCase):
             self.assertEqual(classifications[paths[1]], "PostgreSQL")
             self.assertEqual(classifications[paths[2]], "PostgreSQL")
             self.assertEqual(classifications[paths[3]], "CPython")
+            self.assertEqual(classifications[paths[4]], "CPython")
             with self.assertRaisesRegex(ValueError, "packaged native file lacks inventory"):
                 module.classify_macho_paths(
                     ["_internal/libmystery.dylib"],
@@ -504,6 +507,27 @@ class DistributionContractTests(unittest.TestCase):
                     },
                     native_license_root=native,
                 )
+
+    def test_cpython_library_manifest_has_both_exact_onedir_layouts(self) -> None:
+        module = load_macos_module("notice_generator")
+        values = {
+            "LDLIBRARY": "/Library/Frameworks/Python/libpython3.12.dylib",
+            "INSTSONAME": "libpython3.12.dylib",
+        }
+        with patch.object(
+            module.sysconfig,
+            "get_config_var",
+            side_effect=values.get,
+        ):
+            self.assertEqual(
+                module.cpython_library_files(),
+                frozenset(
+                    {
+                        "libpython3.12.dylib",
+                        "_internal/libpython3.12.dylib",
+                    }
+                ),
+            )
 
     def test_runtime_file_inventory_fails_unknown_wasm_script_and_blob(self) -> None:
         module = load_macos_module("license_inventory")
