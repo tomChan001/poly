@@ -47,27 +47,68 @@ macho_require_contained() {
   esac
 }
 
+macho_executable_directory() {
+  local owner="$1"
+  local owner_canonical context_root executable context_canonical executable_canonical
+  local best_root="" best_executable=""
+  [[ -n "${MACHO_AUDIT_CONTEXTS_FILE:-}" && -f "${MACHO_AUDIT_CONTEXTS_FILE}" ]] ||
+    die "@executable_path has no declared main executable context in ${owner}"
+  if ! owner_canonical="$(realpath "${owner}")"; then
+    die "could not canonicalize Mach-O owner: ${owner}"
+  fi
+  while IFS=$'\t' read -r context_root executable; do
+    [[ -n "${context_root}" && -n "${executable}" ]] || continue
+    if ! context_canonical="$(realpath "${context_root}")"; then
+      die "could not canonicalize executable context root: ${context_root}"
+    fi
+    case "${owner_canonical}" in
+      "${context_canonical}"|"${context_canonical}/"*) ;;
+      *) continue ;;
+    esac
+    if [[ "${#context_canonical}" -gt "${#best_root}" ]]; then
+      best_root="${context_canonical}"
+      best_executable="${executable}"
+    fi
+  done <"${MACHO_AUDIT_CONTEXTS_FILE}"
+  [[ -n "${best_executable}" ]] ||
+    die "@executable_path has no matching main executable context in ${owner}"
+  if ! executable_canonical="$(realpath "${best_executable}")"; then
+    die "could not canonicalize declared main executable: ${best_executable}"
+  fi
+  macho_require_contained "${owner}" "main executable" "${executable_canonical}"
+  [[ -f "${executable_canonical}" ]] ||
+    die "declared main executable does not exist: ${best_executable}"
+  dirname -- "${executable_canonical}"
+}
+
 macho_resolve_token_path() {
   local owner="$1"
   local value="$2"
   local expected_kind="$3"
-  local owner_canonical owner_directory suffix candidate resolved
+  local owner_canonical owner_directory executable_directory suffix candidate resolved
   if ! owner_canonical="$(realpath "${owner}")"; then
     die "could not canonicalize Mach-O owner: ${owner}"
   fi
   macho_require_contained "${owner}" "owner" "${owner_canonical}"
   owner_directory="$(dirname -- "${owner_canonical}")"
   case "${value}" in
-    @loader_path|@executable_path)
+    @loader_path)
       candidate="${owner_directory}"
       ;;
     @loader_path/*)
       suffix="${value#@loader_path/}"
       candidate="${owner_directory}/${suffix}"
       ;;
-    @executable_path/*)
+    @executable_path|@executable_path/*)
+      if ! executable_directory="$(macho_executable_directory "${owner}")"; then
+        die "failed to select main executable context in ${owner}"
+      fi
       suffix="${value#@executable_path/}"
-      candidate="${owner_directory}/${suffix}"
+      if [[ "${value}" == "@executable_path" ]]; then
+        candidate="${executable_directory}"
+      else
+        candidate="${executable_directory}/${suffix}"
+      fi
       ;;
     *)
       die "unexpected dependency or rpath in ${owner}: ${value}"
@@ -159,11 +200,22 @@ macho_check_dependency() {
 macho_audit_tree() {
   local tree="$1"
   local work_dir="$2"
-  local candidate canonical_candidate dependency
+  local candidate canonical_candidate canonical_boundary dependency
+  if ! canonical_boundary="$(realpath "${MACHO_AUDIT_BOUNDARY:-${tree}}")"; then
+    die "could not canonicalize audit boundary: ${MACHO_AUDIT_BOUNDARY:-${tree}}"
+  fi
+  [[ -d "${canonical_boundary}" ]] ||
+    die "audit boundary is not a directory: ${MACHO_AUDIT_BOUNDARY:-${tree}}"
   if ! MACHO_AUDIT_CANONICAL_ROOT="$(realpath "${tree}")"; then
     die "could not canonicalize packaged root: ${tree}"
   fi
   [[ -d "${MACHO_AUDIT_CANONICAL_ROOT}" ]] || die "packaged root is not a directory: ${tree}"
+  case "${MACHO_AUDIT_CANONICAL_ROOT}" in
+    "${canonical_boundary}"|"${canonical_boundary}/"*) ;;
+    *)
+      die "packaged root escapes audit boundary: ${tree} -> ${MACHO_AUDIT_CANONICAL_ROOT}"
+      ;;
+  esac
   if ! "${MACHO_AUDIT_FIND_BIN}" "${tree}" \( -type f -o -type l \) -print0 >"${work_dir}/audit-files"; then
     die "find failed while auditing ${tree}"
   fi

@@ -16,6 +16,8 @@ MACHO_AUDIT_FIND_BIN="find"
 MACHO_AUDIT_FILE_BIN="file"
 MACHO_AUDIT_OTOOL_BIN="otool"
 MACHO_AUDIT_CODESIGN=0
+MACHO_AUDIT_BOUNDARY=""
+MACHO_AUDIT_CONTEXTS_FILE=""
 # shellcheck source=packaging/macos/macho-audit.sh
 source "${SCRIPT_DIR}/macho-audit.sh"
 
@@ -41,6 +43,12 @@ if [[ "${1:-}" == "--audit-tree" ]]; then
     [[ -n "${AUDIT_TEMP:-}" && -d "${AUDIT_TEMP}" ]] && rm -rf -- "${AUDIT_TEMP}"
   }
   trap cleanup_audit EXIT INT TERM
+  MACHO_AUDIT_BOUNDARY="${POLY_TEST_AUDIT_BOUNDARY:-$2}"
+  MACHO_AUDIT_CONTEXTS_FILE="${AUDIT_TEMP}/executable-contexts"
+  : >"${MACHO_AUDIT_CONTEXTS_FILE}"
+  if [[ -n "${POLY_TEST_MAIN_EXECUTABLE:-}" ]]; then
+    printf '%s\t%s\n' "$2" "${POLY_TEST_MAIN_EXECUTABLE}" >"${MACHO_AUDIT_CONTEXTS_FILE}"
+  fi
   macho_audit_tree "$2" "${AUDIT_TEMP}"
   printf 'Mach-O dependency audit passed: %s\n' "$2"
   exit 0
@@ -151,6 +159,9 @@ while IFS= read -r -d '' macho; do
   done <"${BUILD_TEMP}/rpaths"
 done <"${BUILD_TEMP}/staged-files"
 
+MACHO_AUDIT_BOUNDARY="${STAGED}"
+MACHO_AUDIT_CONTEXTS_FILE="${BUILD_TEMP}/executable-contexts"
+printf '%s\t%s\n' "${STAGED}" "${STAGED}/bin/postgres" >"${MACHO_AUDIT_CONTEXTS_FILE}"
 macho_audit_tree "${STAGED}" "${BUILD_TEMP}"
 
 mv -- "${STAGED}" "${DESTINATION}"

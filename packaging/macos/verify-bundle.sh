@@ -15,6 +15,8 @@ MACHO_AUDIT_FIND_BIN="find"
 MACHO_AUDIT_FILE_BIN="file"
 MACHO_AUDIT_OTOOL_BIN="otool"
 MACHO_AUDIT_CODESIGN=0
+MACHO_AUDIT_BOUNDARY=""
+MACHO_AUDIT_CONTEXTS_FILE=""
 # shellcheck source=packaging/macos/macho-audit.sh
 source "${SCRIPT_DIR}/macho-audit.sh"
 
@@ -199,6 +201,12 @@ if [[ "${1:-}" == "--audit-tree" ]]; then
   done
   VERIFY_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/poly-bundle-audit.XXXXXXXX")"
   trap cleanup_temp EXIT INT TERM
+  MACHO_AUDIT_BOUNDARY="${POLY_TEST_AUDIT_BOUNDARY:-$2}"
+  MACHO_AUDIT_CONTEXTS_FILE="${VERIFY_TEMP}/executable-contexts"
+  : >"${MACHO_AUDIT_CONTEXTS_FILE}"
+  if [[ -n "${POLY_TEST_MAIN_EXECUTABLE:-}" ]]; then
+    printf '%s\t%s\n' "$2" "${POLY_TEST_MAIN_EXECUTABLE}" >"${MACHO_AUDIT_CONTEXTS_FILE}"
+  fi
   macho_audit_tree "$2" "${VERIFY_TEMP}"
   printf 'Mach-O dependency audit passed: %s\n' "$2"
   exit 0
@@ -247,6 +255,15 @@ spctl --assess --type execute --verbose=4 "${APP_PATH}"
 xcrun stapler validate "${APP_PATH}"
 
 MACHO_AUDIT_CODESIGN=1
+MACHO_AUDIT_BOUNDARY="${APP_PATH}"
+MACHO_AUDIT_CONTEXTS_FILE="${VERIFY_TEMP}/executable-contexts"
+printf '%s\t%s\n' "${APP_PATH}/Contents" "${APP_EXECUTABLE}" >"${MACHO_AUDIT_CONTEXTS_FILE}"
+printf '%s\t%s\n' "${RUNTIME_ROOT}" "${RUNTIME_EXECUTABLE}" >>"${MACHO_AUDIT_CONTEXTS_FILE}"
+for postgres_root in "${RUNTIME_ROOT}/postgres" "${RUNTIME_ROOT}/_internal/postgres"; do
+  if [[ -f "${postgres_root}/bin/postgres" ]]; then
+    printf '%s\t%s\n' "${postgres_root}" "${postgres_root}/bin/postgres" >>"${MACHO_AUDIT_CONTEXTS_FILE}"
+  fi
+done
 macho_audit_tree "${APP_PATH}/Contents" "${VERIFY_TEMP}"
 
 COLLECTED_PIDS=()

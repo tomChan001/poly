@@ -3,20 +3,60 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import importlib.metadata
+import importlib.util
 import json
-from pathlib import Path
 import re
 import sys
+import sysconfig
 import tomllib
-from packaging.markers import default_environment
-from packaging.requirements import Requirement
+from collections.abc import Set as AbstractSet
+from pathlib import Path
 
 from license_inventory import (
     classify_macho_paths,
     classify_runtime_paths,
     normalize_name,
 )
+
+
+def load_requirement_api():
+    """Load the third-party packaging distribution without name shadowing."""
+
+    alias = "_poly_notice_packaging"
+    package = sys.modules.get(alias)
+    if package is None:
+        distribution = importlib.metadata.distribution("packaging")
+        package_directory = Path(distribution.locate_file("packaging")).resolve()
+        init_path = package_directory / "__init__.py"
+        spec = importlib.util.spec_from_file_location(
+            alias,
+            init_path,
+            submodule_search_locations=[str(package_directory)],
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(
+                f"could not load the third-party packaging distribution from {init_path}"
+            )
+        package = importlib.util.module_from_spec(spec)
+        sys.modules[alias] = package
+        try:
+            spec.loader.exec_module(package)
+        except BaseException:
+            sys.modules.pop(alias, None)
+            raise
+    markers = importlib.import_module(f"{alias}.markers")
+    requirements = importlib.import_module(f"{alias}.requirements")
+    licenses = importlib.import_module(f"{alias}.licenses")
+    return (
+        markers.default_environment,
+        requirements.Requirement,
+        licenses.canonicalize_license_expression,
+    )
+
+
+default_environment, Requirement, canonicalize_license_expression = load_requirement_api()
 
 
 POSTGRESQL_LICENSE = """PostgreSQL Database Management System
@@ -165,6 +205,74 @@ def python_inventory(requirements: Path, uv_lock: Path) -> list[dict[str, str]]:
     return sorted(packages, key=lambda package: (package["name"].casefold(), package["version"]))
 
 
+def installed_distribution_files(names: set[str]) -> dict[str, frozenset[str]]:
+    wanted = {normalize_name(name) for name in names}
+    inventory: dict[str, frozenset[str]] = {}
+    for distribution in importlib.metadata.distributions():
+        name = normalize_name(distribution.metadata.get("Name", ""))
+        if name not in wanted:
+            continue
+        files = distribution.files
+        if not files:
+            raise ValueError(f"installed distribution has no RECORD/file inventory: {name}")
+        inventory[name] = frozenset(
+            str(path).replace("\\", "/") for path in files
+        )
+    missing = sorted(wanted - inventory.keys())
+    if missing:
+        raise ValueError(
+            "installed distributions lack RECORD/file inventory: "
+            + ", ".join(missing)
+        )
+    return inventory
+
+
+def cpython_stdlib_files() -> frozenset[str]:
+    stdlib_root = Path(sysconfig.get_path("stdlib")).resolve()
+    if not stdlib_root.is_dir():
+        raise ValueError(f"CPython standard library root is missing: {stdlib_root}")
+    return frozenset(
+        path.relative_to(stdlib_root).as_posix()
+        for path in stdlib_root.rglob("*")
+        if path.is_file()
+    )
+
+
+def cpython_library_files() -> frozenset[str]:
+    names = {
+        Path(value).name
+        for key in ("LDLIBRARY", "INSTSONAME")
+        if (value := sysconfig.get_config_var(key))
+        and str(value).endswith(".dylib")
+    }
+    if not names:
+        raise ValueError("CPython build metadata lacks its macOS dynamic library name")
+    return frozenset(names)
+
+
+def pyinstaller_runtime_files(
+    distribution_files: AbstractSet[str],
+) -> frozenset[str]:
+    runtime_files: set[str] = set()
+    for raw_path in distribution_files:
+        path = raw_path.replace("\\", "/")
+        match = re.fullmatch(r"PyInstaller/loader/(pyimod\d+_[^/]+)\.py", path)
+        if match:
+            runtime_files.add(f"{match.group(1)}.pyc")
+            continue
+        match = re.fullmatch(r"PyInstaller/hooks/rthooks/(pyi_rth_[^/]+)\.py", path)
+        if match:
+            runtime_files.update({f"{match.group(1)}.py", f"{match.group(1)}.pyc"})
+            continue
+        prefix = "PyInstaller/fake-modules/"
+        if path.startswith(f"{prefix}_pyi_rth_utils/") and path.endswith(".py"):
+            relative = path.removeprefix(prefix)
+            runtime_files.update({relative, f"{relative}c"})
+    if not runtime_files:
+        raise ValueError("PyInstaller distribution lacks its runtime support manifest")
+    return frozenset(runtime_files)
+
+
 def rust_inventory(metadata_paths: list[Path]) -> tuple[list[dict[str, str]], Path]:
     selected: dict[tuple[str, str], dict[str, str]] = {}
     tauri_root: Path | None = None
@@ -230,36 +338,98 @@ def npm_inventory(lock_path: Path) -> list[dict[str, str]]:
     return sorted(packages, key=lambda package: (package["name"].casefold(), package["version"]))
 
 
-LICENSE_ALIASES = {
-    "apache 2.0": "apache-2.0",
-    "apache software license": "apache-2.0",
-    "bsd": "bsd-unspecified",
-    "bsd license": "bsd-unspecified",
-    "mit license": "mit",
-    "mozilla public license 2.0 (mpl 2.0)": "mpl-2.0",
-    "public domain": "public-domain",
-    "the mit license (mit)": "mit",
-}
+LICENSE_LABEL_ALIASES = (
+    ("Mozilla Public License 2.0 (MPL 2.0)", "MPL-2.0"),
+    ("GNU General Public License v2 (GPLv2)", "GPL-2.0-only"),
+    ("The MIT License (MIT)", "MIT"),
+    ("Apache Software License", "Apache-2.0"),
+    ("Apache 2.0", "Apache-2.0"),
+    ("MIT License", "MIT"),
+    ("BSD License", "LicenseRef-BSD-Unspecified"),
+    ("Public-Domain", "LicenseRef-Public-Domain"),
+    ("Public Domain", "LicenseRef-Public-Domain"),
+)
 
 
-def normalized_license_terms(expression: str) -> frozenset[str]:
-    """Normalize common tool labels while preserving substantive license terms."""
+def normalized_license_expression(expression: str) -> tuple[object, ...]:
+    """Return a commutative syntax tree for a validated SPDX expression."""
 
-    normalized = " ".join(expression.strip().split()).casefold()
-    if not normalized or normalized in {"none", "unknown", "n/a"}:
+    normalized = " ".join(expression.strip().split())
+    if not normalized or normalized.casefold() in {"none", "unknown", "n/a"}:
         raise ValueError(f"unknown license expression: {expression!r}")
-    if normalized in LICENSE_ALIASES:
-        return frozenset({LICENSE_ALIASES[normalized]})
-    terms: set[str] = set()
-    for raw_term in re.split(r"\s+(?:and|or)\s+|[/;,]", normalized):
-        term = raw_term.strip().strip("() ")
-        term = re.sub(r"^osi approved\s*::\s*", "", term)
-        term = LICENSE_ALIASES.get(term, term)
-        if term:
-            terms.add(term)
-    if not terms:
-        raise ValueError(f"unknown license expression: {expression!r}")
-    return frozenset(terms)
+    normalized = normalized.replace(";", " OR ")
+    for label, replacement in LICENSE_LABEL_ALIASES:
+        normalized = re.sub(
+            re.escape(label), replacement, normalized, flags=re.IGNORECASE
+        )
+    normalized = re.sub(
+        r"(?<![-A-Za-z0-9])BSD(?![-A-Za-z0-9])",
+        "LicenseRef-BSD-Unspecified",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    try:
+        canonical = str(canonicalize_license_expression(normalized))
+    except Exception as error:
+        raise ValueError(
+            f"invalid or unknown license expression {expression!r}: {error}"
+        ) from error
+
+    tokens = re.findall(r"\(|\)|[^\s()]+", canonical)
+    position = 0
+
+    def combine(operator: str, left: tuple[object, ...], right: tuple[object, ...]):
+        children: list[tuple[object, ...]] = []
+        for node in (left, right):
+            if node[0] == operator:
+                children.extend(node[1:])
+            else:
+                children.append(node)
+        return (operator, *sorted(children, key=repr))
+
+    def parse_primary() -> tuple[object, ...]:
+        nonlocal position
+        if tokens[position] == "(":
+            position += 1
+            node = parse_or()
+            if position >= len(tokens) or tokens[position] != ")":
+                raise ValueError(f"unbalanced canonical license expression: {canonical}")
+            position += 1
+            return node
+        token = tokens[position]
+        position += 1
+        return ("LICENSE", token)
+
+    def parse_with() -> tuple[object, ...]:
+        nonlocal position
+        node = parse_primary()
+        if position < len(tokens) and tokens[position] == "WITH":
+            position += 1
+            exception = tokens[position]
+            position += 1
+            return ("WITH", node, exception)
+        return node
+
+    def parse_and() -> tuple[object, ...]:
+        nonlocal position
+        node = parse_with()
+        while position < len(tokens) and tokens[position] == "AND":
+            position += 1
+            node = combine("AND", node, parse_with())
+        return node
+
+    def parse_or() -> tuple[object, ...]:
+        nonlocal position
+        node = parse_and()
+        while position < len(tokens) and tokens[position] == "OR":
+            position += 1
+            node = combine("OR", node, parse_and())
+        return node
+
+    tree = parse_or()
+    if position != len(tokens):
+        raise ValueError(f"could not parse canonical license expression: {canonical}")
+    return tree
 
 
 def validate_external_inventory(
@@ -291,8 +461,8 @@ def validate_external_inventory(
             mismatched.append(f"{label} (empty external license)")
         else:
             try:
-                expected_terms = normalized_license_terms(package["license"])
-                external_terms = normalized_license_terms(external_license)
+                expected_terms = normalized_license_expression(package["license"])
+                external_terms = normalized_license_expression(external_license)
             except ValueError as error:
                 mismatched.append(f"{label} ({error})")
             else:
@@ -399,11 +569,20 @@ def main() -> int:
             raise ValueError("assembled mode requires Mach-O inventory and native license root")
         macho_paths = args.macho_inventory.read_text(encoding="utf-8").splitlines()
         production = {package["name"]: package for package in python}
+        distribution_files = installed_distribution_files(set(production))
+        stdlib_files = cpython_stdlib_files()
+        cpython_libraries = cpython_library_files()
+        pyinstaller_files = installed_distribution_files({"PyInstaller"})[
+            normalize_name("PyInstaller")
+        ]
+        pyinstaller_manifest = pyinstaller_runtime_files(pyinstaller_files)
         classifications = classify_macho_paths(
             macho_paths,
             production_distributions=production,
             package_distributions=importlib.metadata.packages_distributions(),
-            stdlib_modules=sys.stdlib_module_names,
+            distribution_files=distribution_files,
+            stdlib_files=stdlib_files,
+            cpython_library_files=cpython_libraries,
             native_license_root=args.native_license_root,
         )
         runtime_paths = sorted(
@@ -419,7 +598,9 @@ def main() -> int:
             macho_classifications=classifications,
             production_distributions=production,
             package_distributions=importlib.metadata.packages_distributions(),
-            stdlib_modules=sys.stdlib_module_names,
+            distribution_files=distribution_files,
+            stdlib_files=stdlib_files,
+            pyinstaller_runtime_files=pyinstaller_manifest,
         )
         parts.extend(["", "## Assembled native file inventory", "", "| Packaged file | License attribution |", "| --- | --- |"])
         for relative in runtime_paths:

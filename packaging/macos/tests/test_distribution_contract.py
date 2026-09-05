@@ -284,13 +284,101 @@ class DistributionContractTests(unittest.TestCase):
             )
             for script_name in ("fetch-postgres.sh", "verify-bundle.sh"):
                 result = subprocess.run(
-                    [bash, str(MACOS / script_name), "--audit-tree", str(tree)],
+                    [
+                        bash,
+                        str(MACOS / script_name),
+                        "--audit-tree",
+                        git_bash_path(tree),
+                    ],
                     capture_output=True,
                     text=True,
                     env=env,
                     check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_macho_audit_uses_main_executable_context(self) -> None:
+        bash = bash_executable()
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary)
+            tree = fixture / "tree"
+            owner = tree / "Frameworks" / "Nested" / "owner.dylib"
+            library = tree / "Frameworks" / "libok.dylib"
+            main_executable = tree / "MacOS" / "Poly"
+            for path in (owner, library, main_executable):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"Mach-O fixture")
+            stubs = fixture / "stubs"
+            stubs.mkdir()
+            write_stub(stubs, "find", "printf '%s\\0' \"$1/Frameworks/Nested/owner.dylib\"")
+            write_stub(stubs, "file", "printf 'Mach-O 64-bit dynamically linked shared library\\n'")
+            write_stub(
+                stubs,
+                "otool",
+                "if [[ \"$1\" == '-L' ]]; then "
+                "printf '%s:\\n\\t@executable_path/../Frameworks/libok.dylib "
+                "(compatibility version 1.0.0)\\n' \"$2\"; else :; fi",
+            )
+            env = os.environ.copy()
+            env["PATH"] = f"{git_bash_path(stubs)}:/usr/bin:/bin"
+            env.update(
+                POLY_TEST_FIND=git_bash_path(stubs / "find"),
+                POLY_TEST_FILE=git_bash_path(stubs / "file"),
+                POLY_TEST_OTOOL=git_bash_path(stubs / "otool"),
+                POLY_TEST_MAIN_EXECUTABLE=git_bash_path(main_executable),
+            )
+            for script_name in ("fetch-postgres.sh", "verify-bundle.sh"):
+                result = subprocess.run(
+                    [
+                        bash,
+                        str(MACOS / script_name),
+                        "--audit-tree",
+                        git_bash_path(tree),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_macho_audit_rejects_tree_outside_declared_boundary(self) -> None:
+        bash = bash_executable()
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary)
+            boundary = fixture / "Poly.app"
+            tree = fixture / "escaped-contents"
+            owner = tree / "owner"
+            for directory in (boundary, tree):
+                directory.mkdir()
+            owner.write_bytes(b"not Mach-O")
+            stubs = fixture / "stubs"
+            stubs.mkdir()
+            write_stub(stubs, "find", "printf '%s\\0' \"$1/owner\"")
+            write_stub(stubs, "file", "printf 'data\\n'")
+            write_stub(stubs, "otool", "exit 0")
+            env = os.environ.copy()
+            env["PATH"] = f"{git_bash_path(stubs)}:/usr/bin:/bin"
+            env.update(
+                POLY_TEST_FIND=git_bash_path(stubs / "find"),
+                POLY_TEST_FILE=git_bash_path(stubs / "file"),
+                POLY_TEST_OTOOL=git_bash_path(stubs / "otool"),
+                POLY_TEST_AUDIT_BOUNDARY=git_bash_path(boundary),
+            )
+            result = subprocess.run(
+                [
+                    bash,
+                    str(MACOS / "verify-bundle.sh"),
+                    "--audit-tree",
+                    git_bash_path(tree),
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("audit boundary", result.stderr)
 
     def test_process_enumeration_failure_is_fatal(self) -> None:
         bash = bash_executable()
@@ -366,7 +454,9 @@ class DistributionContractTests(unittest.TestCase):
                 macho_inventory.read_text(encoding="utf-8").splitlines(),
                 production_distributions={},
                 package_distributions={},
-                stdlib_modules=set(),
+                distribution_files={},
+                stdlib_files=set(),
+                cpython_library_files={"libpython3.12.dylib"},
                 native_license_root=native,
             )
             self.assertEqual(classifications[paths[1]], "PostgreSQL")
@@ -377,7 +467,19 @@ class DistributionContractTests(unittest.TestCase):
                     ["_internal/libmystery.dylib"],
                     production_distributions={},
                     package_distributions={},
-                    stdlib_modules=set(),
+                    distribution_files={},
+                    stdlib_files=set(),
+                    cpython_library_files={"libpython3.12.dylib"},
+                    native_license_root=native,
+                )
+            with self.assertRaisesRegex(ValueError, "packaged native file lacks inventory"):
+                module.classify_macho_paths(
+                    ["_internal/libpython9.9.dylib"],
+                    production_distributions={},
+                    package_distributions={},
+                    distribution_files={},
+                    stdlib_files=set(),
+                    cpython_library_files={"libpython3.12.dylib"},
                     native_license_root=native,
                 )
 
@@ -390,15 +492,26 @@ class DistributionContractTests(unittest.TestCase):
                 "frontend/dist/index.html",
                 "_internal/base_library.zip",
                 "_internal/certifi/cacert.pem",
+                "_internal/json/__init__.py",
+                "_internal/pyimod01_archive.pyc",
             ],
             macho_classifications={},
             production_distributions=production,
             package_distributions={"certifi": ["certifi"]},
-            stdlib_modules=set(),
+            distribution_files={"certifi": {"certifi/cacert.pem"}},
+            stdlib_files={"json/__init__.py"},
+            pyinstaller_runtime_files={"pyimod01_archive.pyc"},
         )
         self.assertEqual(known["alembic.ini"], "Poly application asset")
         self.assertIn("certifi (MPL-2.0)", known["_internal/certifi/cacert.pem"])
-        for unknown in ("_internal/mystery.wasm", "hooks/start.sh", "blob.bin"):
+        for unknown in (
+            "_internal/mystery.wasm",
+            "hooks/start.sh",
+            "blob.bin",
+            "_internal/certifi/untracked.wasm",
+            "_internal/json/untracked.bin",
+            "_internal/pyimod_untrusted.sh",
+        ):
             with self.subTest(unknown=unknown), self.assertRaisesRegex(
                 ValueError, "packaged file lacks license inventory"
             ):
@@ -407,7 +520,9 @@ class DistributionContractTests(unittest.TestCase):
                     macho_classifications={},
                     production_distributions=production,
                     package_distributions={"certifi": ["certifi"]},
-                    stdlib_modules=set(),
+                    distribution_files={"certifi": {"certifi/cacert.pem"}},
+                    stdlib_files={"json/__init__.py"},
+                    pyinstaller_runtime_files={"pyimod01_archive.pyc"},
                 )
 
     def test_listener_audit_rejects_mixed_wildcard_and_postgres_tcp(self) -> None:
@@ -525,6 +640,90 @@ class DistributionContractTests(unittest.TestCase):
                     report, expected, ecosystem="Python"
                 )
 
+            expected[0]["license"] = "MIT AND Apache-2.0"
+            report.write_text(
+                json.dumps(
+                    [
+                        {
+                            "Name": "example-package",
+                            "Version": "1.0.0",
+                            "License": "MIT OR Apache-2.0",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "license mismatch"):
+                module.validate_external_inventory(
+                    report, expected, ecosystem="Python"
+                )
+
+            expected[0]["license"] = "Apache-2.0 WITH LLVM-exception"
+            report.write_text(
+                json.dumps(
+                    [
+                        {
+                            "Name": "example-package",
+                            "Version": "1.0.0",
+                            "License": "Apache-2.0",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "license mismatch"):
+                module.validate_external_inventory(
+                    report, expected, ecosystem="Python"
+                )
+
+            report.write_text(
+                json.dumps(
+                    [
+                        {
+                            "Name": "example-package",
+                            "Version": "1.0.0",
+                            "License": "Apache-2.0 WITH LLVM-exception",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            module.validate_external_inventory(report, expected, ecosystem="Python")
+            report.write_text(
+                json.dumps(
+                    [
+                        {
+                            "Name": "example-package",
+                            "Version": "1.0.0",
+                            "License": "Apache-2.0 WITH Classpath-exception-2.0",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "license mismatch"):
+                module.validate_external_inventory(
+                    report, expected, ecosystem="Python"
+                )
+
+            expected[0]["license"] = "MIT AND (Apache-2.0 OR BSD-2-Clause)"
+            report.write_text(
+                json.dumps(
+                    [
+                        {
+                            "Name": "example-package",
+                            "Version": "1.0.0",
+                            "License": "(MIT AND Apache-2.0) OR BSD-2-Clause",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "license mismatch"):
+                module.validate_external_inventory(
+                    report, expected, ecosystem="Python"
+                )
+
             expected[0]["license"] = "BSD-2-Clause"
             report.write_text(
                 json.dumps(
@@ -557,6 +756,19 @@ class DistributionContractTests(unittest.TestCase):
                 encoding="utf-8",
             )
             module.validate_external_inventory(report, expected, ecosystem="Python")
+
+    def test_notice_generator_imports_with_repo_packaging_namespace(self) -> None:
+        module = load_macos_module("notice_generator")
+        with tempfile.TemporaryDirectory() as temporary:
+            requirements = Path(temporary) / "requirements.txt"
+            requirements.write_text(
+                'example-package==1.0; sys_platform == "darwin"\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                module.production_requirement_names(requirements),
+                {"example-package"},
+            )
 
     def test_verify_bundle_is_path_scoped_and_never_kills_by_name(self) -> None:
         script = self.read("verify-bundle.sh")
@@ -601,7 +813,9 @@ class DistributionContractTests(unittest.TestCase):
         self.assertIn("cargo metadata --locked", script)
         self.assertIn('f"{relative}.LICENSE"', helper)
         self.assertIn("packages_distributions", helper)
-        self.assertIn("stdlib_module_names", helper)
+        self.assertIn("cpython_stdlib_files", helper)
+        self.assertIn("distribution.files", helper)
+        self.assertIn("pyinstaller_runtime_files", helper)
         self.assertIn("macho-inventory", script)
         self.assertNotIn(".env", script + helper)
 
