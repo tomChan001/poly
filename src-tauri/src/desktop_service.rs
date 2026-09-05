@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -73,10 +73,24 @@ impl DesktopPaths {
     }
 
     pub fn prepare_directories(&self) -> Result<(), DesktopServiceError> {
-        for directory in [&self.data_dir, &self.runtime_dir, &self.logs_dir] {
-            reject_existing_symlink(directory)?;
-            std::fs::create_dir_all(directory).map_err(DesktopServiceError::Directory)?;
+        reject_symlink_ancestors(&self.resource_dir)?;
+        std::fs::canonicalize(&self.resource_dir).map_err(DesktopServiceError::Directory)?;
+        let cache_root = self
+            .runtime_dir
+            .parent()
+            .ok_or(DesktopServiceError::InvalidPath("app_cache_dir"))?;
+        for directory in [
+            self.application_support.as_path(),
+            cache_root,
+            &self.data_dir,
+            &self.runtime_dir,
+            &self.logs_dir,
+        ] {
+            secure_create_dir_all(directory)?;
         }
+        ensure_canonical_child(&self.application_support, &self.data_dir)?;
+        ensure_canonical_child(&self.data_dir, &self.logs_dir)?;
+        ensure_canonical_child(cache_root, &self.runtime_dir)?;
         Ok(())
     }
 
@@ -99,22 +113,67 @@ impl DesktopPaths {
     pub fn logs_dir(&self) -> &Path {
         &self.logs_dir
     }
+
+    pub fn revealable_logs_dir(&self) -> Option<PathBuf> {
+        let metadata = std::fs::symlink_metadata(&self.logs_dir).ok()?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return None;
+        }
+        ensure_canonical_child(&self.application_support, &self.logs_dir)
+            .ok()
+            .map(|()| self.logs_dir.clone())
+    }
 }
 
 fn validate_absolute(path: &Path, field: &'static str) -> Result<(), DesktopServiceError> {
-    if path.is_absolute() {
+    if path.is_absolute()
+        && !path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
         Ok(())
     } else {
         Err(DesktopServiceError::InvalidPath(field))
     }
 }
 
-fn reject_existing_symlink(path: &Path) -> Result<(), DesktopServiceError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(DesktopServiceError::SymbolicLink),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(DesktopServiceError::Directory(error)),
+fn secure_create_dir_all(path: &Path) -> Result<(), DesktopServiceError> {
+    reject_symlink_ancestors(path)?;
+    std::fs::create_dir_all(path).map_err(DesktopServiceError::Directory)?;
+    reject_symlink_ancestors(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(DesktopServiceError::Directory)?;
+    }
+    Ok(())
+}
+
+fn reject_symlink_ancestors(path: &Path) -> Result<(), DesktopServiceError> {
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(DesktopServiceError::SymbolicLink);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(DesktopServiceError::Directory(error)),
+        }
+    }
+    Ok(())
+}
+
+fn ensure_canonical_child(root: &Path, child: &Path) -> Result<(), DesktopServiceError> {
+    let canonical_root = std::fs::canonicalize(root).map_err(DesktopServiceError::Directory)?;
+    let canonical_child = std::fs::canonicalize(child).map_err(DesktopServiceError::Directory)?;
+    if canonical_child.starts_with(canonical_root) {
+        Ok(())
+    } else {
+        Err(DesktopServiceError::InvalidPath("owned desktop directory"))
     }
 }
 
@@ -126,6 +185,26 @@ pub fn finder_reveal_command(logs_dir: &Path) -> tokio::process::Command {
 
 pub trait DesktopNavigator: Send + Sync + 'static {
     fn navigate(&self, url: Url) -> Result<(), DesktopServiceError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DesktopDiagnosticEvent {
+    NoticeRejected,
+    NavigationFailed,
+    NavigationFallbackFailed,
+    SupervisionFailed,
+    SetupFailed,
+}
+
+pub trait DesktopDiagnosticReporter: Send + Sync + 'static {
+    fn report(&self, event: DesktopDiagnosticEvent);
+}
+
+#[derive(Default)]
+struct NoopDiagnosticReporter;
+
+impl DesktopDiagnosticReporter for NoopDiagnosticReporter {
+    fn report(&self, _event: DesktopDiagnosticEvent) {}
 }
 
 pub trait DesktopRuntime: Send + 'static {
@@ -166,8 +245,14 @@ where
 pub struct DesktopRuntimeService<R, N> {
     runtime: Mutex<R>,
     navigator: N,
-    supervision_running: AtomicBool,
+    phase: AtomicU8,
+    reporter: Arc<dyn DesktopDiagnosticReporter>,
 }
+
+const PHASE_IDLE: u8 = 0;
+const PHASE_RUNNING: u8 = 1;
+const PHASE_TERMINAL: u8 = 2;
+const PHASE_RETRYING: u8 = 3;
 
 impl<R, N> DesktopRuntimeService<R, N>
 where
@@ -175,10 +260,19 @@ where
     N: DesktopNavigator,
 {
     pub fn new(runtime: R, navigator: N) -> Self {
+        Self::with_reporter(runtime, navigator, Arc::new(NoopDiagnosticReporter))
+    }
+
+    pub fn with_reporter(
+        runtime: R,
+        navigator: N,
+        reporter: Arc<dyn DesktopDiagnosticReporter>,
+    ) -> Self {
         Self {
             runtime: Mutex::new(runtime),
             navigator,
-            supervision_running: AtomicBool::new(false),
+            phase: AtomicU8::new(PHASE_IDLE),
+            reporter,
         }
     }
 
@@ -194,10 +288,21 @@ where
         while notices.changed().await.is_ok() {
             let notice = notices.borrow_and_update().clone();
             if let Some(notice) = notice {
-                let url = DesktopNavigationController::navigation_for_notice(&notice)
-                    .unwrap_or_else(|_| safe_navigation_failure_url());
-                if self.navigator.navigate(url).is_err() {
-                    let _ = self.navigator.navigate(safe_navigation_failure_url());
+                let url = match DesktopNavigationController::navigation_for_notice(&notice) {
+                    Ok(url) => url,
+                    Err(_) => {
+                        self.reporter.report(DesktopDiagnosticEvent::NoticeRejected);
+                        safe_navigation_failure_url()
+                    }
+                };
+                if !self.navigate_with_reconciliation(url).await
+                    && self
+                        .navigator
+                        .navigate(safe_navigation_failure_url())
+                        .is_err()
+                {
+                    self.reporter
+                        .report(DesktopDiagnosticEvent::NavigationFallbackFailed);
                 }
             }
         }
@@ -206,8 +311,13 @@ where
 
     pub fn start_supervision(self: &Arc<Self>) -> bool {
         if self
-            .supervision_running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .phase
+            .compare_exchange(
+                PHASE_IDLE,
+                PHASE_RUNNING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_err()
         {
             return false;
@@ -217,30 +327,283 @@ where
         tauri::async_runtime::spawn(async move {
             let mut runtime = service.runtime.lock().await;
             let result = runtime.supervise_until_terminal().await;
-            service.supervision_running.store(false, Ordering::Release);
+            let terminal = runtime.is_terminal() || result.is_err();
             drop(runtime);
+            service.phase.store(
+                if terminal { PHASE_TERMINAL } else { PHASE_IDLE },
+                Ordering::Release,
+            );
             if result.is_err() {
-                let _ = service.navigator.navigate(status_url_with_logs(
-                    DesktopUiState::RuntimeUnavailable,
-                    true,
-                ));
+                service
+                    .reporter
+                    .report(DesktopDiagnosticEvent::SupervisionFailed);
+                if service
+                    .navigator
+                    .navigate(status_url_with_logs(
+                        DesktopUiState::RuntimeUnavailable,
+                        true,
+                    ))
+                    .is_err()
+                {
+                    service
+                        .reporter
+                        .report(DesktopDiagnosticEvent::NavigationFallbackFailed);
+                }
             }
         });
         true
     }
 
     pub async fn retry(self: &Arc<Self>) -> Result<(), DesktopServiceError> {
-        let mut runtime = self.runtime.lock().await;
+        match self.phase.compare_exchange(
+            PHASE_TERMINAL,
+            PHASE_RETRYING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(PHASE_RUNNING | PHASE_RETRYING) => {
+                return Err(DesktopServiceError::AlreadyRunning);
+            }
+            Err(_) => return Err(DesktopServiceError::RetryNotTerminal),
+        }
+
+        let mut runtime = match self.runtime.try_lock() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                self.phase.store(PHASE_TERMINAL, Ordering::Release);
+                return Err(DesktopServiceError::AlreadyRunning);
+            }
+        };
         if !runtime.is_terminal() {
+            self.phase.store(PHASE_IDLE, Ordering::Release);
             return Err(DesktopServiceError::RetryNotTerminal);
         }
-        runtime.explicit_operator_retry()?;
+        if let Err(error) = runtime.explicit_operator_retry() {
+            self.phase.store(PHASE_TERMINAL, Ordering::Release);
+            return Err(error);
+        }
         drop(runtime);
+        self.phase.store(PHASE_IDLE, Ordering::Release);
 
         if self.start_supervision() {
             Ok(())
         } else {
             Err(DesktopServiceError::AlreadyRunning)
+        }
+    }
+
+    async fn navigate_with_reconciliation(&self, url: Url) -> bool {
+        let is_ready = url.scheme() == "http" && url.host_str() == Some("127.0.0.1");
+        let attempts = if is_ready { 3 } else { 1 };
+        for attempt in 0..attempts {
+            if self.navigator.navigate(url.clone()).is_ok() {
+                return true;
+            }
+            self.reporter
+                .report(DesktopDiagnosticEvent::NavigationFailed);
+            if attempt + 1 < attempts {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        false
+    }
+}
+
+pub trait DesktopRetryControl: Send + Sync + 'static {
+    fn retry(&self) -> DesktopRuntimeFuture<'_>;
+}
+
+impl<R, N> DesktopRetryControl for Arc<DesktopRuntimeService<R, N>>
+where
+    R: DesktopRuntime,
+    N: DesktopNavigator,
+{
+    fn retry(&self) -> DesktopRuntimeFuture<'_> {
+        Box::pin(async move { DesktopRuntimeService::retry(self).await })
+    }
+}
+
+pub type DesktopInstallFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<InstalledDesktopRuntime, DesktopSetupFailure>> + Send + 'a>>;
+
+pub trait DesktopInstaller: Send + Sync + 'static {
+    fn install(&self) -> DesktopInstallFuture<'_>;
+}
+
+pub struct InstalledDesktopRuntime {
+    control: Arc<dyn DesktopRetryControl>,
+    logs_dir: Option<PathBuf>,
+}
+
+impl InstalledDesktopRuntime {
+    pub fn new(control: Arc<dyn DesktopRetryControl>, logs_dir: Option<PathBuf>) -> Self {
+        Self { control, logs_dir }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DesktopSetupFailure {
+    PermissionDenied { logs_dir: Option<PathBuf> },
+    ResourceMissing { logs_dir: Option<PathBuf> },
+    RuntimeUnavailable { logs_dir: Option<PathBuf> },
+}
+
+impl DesktopSetupFailure {
+    fn status(self) -> (DesktopUiState, bool) {
+        match self {
+            Self::PermissionDenied { logs_dir } => {
+                (DesktopUiState::PermissionDenied, logs_dir.is_some())
+            }
+            Self::ResourceMissing { logs_dir } => {
+                (DesktopUiState::ResourceMissing, logs_dir.is_some())
+            }
+            Self::RuntimeUnavailable { logs_dir } => {
+                (DesktopUiState::RuntimeUnavailable, logs_dir.is_some())
+            }
+        }
+    }
+
+    fn logs_dir(&self) -> Option<PathBuf> {
+        match self {
+            Self::PermissionDenied { logs_dir }
+            | Self::ResourceMissing { logs_dir }
+            | Self::RuntimeUnavailable { logs_dir } => logs_dir.clone(),
+        }
+    }
+}
+
+const SETUP_NEW: u8 = 0;
+const SETUP_INSTALLING: u8 = 1;
+const SETUP_FAILED: u8 = 2;
+const SETUP_INSTALLED: u8 = 3;
+
+pub struct RecoverableDesktopSetup<I, N> {
+    installer: I,
+    navigator: N,
+    reporter: Arc<dyn DesktopDiagnosticReporter>,
+    phase: AtomicU8,
+    installed: std::sync::RwLock<Option<InstalledDesktopRuntime>>,
+    available_logs: std::sync::RwLock<Option<PathBuf>>,
+}
+
+impl<I, N> RecoverableDesktopSetup<I, N>
+where
+    I: DesktopInstaller,
+    N: DesktopNavigator,
+{
+    pub fn new(installer: I, navigator: N, reporter: Arc<dyn DesktopDiagnosticReporter>) -> Self {
+        Self {
+            installer,
+            navigator,
+            reporter,
+            phase: AtomicU8::new(SETUP_NEW),
+            installed: std::sync::RwLock::new(None),
+            available_logs: std::sync::RwLock::new(None),
+        }
+    }
+
+    pub async fn initialize(&self) {
+        if self
+            .phase
+            .compare_exchange(
+                SETUP_NEW,
+                SETUP_INSTALLING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        self.show_initializing();
+        let _ = self.attempt_install().await;
+    }
+
+    pub async fn retry(&self) -> Result<(), DesktopServiceError> {
+        match self.phase.load(Ordering::Acquire) {
+            SETUP_INSTALLED => {
+                let control = self
+                    .installed
+                    .read()
+                    .expect("desktop setup lock poisoned")
+                    .as_ref()
+                    .map(|installed| Arc::clone(&installed.control))
+                    .ok_or(DesktopServiceError::Runtime)?;
+                control.retry().await
+            }
+            SETUP_FAILED => {
+                if self
+                    .phase
+                    .compare_exchange(
+                        SETUP_FAILED,
+                        SETUP_INSTALLING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    return Err(DesktopServiceError::AlreadyRunning);
+                }
+                self.show_initializing();
+                self.attempt_install().await
+            }
+            SETUP_INSTALLING => Err(DesktopServiceError::AlreadyRunning),
+            _ => Err(DesktopServiceError::RetryNotTerminal),
+        }
+    }
+
+    pub fn logs_dir(&self) -> Option<PathBuf> {
+        self.available_logs
+            .read()
+            .expect("desktop setup lock poisoned")
+            .clone()
+    }
+
+    pub fn installer(&self) -> &I {
+        &self.installer
+    }
+
+    fn show_initializing(&self) {
+        if self
+            .navigator
+            .navigate(status_url(DesktopUiState::Initializing))
+            .is_err()
+        {
+            self.reporter
+                .report(DesktopDiagnosticEvent::NavigationFailed);
+        }
+    }
+
+    async fn attempt_install(&self) -> Result<(), DesktopServiceError> {
+        match self.installer.install().await {
+            Ok(installed) => {
+                *self
+                    .available_logs
+                    .write()
+                    .expect("desktop setup lock poisoned") = installed.logs_dir.clone();
+                *self.installed.write().expect("desktop setup lock poisoned") = Some(installed);
+                self.phase.store(SETUP_INSTALLED, Ordering::Release);
+                Ok(())
+            }
+            Err(failure) => {
+                self.reporter.report(DesktopDiagnosticEvent::SetupFailed);
+                *self
+                    .available_logs
+                    .write()
+                    .expect("desktop setup lock poisoned") = failure.logs_dir();
+                let (state, can_reveal_logs) = failure.status();
+                if self
+                    .navigator
+                    .navigate(status_url_with_logs(state, can_reveal_logs))
+                    .is_err()
+                {
+                    self.reporter
+                        .report(DesktopDiagnosticEvent::NavigationFallbackFailed);
+                }
+                self.phase.store(SETUP_FAILED, Ordering::Release);
+                Err(DesktopServiceError::Runtime)
+            }
         }
     }
 }
@@ -259,12 +622,14 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use tokio::sync::{watch, Notify};
+    use tokio::sync::{watch, Barrier, Notify};
     use url::Url;
 
     use super::{
-        finder_reveal_command, DesktopNavigator, DesktopPaths, DesktopRuntime,
-        DesktopRuntimeService, DesktopServiceError,
+        finder_reveal_command, DesktopDiagnosticEvent, DesktopDiagnosticReporter, DesktopInstaller,
+        DesktopNavigator, DesktopPaths, DesktopRetryControl, DesktopRuntime, DesktopRuntimeService,
+        DesktopServiceError, DesktopSetupFailure, InstalledDesktopRuntime, RecoverableDesktopSetup,
+        PHASE_TERMINAL,
     };
     use crate::runtime::protocol::RuntimeEvent;
     use crate::runtime::supervisor::{RuntimeFailure, RuntimeSupervisorNotice};
@@ -280,6 +645,7 @@ mod tests {
         restart_observed: Arc<Notify>,
         ready_observed: Arc<Notify>,
         fail_next_restart: Arc<AtomicBool>,
+        ready_failures: Arc<AtomicUsize>,
     }
 
     impl DesktopNavigator for FakeNavigator {
@@ -295,11 +661,97 @@ mod tests {
                 }
             }
             if url.host_str() == Some("127.0.0.1") {
+                if self
+                    .ready_failures
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return Err(DesktopServiceError::Navigation);
+                }
                 self.ready_seen.store(true, Ordering::SeqCst);
                 self.ready_observed.notify_one();
             }
             self.urls.lock().unwrap().push(url);
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingReporter {
+        events: Mutex<Vec<DesktopDiagnosticEvent>>,
+    }
+
+    impl DesktopDiagnosticReporter for RecordingReporter {
+        fn report(&self, event: DesktopDiagnosticEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    struct PendingRuntime {
+        notices: watch::Sender<Option<RuntimeSupervisorNotice>>,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[derive(Default)]
+    struct FakeRetryControl {
+        retries: AtomicUsize,
+    }
+
+    impl DesktopRetryControl for FakeRetryControl {
+        fn retry(&self) -> RuntimeFuture<'_> {
+            Box::pin(async move {
+                self.retries.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    struct RecoveringInstaller {
+        attempts: AtomicUsize,
+        second_entered: Arc<Notify>,
+        release_second: Arc<Notify>,
+        control: Arc<FakeRetryControl>,
+    }
+
+    impl DesktopInstaller for RecoveringInstaller {
+        fn install(&self) -> super::DesktopInstallFuture<'_> {
+            Box::pin(async move {
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    return Err(DesktopSetupFailure::PermissionDenied { logs_dir: None });
+                }
+                self.second_entered.notify_waiters();
+                self.release_second.notified().await;
+                Ok(InstalledDesktopRuntime::new(
+                    self.control.clone(),
+                    Some(PathBuf::from("/safe/Application Support/Poly/logs")),
+                ))
+            })
+        }
+    }
+
+    impl DesktopRuntime for PendingRuntime {
+        fn subscribe_notices(&self) -> watch::Receiver<Option<RuntimeSupervisorNotice>> {
+            self.notices.subscribe()
+        }
+
+        fn is_terminal(&self) -> bool {
+            false
+        }
+
+        fn explicit_operator_retry(&mut self) -> Result<(), DesktopServiceError> {
+            panic!("an active runtime must not be retried")
+        }
+
+        fn supervise_until_terminal(&mut self) -> RuntimeFuture<'_> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(())
+            })
         }
     }
 
@@ -420,6 +872,36 @@ mod tests {
             PathBuf::from("/absolute/cache"),
         )
         .is_err());
+        assert!(DesktopPaths::from_resolved(
+            root.join("Resources"),
+            root.join("Application Support").join("app").join(".."),
+            root.join("Caches").join("..").join("outside"),
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_preparation_rejects_a_symlinked_owned_path() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("poly-desktop-paths-{}", std::process::id()));
+        let resources = root.join("Resources");
+        let support = root.join("Application Support");
+        let app_data = support.join("com.poly.desktop");
+        let cache = root.join("Caches").join("com.poly.desktop");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::create_dir_all(&support).unwrap();
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        symlink(root.join("outside"), support.join("Poly")).unwrap();
+        let paths = DesktopPaths::from_resolved(resources, app_data, cache).unwrap();
+
+        assert!(matches!(
+            paths.prepare_directories(),
+            Err(DesktopServiceError::SymbolicLink)
+        ));
+        std::fs::remove_file(support.join("Poly")).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -486,6 +968,73 @@ mod tests {
     }
 
     #[test]
+    fn retry_returns_promptly_while_runtime_supervision_is_active() {
+        tauri::async_runtime::block_on(async {
+            let (notices, _) = watch::channel(None);
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let service = Arc::new(DesktopRuntimeService::new(
+                PendingRuntime {
+                    notices,
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                },
+                FakeNavigator::default(),
+            ));
+            assert!(service.start_supervision());
+            entered.notified().await;
+
+            let result = tokio::time::timeout(Duration::from_millis(50), service.retry())
+                .await
+                .expect("retry must not queue behind the active runtime");
+
+            assert!(matches!(result, Err(DesktopServiceError::AlreadyRunning)));
+            release.notify_one();
+        });
+    }
+
+    #[test]
+    fn concurrent_terminal_retries_start_exactly_one_new_run() {
+        tauri::async_runtime::block_on(async {
+            let fixture = fake_service();
+            let observer = tauri::async_runtime::spawn(
+                Arc::clone(&fixture.service).observe_notices(fixture.notices),
+            );
+            assert!(fixture.service.start_supervision());
+            wait_for(|| fixture.service.phase.load(Ordering::Acquire) == PHASE_TERMINAL).await;
+
+            let barrier = Arc::new(Barrier::new(3));
+            let first = {
+                let service = Arc::clone(&fixture.service);
+                let barrier = Arc::clone(&barrier);
+                tauri::async_runtime::spawn(async move {
+                    barrier.wait().await;
+                    service.retry().await
+                })
+            };
+            let second = {
+                let service = Arc::clone(&fixture.service);
+                let barrier = Arc::clone(&barrier);
+                tauri::async_runtime::spawn(async move {
+                    barrier.wait().await;
+                    service.retry().await
+                })
+            };
+            barrier.wait().await;
+            let (first, second) = tokio::time::timeout(Duration::from_millis(100), async {
+                (first.await.unwrap(), second.await.unwrap())
+            })
+            .await
+            .expect("duplicate retry must be rejected without queuing");
+
+            assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+            wait_for(|| fixture.supervise_calls.load(Ordering::SeqCst) == 2).await;
+            assert_eq!(fixture.retry_calls.load(Ordering::SeqCst), 1);
+            observer.abort();
+        });
+    }
+
+    #[test]
     fn observer_recovers_from_a_navigation_error_and_processes_later_notices() {
         tauri::async_runtime::block_on(async {
             let fixture = fake_service();
@@ -523,6 +1072,129 @@ mod tests {
 
             wait_for(|| fixture.navigator.ready_seen.load(Ordering::SeqCst)).await;
             observer.abort();
+        });
+    }
+
+    #[test]
+    fn observer_retries_a_failed_ready_navigation_without_another_notice() {
+        tauri::async_runtime::block_on(async {
+            let fixture = fake_service();
+            fixture.navigator.ready_failures.store(1, Ordering::SeqCst);
+            let observer = tauri::async_runtime::spawn(
+                Arc::clone(&fixture.service).observe_notices(fixture.notices),
+            );
+            fixture
+                .service
+                .runtime
+                .lock()
+                .await
+                .notices
+                .send_replace(Some(RuntimeSupervisorNotice::Runtime(
+                    RuntimeEvent::Ready {
+                        port: NonZeroU16::new(49152).unwrap(),
+                        bootstrap_path: "/desktop/bootstrap/safe".to_owned(),
+                    },
+                )));
+
+            wait_for(|| fixture.navigator.ready_seen.load(Ordering::SeqCst)).await;
+            assert!(fixture
+                .navigator
+                .urls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|url| url.host_str() == Some("127.0.0.1")));
+            observer.abort();
+        });
+    }
+
+    #[test]
+    fn navigation_failures_are_reported_as_sanitized_events() {
+        tauri::async_runtime::block_on(async {
+            let (notices, _) = watch::channel(None);
+            let navigator = FakeNavigator::default();
+            navigator.fail_next_restart.store(true, Ordering::SeqCst);
+            let reporter = Arc::new(RecordingReporter::default());
+            let runtime = PendingRuntime {
+                notices,
+                entered: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+            };
+            let receiver = runtime.subscribe_notices();
+            let service = Arc::new(DesktopRuntimeService::with_reporter(
+                runtime,
+                navigator,
+                reporter.clone(),
+            ));
+            let observer =
+                tauri::async_runtime::spawn(Arc::clone(&service).observe_notices(receiver));
+            service.runtime.lock().await.notices.send_replace(Some(
+                RuntimeSupervisorNotice::RestartScheduled {
+                    attempt: 1,
+                    delay: Duration::from_secs(1),
+                },
+            ));
+
+            wait_for(|| !reporter.events.lock().unwrap().is_empty()).await;
+            assert_eq!(
+                reporter.events.lock().unwrap().as_slice(),
+                &[DesktopDiagnosticEvent::NavigationFailed]
+            );
+            observer.abort();
+        });
+    }
+
+    #[test]
+    fn setup_failure_keeps_status_ui_alive_and_retry_recovers_single_flight() {
+        tauri::async_runtime::block_on(async {
+            let navigator = FakeNavigator::default();
+            let reporter = Arc::new(RecordingReporter::default());
+            let second_entered = Arc::new(Notify::new());
+            let release_second = Arc::new(Notify::new());
+            let installer = RecoveringInstaller {
+                attempts: AtomicUsize::new(0),
+                second_entered: Arc::clone(&second_entered),
+                release_second: Arc::clone(&release_second),
+                control: Arc::new(FakeRetryControl::default()),
+            };
+            let setup = Arc::new(RecoverableDesktopSetup::new(
+                installer,
+                navigator.clone(),
+                reporter.clone(),
+            ));
+
+            setup.initialize().await;
+            assert!(navigator
+                .urls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|url| { desktop_state(url).as_deref() == Some("permission_denied") }));
+            assert_eq!(
+                reporter.events.lock().unwrap().as_slice(),
+                &[DesktopDiagnosticEvent::SetupFailed]
+            );
+
+            let first = {
+                let setup = Arc::clone(&setup);
+                tauri::async_runtime::spawn(async move { setup.retry().await })
+            };
+            second_entered.notified().await;
+            let duplicate = tokio::time::timeout(Duration::from_millis(50), setup.retry())
+                .await
+                .expect("a duplicate setup retry must return promptly");
+            assert!(matches!(
+                duplicate,
+                Err(DesktopServiceError::AlreadyRunning)
+            ));
+            release_second.notify_waiters();
+            first.await.unwrap().unwrap();
+
+            assert_eq!(setup.installer().attempts.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                setup.logs_dir(),
+                Some(PathBuf::from("/safe/Application Support/Poly/logs"))
+            );
         });
     }
 

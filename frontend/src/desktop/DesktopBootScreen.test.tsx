@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom/vitest'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import {
@@ -63,13 +63,14 @@ describe('DesktopBootScreen', () => {
     expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument()
   })
 
-  test('routes actions through the narrow desktop adapter', () => {
+  test('routes actions through the narrow desktop adapter', async () => {
     const retry = vi.fn()
     const revealLogs = vi.fn()
     window.__POLY_DESKTOP__ = { retry, revealLogs }
     render(<DesktopBootScreen state="migration_failed" canRevealLogs />)
 
     fireEvent.click(screen.getByRole('button', { name: '重试' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '重试' })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: '在 Finder 中显示诊断日志' }))
 
     expect(retry).toHaveBeenCalledOnce()
@@ -94,6 +95,36 @@ describe('DesktopBootScreen', () => {
     fireEvent.click(screen.getByRole('button', { name: '重试' }))
 
     expect(await screen.findByRole('alert')).toHaveTextContent('操作未能完成，请重试或查看诊断日志。')
+    expect(screen.getByRole('button', { name: '重试' })).toBeEnabled()
+  })
+
+  test('coalesces repeated actions while one desktop command is pending', async () => {
+    let finishRetry!: () => void
+    const retry = vi.fn(() => new Promise<void>((resolve) => {
+      finishRetry = resolve
+    }))
+    const revealLogs = vi.fn().mockResolvedValue(undefined)
+    window.__POLY_DESKTOP__ = { retry, revealLogs }
+    render(<DesktopBootScreen state="runtime_unavailable" canRevealLogs />)
+
+    const retryButton = screen.getByRole('button', { name: '重试' })
+    const logsButton = screen.getByRole('button', { name: '在 Finder 中显示诊断日志' })
+    const card = screen.getByRole('heading').closest('section')
+    fireEvent.click(retryButton)
+    fireEvent.click(retryButton)
+    fireEvent.click(logsButton)
+
+    expect(retry).toHaveBeenCalledOnce()
+    expect(revealLogs).not.toHaveBeenCalled()
+    expect(retryButton).toBeDisabled()
+    expect(logsButton).toBeDisabled()
+    expect(card).toHaveAttribute('aria-busy', 'true')
+
+    await act(async () => finishRetry())
+
+    expect(retryButton).toBeEnabled()
+    expect(logsButton).toBeEnabled()
+    expect(card).toHaveAttribute('aria-busy', 'false')
   })
 })
 

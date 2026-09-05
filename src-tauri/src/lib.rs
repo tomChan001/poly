@@ -15,13 +15,14 @@ use webview::{ready_url, status_url_with_logs, DesktopUiState, NavigationError};
 
 #[cfg(any(target_os = "macos", test))]
 use desktop_service::{
-    finder_reveal_command, DesktopNavigator, DesktopPaths, DesktopRuntimeService,
-    DesktopServiceError,
+    finder_reveal_command, DesktopDiagnosticEvent, DesktopDiagnosticReporter, DesktopInstaller,
+    DesktopNavigator, DesktopPaths, DesktopRuntimeService, DesktopServiceError,
+    DesktopSetupFailure, InstalledDesktopRuntime, RecoverableDesktopSetup,
 };
 #[cfg(any(target_os = "macos", test))]
-use std::path::PathBuf;
-#[cfg(any(target_os = "macos", test))]
 use std::sync::Arc;
+#[cfg(any(target_os = "macos", test))]
+use std::sync::Mutex;
 #[cfg(any(target_os = "macos", test))]
 use webview::status_url;
 
@@ -67,22 +68,144 @@ impl DesktopNavigator for TauriDesktopNavigator {
 }
 
 #[cfg(any(target_os = "macos", test))]
-type ProductionDesktopService = DesktopRuntimeService<
-    RuntimeSupervisor<ProductionLauncher, SystemClock>,
-    TauriDesktopNavigator,
->;
+struct BoundedDesktopReporter {
+    log: Mutex<Option<runtime::process::DiagnosticLog>>,
+    dropped: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl BoundedDesktopReporter {
+    fn new() -> Self {
+        Self {
+            log: Mutex::new(None),
+            dropped: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn configure(&self, application_support: &std::path::Path) {
+        match runtime::process::DiagnosticLog::under_application_support(application_support) {
+            Ok(log) => *self.log.lock().expect("diagnostic log lock poisoned") = Some(log),
+            Err(_) => {
+                self.dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl DesktopDiagnosticReporter for BoundedDesktopReporter {
+    fn report(&self, event: DesktopDiagnosticEvent) {
+        let label = match event {
+            DesktopDiagnosticEvent::NoticeRejected => "desktop_notice_rejected\n",
+            DesktopDiagnosticEvent::NavigationFailed => "desktop_navigation_failed\n",
+            DesktopDiagnosticEvent::NavigationFallbackFailed => {
+                "desktop_navigation_fallback_failed\n"
+            }
+            DesktopDiagnosticEvent::SupervisionFailed => "desktop_supervision_failed\n",
+            DesktopDiagnosticEvent::SetupFailed => "desktop_setup_failed\n",
+        };
+        let result = self
+            .log
+            .lock()
+            .expect("diagnostic log lock poisoned")
+            .as_mut()
+            .map(|log| log.write_redacted(label));
+        if !matches!(result, Some(Ok(()))) {
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone)]
+struct ProductionDesktopInstaller {
+    app: tauri::AppHandle,
+    navigator: TauriDesktopNavigator,
+    reporter: Arc<BoundedDesktopReporter>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl DesktopInstaller for ProductionDesktopInstaller {
+    fn install(&self) -> desktop_service::DesktopInstallFuture<'_> {
+        use tauri::Manager as _;
+
+        Box::pin(async move {
+            let paths = DesktopPaths::from_resolved(
+                self.app
+                    .path()
+                    .resource_dir()
+                    .map_err(|_| DesktopSetupFailure::ResourceMissing { logs_dir: None })?,
+                self.app
+                    .path()
+                    .app_data_dir()
+                    .map_err(|_| DesktopSetupFailure::PermissionDenied { logs_dir: None })?,
+                self.app
+                    .path()
+                    .app_cache_dir()
+                    .map_err(|_| DesktopSetupFailure::PermissionDenied { logs_dir: None })?,
+            )
+            .map_err(|_| DesktopSetupFailure::RuntimeUnavailable { logs_dir: None })?;
+            if let Err(error) = paths.prepare_directories() {
+                let logs_dir = paths.revealable_logs_dir();
+                return Err(match error {
+                    DesktopServiceError::Directory(source)
+                        if source.kind() == std::io::ErrorKind::PermissionDenied =>
+                    {
+                        DesktopSetupFailure::PermissionDenied { logs_dir }
+                    }
+                    DesktopServiceError::SymbolicLink | DesktopServiceError::InvalidPath(_) => {
+                        DesktopSetupFailure::PermissionDenied { logs_dir }
+                    }
+                    _ => DesktopSetupFailure::RuntimeUnavailable { logs_dir },
+                });
+            }
+            self.reporter.configure(paths.application_support());
+
+            let supervisor = RuntimeSupervisor::production(
+                ProductionLauncher::new(paths.resource_dir().to_path_buf()),
+                paths.data_dir().to_path_buf(),
+                paths.runtime_dir().to_path_buf(),
+                paths.application_support().to_path_buf(),
+            );
+            let notices = supervisor.subscribe_notices();
+            let service = Arc::new(DesktopRuntimeService::with_reporter(
+                supervisor,
+                self.navigator.clone(),
+                self.reporter.clone(),
+            ));
+            let observer = Arc::clone(&service);
+            tauri::async_runtime::spawn(async move {
+                let _ = observer.observe_notices(notices).await;
+            });
+            if !service.start_supervision() {
+                return Err(DesktopSetupFailure::RuntimeUnavailable {
+                    logs_dir: paths.revealable_logs_dir(),
+                });
+            }
+            Ok(InstalledDesktopRuntime::new(
+                Arc::new(service),
+                Some(paths.logs_dir().to_path_buf()),
+            ))
+        })
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+type ProductionDesktopSetup =
+    RecoverableDesktopSetup<ProductionDesktopInstaller, TauriDesktopNavigator>;
 
 #[cfg(any(target_os = "macos", test))]
 struct DesktopAppState {
-    service: Arc<ProductionDesktopService>,
-    logs_dir: PathBuf,
+    setup: Arc<ProductionDesktopSetup>,
 }
 
 #[cfg(any(target_os = "macos", test))]
 #[tauri::command]
 async fn retry_desktop_runtime(state: tauri::State<'_, DesktopAppState>) -> Result<(), String> {
     state
-        .service
+        .setup
         .retry()
         .await
         .map_err(|_| "runtime retry is unavailable".to_owned())
@@ -91,7 +214,11 @@ async fn retry_desktop_runtime(state: tauri::State<'_, DesktopAppState>) -> Resu
 #[cfg(any(target_os = "macos", test))]
 #[tauri::command]
 async fn reveal_desktop_logs(state: tauri::State<'_, DesktopAppState>) -> Result<(), String> {
-    let status = finder_reveal_command(&state.logs_dir)
+    let logs_dir = state
+        .setup
+        .logs_dir()
+        .ok_or_else(|| "diagnostic logs are unavailable".to_owned())?;
+    let status = finder_reveal_command(&logs_dir)
         .status()
         .await
         .map_err(|_| "diagnostic logs could not be revealed".to_owned())?;
@@ -106,42 +233,34 @@ async fn reveal_desktop_logs(state: tauri::State<'_, DesktopAppState>) -> Result
 fn setup_desktop_runtime(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     use tauri::Manager as _;
 
-    let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| std::io::Error::other("main desktop webview is missing"))?;
+    let Some(window) = app.get_webview_window("main") else {
+        return Ok(());
+    };
     let navigator = TauriDesktopNavigator { window };
-    navigator.navigate(status_url(DesktopUiState::Initializing))?;
-
-    let paths = DesktopPaths::from_resolved(
-        app.path().resource_dir()?,
-        app.path().app_data_dir()?,
-        app.path().app_cache_dir()?,
-    )?;
-    paths.prepare_directories()?;
-
-    let supervisor = RuntimeSupervisor::production(
-        ProductionLauncher::new(paths.resource_dir().to_path_buf()),
-        paths.data_dir().to_path_buf(),
-        paths.runtime_dir().to_path_buf(),
-        paths.application_support().to_path_buf(),
-    );
-    let notices = supervisor.subscribe_notices();
-    let service = Arc::new(DesktopRuntimeService::new(supervisor, navigator));
-
+    let reporter = Arc::new(BoundedDesktopReporter::new());
+    if navigator
+        .navigate(status_url(DesktopUiState::Initializing))
+        .is_err()
+    {
+        reporter.report(DesktopDiagnosticEvent::NavigationFailed);
+    }
+    let setup = Arc::new(RecoverableDesktopSetup::new(
+        ProductionDesktopInstaller {
+            app: app.handle().clone(),
+            navigator: navigator.clone(),
+            reporter: reporter.clone(),
+        },
+        navigator,
+        reporter,
+    ));
     if !app.manage(DesktopAppState {
-        service: Arc::clone(&service),
-        logs_dir: paths.logs_dir().to_path_buf(),
+        setup: Arc::clone(&setup),
     }) {
-        return Err(std::io::Error::other("desktop runtime state is already installed").into());
+        return Ok(());
     }
-
-    let observer = Arc::clone(&service);
     tauri::async_runtime::spawn(async move {
-        let _ = observer.observe_notices(notices).await;
+        setup.initialize().await;
     });
-    if !service.start_supervision() {
-        return Err(std::io::Error::other("desktop runtime supervision did not start").into());
-    }
     Ok(())
 }
 

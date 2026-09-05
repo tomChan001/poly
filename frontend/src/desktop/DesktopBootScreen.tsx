@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 
 import './desktop.css'
 
@@ -133,8 +133,11 @@ export function DesktopBootScreen({ state, canRevealLogs = false }: DesktopBootS
   const copy = COPY[state]
   const transient = TRANSIENT_STATES.has(state)
   const [actionError, setActionError] = useState<string | null>(null)
+  const [actionPending, setActionPending] = useState(false)
+  const actionPendingRef = useRef(false)
 
   const runAction = async (action: keyof DesktopAdapter) => {
+    if (actionPendingRef.current) return
     const adapter = window.__POLY_DESKTOP__
     if (!adapter) {
       setActionError('无法连接桌面端，请重试。')
@@ -142,16 +145,25 @@ export function DesktopBootScreen({ state, canRevealLogs = false }: DesktopBootS
     }
 
     setActionError(null)
+    actionPendingRef.current = true
+    setActionPending(true)
     try {
       await adapter[action]()
     } catch {
       setActionError('操作未能完成，请重试或查看诊断日志。')
+    } finally {
+      actionPendingRef.current = false
+      setActionPending(false)
     }
   }
 
   return (
     <main className="desktop-boot-shell">
-      <section className="desktop-boot-card" aria-labelledby="desktop-boot-heading">
+      <section
+        className="desktop-boot-card"
+        aria-labelledby="desktop-boot-heading"
+        aria-busy={actionPending}
+      >
         <div className="desktop-boot-mark" aria-hidden="true">P</div>
         <h1 id="desktop-boot-heading">{copy.heading}</h1>
         <p data-testid="desktop-explanation">{copy.explanation}</p>
@@ -165,12 +177,22 @@ export function DesktopBootScreen({ state, canRevealLogs = false }: DesktopBootS
             <span />
           </div>
         ) : (
-          <button type="button" className="desktop-boot-primary" onClick={() => void runAction('retry')}>
+          <button
+            type="button"
+            className="desktop-boot-primary"
+            disabled={actionPending}
+            onClick={() => void runAction('retry')}
+          >
             重试
           </button>
         )}
         {canRevealLogs && (
-          <button type="button" className="desktop-boot-secondary" onClick={() => void runAction('revealLogs')}>
+          <button
+            type="button"
+            className="desktop-boot-secondary"
+            disabled={actionPending}
+            onClick={() => void runAction('revealLogs')}
+          >
             在 Finder 中显示诊断日志
           </button>
         )}

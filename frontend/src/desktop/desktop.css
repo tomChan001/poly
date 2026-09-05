@@ -73,6 +73,11 @@
   font-weight: 650;
 }
 
+.desktop-boot-card button:disabled {
+  cursor: wait;
+  opacity: 0.62;
+}
+
 .desktop-boot-primary {
   color: white;
   background: #1f7657;
