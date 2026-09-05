@@ -14,6 +14,12 @@ Kalshi 与 Polymarket 的受控跨平台执行系统。Oddpool 只用于发现�
 - 人工只审核映射等价性与系统异常，不存在逐笔批准订单的 API 或页面。
 - 保存风控规则会创建不可变版本；新版本在下一轮 polling 生效，应用重启后会从 PostgreSQL 恢复活动版本。
 
+## macOS 桌面版
+
+macOS 桌面版将前端、本地服务和 PostgreSQL 封装为架构专用 DMG，运营员无需另装运行时。构建、签名、公证、架构支持状态、安装、Keychain、备份和故障恢复步骤见 [macOS 桌面版构建与运行手册](docs/runbooks/macos-desktop-build.md)。
+
+Windows 上通过的可移植测试不代表已经构建或验证 macOS DMG；发布证据必须来自对应架构的原生 macOS CI。
+
 ## 本地开发
 
 ```powershell

@@ -1,0 +1,324 @@
+name: macOS desktop validation
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-desktop-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-native:
+    name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            rust_target: aarch64-apple-darwin
+            py_arch: arm64
+            artifact: Poly-macos-arm64
+          - runner: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            py_arch: x86_64
+            artifact: Poly-macos-x86_64
+    env:
+      CARGO_TERM_COLOR: always
+      POLY_TARGET_ARCH: ${{ matrix.py_arch }}
+      POLY_TARGET_TRIPLE: ${{ matrix.rust_target }}
+      IS_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+      SIGNING_SECRETS_PRESENT: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.KEYCHAIN_PASSWORD != '' && secrets.APPLE_SIGNING_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.8.15'
+          python-version: '3.12'
+          enable-cache: true
+
+      - name: Install frozen Python environment
+        run: uv sync --frozen
+
+      - name: Run mocked Python tests
+        env:
+          OPENING_ENABLED: 'false'
+          LOCAL_SETUP_ENABLED: 'false'
+        run: uv run --frozen pytest backend/tests/unit backend/tests/security packaging/macos/tests/test_ci_documentation_contract.py -q
+
+      - name: Lint frontend
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Test frontend
+        working-directory: frontend
+        run: npm test
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Set up Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: ${{ matrix.rust_target }}
+          components: rustfmt, clippy
+
+      - name: Cache Rust build inputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.rust_target }}
+
+      - name: Confirm native Rust target
+        run: rustup target add "${POLY_TARGET_TRIPLE}"
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Lint Rust
+        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --target "${POLY_TARGET_TRIPLE}" -- -D warnings
+
+      - name: Test Rust
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --target "${POLY_TARGET_TRIPLE}"
+
+      - name: Build pinned PostgreSQL natively
+        run: packaging/macos/fetch-postgres.sh
+
+      - name: Build packaged Python runtime natively
+        run: packaging/macos/build-runtime.sh
+
+      - name: Verify packaged Python runtime
+        run: packaging/macos/verify-runtime.sh
+
+      - name: Stage complete runtime and verify notices
+        run: |
+          mkdir -p src-tauri/resources
+          ditto dist/poly-runtime src-tauri/resources/poly-runtime
+          packaging/macos/generate-notices.sh --check --assembled
+
+      - name: Install pinned Tauri CLI
+        run: cargo install tauri-cli --version 2.11.4 --locked
+
+      - name: Require every protected secret for release tags
+        if: ${{ env.IS_RELEASE == 'true' && env.SIGNING_SECRETS_PRESENT != 'true' }}
+        run: |
+          printf '%s\n' 'A release tag requires the complete protected Apple signing secret set.' >&2
+          exit 1
+
+      - name: Import Developer ID certificate into temporary keychain
+        if: ${{ env.IS_RELEASE == 'true' && env.SIGNING_SECRETS_PRESENT == 'true' }}
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="${RUNNER_TEMP}/poly-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.keychain-db"
+          CERTIFICATE_PATH="${RUNNER_TEMP}/poly-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.p12"
+          printf 'POLY_SIGNING_KEYCHAIN=%s\n' "${KEYCHAIN_PATH}" >>"${GITHUB_ENV}"
+          printf 'POLY_SIGNING_CERTIFICATE=%s\n' "${CERTIFICATE_PATH}" >>"${GITHUB_ENV}"
+          printf '%s' "${APPLE_CERTIFICATE}" | base64 --decode >"${CERTIFICATE_PATH}"
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security import "${CERTIFICATE_PATH}" -k "${KEYCHAIN_PATH}" \
+            -P "${APPLE_CERTIFICATE_PASSWORD}" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security list-keychains -d user -s "${KEYCHAIN_PATH}"
+
+      - name: Build ad-hoc validation App and DMG
+        if: ${{ env.IS_RELEASE != 'true' }}
+        working-directory: src-tauri
+        env:
+          APPLE_SIGNING_IDENTITY: '-'
+        run: cargo tauri build --target "${POLY_TARGET_TRIPLE}"
+
+      - name: Developer ID sign and notarize release App and DMG
+        if: ${{ env.IS_RELEASE == 'true' && env.SIGNING_SECRETS_PRESENT == 'true' }}
+        working-directory: src-tauri
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: cargo tauri build --target "${POLY_TARGET_TRIPLE}"
+
+      - name: Staple and validate release tickets
+        if: ${{ env.IS_RELEASE == 'true' && env.SIGNING_SECRETS_PRESENT == 'true' }}
+        run: |
+          APP_PATH="${GITHUB_WORKSPACE}/src-tauri/target/${POLY_TARGET_TRIPLE}/release/bundle/macos/Poly.app"
+          DMG_PATH="$(find "${GITHUB_WORKSPACE}/src-tauri/target/${POLY_TARGET_TRIPLE}/release/bundle/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          test -d "${APP_PATH}"
+          test -n "${DMG_PATH}"
+          xcrun stapler staple "${APP_PATH}"
+          xcrun stapler validate "${APP_PATH}"
+          xcrun stapler staple "${DMG_PATH}"
+          xcrun stapler validate "${DMG_PATH}"
+
+      - name: Verify release bundle or ad-hoc contract
+        run: |
+          APP_PATH="${GITHUB_WORKSPACE}/src-tauri/target/${POLY_TARGET_TRIPLE}/release/bundle/macos/Poly.app"
+          if [[ "${IS_RELEASE}" == 'true' ]]; then
+            packaging/macos/verify-bundle.sh "${APP_PATH}"
+          else
+            codesign --verify --deep --strict --verbose=2 "${APP_PATH}"
+            packaging/macos/verify-bundle.sh --check
+          fi
+
+      - name: Install DMG into an isolated home and smoke test
+        env:
+          SMOKE_SERVICE: com.poly.desktop.integrations
+          SMOKE_ACCOUNT: com.poly.desktop.integrations.ci-smoke
+        run: |
+          set -euo pipefail
+          SMOKE_ROOT="$(mktemp -d "${RUNNER_TEMP}/poly-smoke.XXXXXXXX")"
+          SMOKE_HOME="${SMOKE_ROOT}/home"
+          SMOKE_APPLICATIONS="${SMOKE_ROOT}/Applications"
+          GUARD_DIR="${SMOKE_ROOT}/guard-bin"
+          GUARD_LOG="${SMOKE_ROOT}/ambient-command.log"
+          MOUNT_POINT="${SMOKE_ROOT}/mounted-dmg"
+          SMOKE_KEYCHAIN="${SMOKE_ROOT}/ci-smoke.keychain-db"
+          SMOKE_KEYCHAIN_PASSWORD="$(uuidgen)"
+          SMOKE_SECRET="$(uuidgen)"
+          APP_PATH="${GITHUB_WORKSPACE}/src-tauri/target/${POLY_TARGET_TRIPLE}/release/bundle/macos/Poly.app"
+          DMG_PATH="$(find "${GITHUB_WORKSPACE}/src-tauri/target/${POLY_TARGET_TRIPLE}/release/bundle/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          INSTALLED_APP="${SMOKE_APPLICATIONS}/Poly.app"
+          RUNTIME_ROOT="${INSTALLED_APP}/Contents/Resources/poly-runtime"
+          mkdir -p "${SMOKE_HOME}/Library/Application Support" "${SMOKE_HOME}/Library/Caches"
+          mkdir -p "${SMOKE_APPLICATIONS}" "${GUARD_DIR}" "${MOUNT_POINT}"
+          chmod 700 "${SMOKE_HOME}" "${SMOKE_APPLICATIONS}"
+          : >"${GUARD_LOG}"
+
+          for command_name in python python3 node postgres aws docker brew; do
+            case "${command_name}" in
+              python) ;;
+              python3) ;;
+              node) ;;
+              postgres) ;;
+              aws) ;;
+              docker) ;;
+              brew) ;;
+            esac
+            printf '%s\n' '#!/bin/sh' \
+              'printf "%s\\n" "${0##*/}" >>"${POLY_GUARD_LOG}"' \
+              'exit 97' >"${GUARD_DIR}/${command_name}"
+            chmod 700 "${GUARD_DIR}/${command_name}"
+          done
+
+          mounted=0
+          cleanup_smoke() {
+            /usr/bin/osascript -e 'tell application id "com.poly.desktop" to quit' >/dev/null 2>&1 || true
+            security delete-generic-password -a "${SMOKE_ACCOUNT}" -s "${SMOKE_SERVICE}" "${SMOKE_KEYCHAIN}" >/dev/null 2>&1 || true
+            security delete-keychain "${SMOKE_KEYCHAIN}" >/dev/null 2>&1 || true
+            if [[ "${mounted}" -eq 1 ]]; then
+              hdiutil detach "${MOUNT_POINT}" -force >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup_smoke EXIT INT TERM
+
+          test -d "${APP_PATH}"
+          test -n "${DMG_PATH}"
+          hdiutil attach "${DMG_PATH}" -mountpoint "${MOUNT_POINT}" -nobrowse -readonly
+          mounted=1
+          SOURCE_APP="$(find "${MOUNT_POINT}" -maxdepth 1 -type d -name 'Poly.app' -print -quit)"
+          test -n "${SOURCE_APP}"
+          ditto "${SOURCE_APP}" "${INSTALLED_APP}"
+          hdiutil detach "${MOUNT_POINT}"
+          mounted=0
+
+          security create-keychain -p "${SMOKE_KEYCHAIN_PASSWORD}" "${SMOKE_KEYCHAIN}"
+          security unlock-keychain -p "${SMOKE_KEYCHAIN_PASSWORD}" "${SMOKE_KEYCHAIN}"
+          security add-generic-password -a "${SMOKE_ACCOUNT}" -s "${SMOKE_SERVICE}" \
+            -w "${SMOKE_SECRET}" "${SMOKE_KEYCHAIN}"
+
+          export HOME="${SMOKE_HOME}"
+          export PATH="${GUARD_DIR}:/usr/bin:/bin"
+          export POLY_GUARD_LOG="${GUARD_LOG}"
+          app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
+          [[ "${app_count}" -eq 0 ]]
+          open -n "${INSTALLED_APP}"
+          for attempt in $(seq 1 60); do
+            runtime_pids="$(packaging/macos/verify-bundle.sh --enumerate-runtime "${RUNTIME_ROOT}/")"
+            listener_found=0
+            while IFS= read -r pid; do
+              [[ -n "${pid}" ]] || continue
+              if lsof -nP -a -p "${pid}" -iTCP -sTCP:LISTEN | grep -q 'TCP 127.0.0.1:'; then
+                listener_found=1
+                break
+              fi
+            done <<<"${runtime_pids}"
+            [[ "${listener_found}" -eq 1 ]] && break
+            sleep 1
+          done
+          [[ "${listener_found}" -eq 1 ]]
+          security find-generic-password -a "${SMOKE_ACCOUNT}" -s "${SMOKE_SERVICE}" \
+            -w "${SMOKE_KEYCHAIN}" >/dev/null
+
+          /usr/bin/osascript -e 'tell application id "com.poly.desktop" to quit'
+          for attempt in $(seq 1 30); do
+            remaining="$(packaging/macos/verify-bundle.sh --enumerate-runtime "${RUNTIME_ROOT}/")"
+            app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
+            [[ -z "${remaining}" && "${app_count}" -eq 0 ]] && break
+            sleep 1
+          done
+          [[ -z "${remaining}" && "${app_count}" -eq 0 ]]
+
+          open -n "${INSTALLED_APP}"
+          sleep 2
+          security find-generic-password -a "${SMOKE_ACCOUNT}" -s "${SMOKE_SERVICE}" \
+            -w "${SMOKE_KEYCHAIN}" >/dev/null
+          open -n "${INSTALLED_APP}"
+          sleep 3
+          app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
+          [[ "${app_count}" -eq 1 ]]
+
+          /usr/bin/osascript -e 'tell application id "com.poly.desktop" to quit'
+          for attempt in $(seq 1 30); do
+            remaining="$(packaging/macos/verify-bundle.sh --enumerate-runtime "${RUNTIME_ROOT}/")"
+            app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
+            [[ -z "${remaining}" && "${app_count}" -eq 0 ]] && break
+            sleep 1
+          done
+          [[ -z "${remaining}" && "${app_count}" -eq 0 ]]
+          security delete-generic-password -a "${SMOKE_ACCOUNT}" -s "${SMOKE_SERVICE}" "${SMOKE_KEYCHAIN}"
+          [[ ! -s "${GUARD_LOG}" ]]
+
+      - name: Remove temporary signing keychain
+        if: ${{ always() && env.IS_RELEASE == 'true' }}
+        run: |
+          KEYCHAIN_PATH="${POLY_SIGNING_KEYCHAIN:-${RUNNER_TEMP}/poly-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.keychain-db}"
+          CERTIFICATE_PATH="${POLY_SIGNING_CERTIFICATE:-${RUNNER_TEMP}/poly-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.p12}"
+          security delete-keychain "${KEYCHAIN_PATH}" >/dev/null 2>&1 || true
+          rm -f -- "${CERTIFICATE_PATH}"
+
+      - name: Upload architecture-specific DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: src-tauri/target/${{ matrix.rust_target }}/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 14
