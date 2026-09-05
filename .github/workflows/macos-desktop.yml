@@ -120,6 +120,8 @@ jobs:
         run: packaging/macos/fetch-postgres.sh
 
       - name: Build packaged Python runtime natively
+        env:
+          POLY_EXPECTED_PARENT_TEAM_ID: ${{ env.IS_RELEASE == 'true' && secrets.APPLE_TEAM_ID || 'ADHOC_VALIDATION_ONLY' }}
         run: packaging/macos/build-runtime.sh
 
       - name: Verify packaged Python runtime
@@ -520,13 +522,11 @@ jobs:
             | "${RUNTIME_EXECUTABLE}" --keychain-smoke verify --account "${SMOKE_ACCOUNT}" >/dev/null
           /usr/bin/open -n "${INSTALLED_APP}"
           /bin/sleep 3
-          assert_exec_trace_alive
           app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
           [[ "${app_count}" -eq 1 ]]
 
           /usr/bin/osascript -e 'tell application id "com.poly.desktop" to quit'
           for ((attempt = 1; attempt <= 30; attempt++)); do
-            assert_exec_trace_alive
             remaining="$("${GITHUB_WORKSPACE}/packaging/macos/verify-bundle.sh" --enumerate-runtime "${RUNTIME_ROOT}/")"
             app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
             [[ -z "${remaining}" && "${app_count}" -eq 0 ]] && break

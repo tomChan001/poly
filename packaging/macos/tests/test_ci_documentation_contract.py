@@ -11,6 +11,14 @@ def read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def test_release_runtime_bakes_the_expected_apple_team_identity() -> None:
+    workflow = read(WORKFLOW)
+
+    assert "POLY_EXPECTED_PARENT_TEAM_ID" in workflow
+    assert "secrets.APPLE_TEAM_ID" in workflow
+    assert "ADHOC_VALIDATION_ONLY" in workflow
+
+
 def test_workflow_is_read_only_and_uses_the_exact_native_matrix() -> None:
     workflow = read(WORKFLOW)
     assert re.search(r"(?m)^permissions:\s*\n\s+contents: read\s*$", workflow)
@@ -284,6 +292,8 @@ def test_smoke_uses_calibrated_kernel_exec_tracing() -> None:
     trace_window = smoke[trace_start:trace_stop]
     assert "--keychain-smoke verify" not in trace_window
     assert "--keychain-smoke delete" not in trace_window
+    post_trace_window = smoke[trace_stop:]
+    assert "assert_exec_trace_alive" not in post_trace_window
 
 
 def test_exec_trace_unexpected_exit_is_a_hard_failure() -> None:

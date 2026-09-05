@@ -20,6 +20,7 @@ if __name__ == "__main__" or getattr(sys, "frozen", False):
     os.environ["POLY_DESKTOP_MODE"] = "1"
 
 from backend.app.core.secrets import KeyringSecretStore, SecretStore
+from backend.app.desktop.parent import trusted_packaged_parent
 from backend.app.desktop.protocol import (
     RuntimeEvent,
     RuntimeState,
@@ -191,6 +192,7 @@ def self_test(
         (root / "frontend" / "dist" / "index.html", root / "frontend" / "dist"),
         (root / "alembic.ini", root),
         (root / "migrations" / "env.py", root / "migrations"),
+        (root / "expected-parent-team-id", root),
     ]
     postgres_bin = root / "postgres" / "bin"
     required_executables = [
@@ -308,6 +310,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         event = asyncio.run(keychain_smoke(args.keychain_smoke, args.account or ""))
         _stdout_writer(event.to_json())
         return 0 if event.state is RuntimeState.STOPPED else 1
+    if not trusted_packaged_parent(packaged_project_root()):
+        _stdout_writer(
+            _failure("runtime_unavailable", "desktop launcher is not trusted").to_json()
+        )
+        return 1
     return asyncio.run(run_stdio())
 
 

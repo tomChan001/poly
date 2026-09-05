@@ -27,6 +27,7 @@ MIGRATIONS = ROOT / "migrations"
 ALEMBIC_CONFIG = ROOT / "alembic.ini"
 FRONTEND_DIST = ROOT / "frontend" / "dist"
 POSTGRES_DIST = ROOT / "packaging" / "macos" / "postgres" / TARGET_TRIPLE
+PARENT_IDENTITY_FILE = Path(os.environ["POLY_PARENT_IDENTITY_FILE"]).resolve()
 
 required_resources = (
     ENTRY_POINT,
@@ -34,6 +35,7 @@ required_resources = (
     ALEMBIC_CONFIG,
     FRONTEND_DIST / "index.html",
     POSTGRES_DIST,
+    PARENT_IDENTITY_FILE,
 )
 missing_resources = [str(path) for path in required_resources if not path.exists()]
 if missing_resources:
@@ -47,6 +49,7 @@ datas = [
     (str(ALEMBIC_CONFIG), "."),
     (str(FRONTEND_DIST), "frontend/dist"),
     (str(POSTGRES_DIST), "postgres"),
+    (str(PARENT_IDENTITY_FILE), "."),
 ]
 datas.extend(copy_metadata("keyring"))
 binaries = []

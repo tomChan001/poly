@@ -154,7 +154,7 @@ sidecar 通过标准输出发送逐行 JSON 事件，例如：
 {"version":1,"state":"ready","port":49152,"bootstrap_path":"/desktop/bootstrap/..."}
 ```
 
-标准输出只承载控制协议。诊断信息写到经过脱敏和轮转的本地日志，不记录凭证、启动令牌、Cookie 或完整请求 URL。
+标准输出只承载控制协议。诊断信息写到经过脱敏和轮转的本地日志，不记录凭证、启动令牌、会话 capability 或完整请求 URL。冻结的 sidecar 还会验证直接父进程位于同一 bundle，并校验父进程与自身的签名 Team ID；任意终端或同用户进程不能直接启动生产控制面。
 
 ### 5.2 HTTP 端口分配
 
@@ -170,11 +170,11 @@ loopback 绑定仍然是首要边界，并保留现有 `backend/app/core/securit
 
 1. sidecar 根据启动令牌生成一次性高熵 bootstrap 路径。
 2. Tauri 仅把 WebView 导航到该路径一次。
-3. 后端验证后设置随机会话值的 `HttpOnly; SameSite=Strict` Cookie，立即 303 重定向到 `/`，并永久作废 bootstrap 值。
-4. 桌面模式下，业务 API 在现有安全检查之外还要求该 Cookie。
+3. 后端验证后把独立随机会话 capability 放入 303 目标的 URL fragment；fragment 不会随 HTTP 请求发送。React 启动代码把它保存到当前精确 origin（包含随机端口）隔离的 `sessionStorage` 和内存中，并立即通过 `history.replaceState` 从地址栏清除；这样 WebView reload 后仍能恢复会话，而另一个本地端口无法读取。
+4. 桌面模式下，业务 API 在现有安全检查之外要求显式 `X-Poly-Desktop-Session` header，并把 Host/Origin 精确绑定到本次随机端口。
 5. Uvicorn 访问日志关闭，因此一次性路径不会进入日志。
 
-loopback 使用 HTTP 时不能可靠设置 `Secure` Cookie，因此不伪装这一属性。令牌只在进程内存和极短暂的 WebView 导航中存在；随机端口和一次性 Cookie 是对 localhost/Origin 校验的纵深防御，不作为抵御同一 macOS 用户下恶意软件的唯一手段。
+会话不使用按主机共享、忽略端口的 ambient Cookie。capability 只存在于当前随机端口的 origin-scoped `sessionStorage`、进程内存和极短暂的 WebView fragment 中；随机端口、精确 authority 校验、禁止 framing 和父进程签名验证共同保护本地控制面。
 
 `/health` 对未认证请求只返回无敏感信息的存活状态；完整运行状态只通过已认证 API 或父子控制通道暴露。
 
@@ -298,8 +298,8 @@ Apple 签名证书、notarization 凭证等只存放在 CI 的受保护秘密存
 
 - 桌面启动消息解析且秘密不进入参数、环境和日志。
 - socket 绑定到 `127.0.0.1`，拒绝 wildcard 配置。
-- 一次性 bootstrap 只能成功一次，重定向后 URL 不含令牌。
-- Cookie 缺失、错误或过期时拒绝业务 API。
+- 一次性 bootstrap 只能成功一次，React 读取 fragment 后立即清除地址栏令牌。
+- capability header 缺失、错误、跨端口或来源不匹配时拒绝业务 API。
 - 现有 localhost/loopback/Origin 安全测试保持通过。
 - PostgreSQL 初始化、迁移失败和恢复逻辑使用临时目录/受控进程替身测试。
 - Keychain 层 mock，验证数据库与日志中不出现凭证。

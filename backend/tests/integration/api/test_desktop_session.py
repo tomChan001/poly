@@ -1,18 +1,33 @@
 from dataclasses import fields
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
 
 from backend.app.container import ApplicationContainer
 from backend.app.core.config import settings
-from backend.app.desktop.session import COOKIE_NAME, DesktopSession
+from backend.app.desktop.session import CAPABILITY_HEADER, DesktopSession
 from backend.app.main import create_app
+
+PORT = 49152
+BASE_URL = f"http://127.0.0.1:{PORT}"
+
+
+def bound_session() -> DesktopSession:
+    session = DesktopSession.create()
+    session.bind_port(PORT)
+    return session
+
+
+def response_capability(response: httpx.Response) -> str:
+    fragment = urlsplit(response.headers["location"]).fragment
+    return parse_qs(fragment)["poly_session"][0]
 
 
 @pytest.mark.asyncio
-async def test_desktop_api_requires_capability_cookie(monkeypatch) -> None:
+async def test_desktop_api_requires_explicit_capability_header(monkeypatch) -> None:
     monkeypatch.setattr(settings, "local_setup_enabled", True)
-    session = DesktopSession.create()
+    session = bound_session()
     app = create_app(
         ApplicationContainer(),
         allow_local_setup=True,
@@ -22,25 +37,30 @@ async def test_desktop_api_requires_capability_cookie(monkeypatch) -> None:
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 51000))
     async with httpx.AsyncClient(
         transport=transport,
-        base_url="http://127.0.0.1",
+        base_url=BASE_URL,
     ) as client:
         denied = await client.get("/api/opportunities")
         denied_health = await client.get("/health")
         bootstrap = await client.get(bootstrap_path, follow_redirects=False)
+        capability = response_capability(bootstrap)
         allowed = await client.get(
             "/api/opportunities",
-            headers={"Origin": "http://127.0.0.1:49152"},
+            headers={"Origin": BASE_URL, CAPABILITY_HEADER: capability},
         )
-        allowed_health = await client.get("/health")
+        allowed_health = await client.get(
+            "/health", headers={CAPABILITY_HEADER: capability}
+        )
         replay = await client.get(bootstrap_path, follow_redirects=False)
 
     assert denied.status_code == 403
     assert denied_health.status_code == 403
     assert bootstrap.status_code == 303
-    assert bootstrap.headers["location"] == "/"
-    assert "HttpOnly" in bootstrap.headers["set-cookie"]
-    assert "SameSite=strict" in bootstrap.headers["set-cookie"]
+    assert bootstrap.headers["location"].startswith("/#poly_session=")
+    assert "set-cookie" not in bootstrap.headers
+    assert bootstrap.headers["cache-control"] == "no-store"
     assert allowed.status_code == 200
+    assert allowed.headers["content-security-policy"] == "frame-ancestors 'none'"
+    assert allowed.headers["x-frame-options"] == "DENY"
     assert allowed_health.status_code == 200
     assert replay.status_code == 403
 
@@ -51,13 +71,13 @@ def test_desktop_session_repr_redacts_secrets_and_exchange_discards_token() -> N
     bootstrap_token = bootstrap_path.rsplit("/", maxsplit=1)[-1]
     before_exchange = repr(session)
 
-    cookie_value = session.exchange(bootstrap_token)
+    capability = session.exchange(bootstrap_token)
 
-    assert cookie_value is not None
+    assert capability is not None
     assert bootstrap_token not in before_exchange
-    assert cookie_value not in before_exchange
+    assert capability not in before_exchange
     assert bootstrap_token not in repr(session)
-    assert cookie_value not in repr(session)
+    assert capability not in repr(session)
     with pytest.raises(RuntimeError, match="desktop bootstrap already used"):
         session.bootstrap_path.startswith("/desktop/")
 
@@ -73,7 +93,7 @@ def test_desktop_session_repr_redacts_secrets_and_exchange_discards_token() -> N
 @pytest.mark.asyncio
 async def test_hostile_origin_stays_blocked_after_bootstrap(monkeypatch) -> None:
     monkeypatch.setattr(settings, "local_setup_enabled", True)
-    session = DesktopSession.create()
+    session = bound_session()
     app = create_app(
         ApplicationContainer(),
         allow_local_setup=True,
@@ -82,7 +102,7 @@ async def test_hostile_origin_stays_blocked_after_bootstrap(monkeypatch) -> None
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 51000))
     async with httpx.AsyncClient(
         transport=transport,
-        base_url="http://127.0.0.1",
+        base_url=BASE_URL,
     ) as client:
         await client.get(session.bootstrap_path)
         response = await client.get(
@@ -96,7 +116,7 @@ async def test_hostile_origin_stays_blocked_after_bootstrap(monkeypatch) -> None
 
 @pytest.mark.asyncio
 async def test_bootstrap_rejects_non_loopback_client() -> None:
-    session = DesktopSession.create()
+    session = bound_session()
     app = create_app(ApplicationContainer(), desktop_session=session)
     transport = httpx.ASGITransport(app=app, client=("192.0.2.10", 51000))
 
@@ -111,14 +131,14 @@ async def test_bootstrap_rejects_non_loopback_client() -> None:
 
 @pytest.mark.asyncio
 async def test_bootstrap_rejects_wrong_token_without_consuming_session() -> None:
-    session = DesktopSession.create()
+    session = bound_session()
     bootstrap_path = session.bootstrap_path
     app = create_app(ApplicationContainer(), desktop_session=session)
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 51000))
 
     async with httpx.AsyncClient(
         transport=transport,
-        base_url="http://127.0.0.1",
+        base_url=BASE_URL,
     ) as client:
         wrong = await client.get(
             "/desktop/bootstrap/not-the-token",
@@ -132,33 +152,29 @@ async def test_bootstrap_rejects_wrong_token_without_consuming_session() -> None
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_cookie_flags_and_value_are_not_the_url_token() -> None:
-    session = DesktopSession.create()
+async def test_bootstrap_returns_nonambient_fragment_capability() -> None:
+    session = bound_session()
     bootstrap_path = session.bootstrap_path
     token = bootstrap_path.rsplit("/", maxsplit=1)[-1]
     app = create_app(ApplicationContainer(), desktop_session=session)
     transport = httpx.ASGITransport(app=app, client=("::1", 51000))
 
     async with httpx.AsyncClient(
-        transport=transport, base_url="http://[::1]"
+        transport=transport, base_url=BASE_URL
     ) as client:
         response = await client.get(bootstrap_path, follow_redirects=False)
 
-    set_cookie = response.headers["set-cookie"]
-    cookie_value = response.cookies[COOKIE_NAME]
+    capability = response_capability(response)
     assert response.status_code == 303
-    assert cookie_value != token
-    assert token not in set_cookie
-    assert "HttpOnly" in set_cookie
-    assert "SameSite=strict" in set_cookie
-    assert "Path=/" in set_cookie
-    assert "Secure" not in set_cookie
+    assert capability != token
+    assert "set-cookie" not in response.headers
+    assert response.headers["content-security-policy"] == "frame-ancestors 'none'"
 
 
 @pytest.mark.asyncio
-async def test_desktop_health_rejects_bogus_cookie_from_loopback(monkeypatch) -> None:
+async def test_desktop_health_rejects_bogus_capability_from_loopback(monkeypatch) -> None:
     monkeypatch.setattr(settings, "local_setup_enabled", True)
-    session = DesktopSession.create()
+    session = bound_session()
     app = create_app(
         ApplicationContainer(),
         allow_local_setup=True,
@@ -168,11 +184,11 @@ async def test_desktop_health_rejects_bogus_cookie_from_loopback(monkeypatch) ->
 
     async with httpx.AsyncClient(
         transport=transport,
-        base_url="http://127.0.0.1",
+        base_url=BASE_URL,
     ) as client:
         response = await client.get(
             "/health",
-            headers={"Cookie": f"{COOKIE_NAME}=bogus"},
+            headers={CAPABILITY_HEADER: "bogus"},
         )
 
     assert response.status_code == 403
@@ -180,11 +196,11 @@ async def test_desktop_health_rejects_bogus_cookie_from_loopback(monkeypatch) ->
 
 
 @pytest.mark.asyncio
-async def test_desktop_health_rejects_valid_cookie_from_remote_client(
+async def test_desktop_health_rejects_valid_capability_from_remote_client(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(settings, "local_setup_enabled", True)
-    session = DesktopSession.create()
+    session = bound_session()
     app = create_app(
         ApplicationContainer(),
         allow_local_setup=True,
@@ -194,19 +210,19 @@ async def test_desktop_health_rejects_valid_cookie_from_remote_client(
     loopback_transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 51000))
     async with httpx.AsyncClient(
         transport=loopback_transport,
-        base_url="http://127.0.0.1",
+        base_url=BASE_URL,
     ) as client:
         bootstrap = await client.get(bootstrap_path, follow_redirects=False)
-    cookie_value = bootstrap.cookies[COOKIE_NAME]
+    capability = response_capability(bootstrap)
 
     remote_transport = httpx.ASGITransport(app=app, client=("192.0.2.10", 51000))
     async with httpx.AsyncClient(
         transport=remote_transport,
-        base_url="http://127.0.0.1",
+        base_url=BASE_URL,
     ) as client:
         response = await client.get(
             "/health",
-            headers={"Cookie": f"{COOKIE_NAME}={cookie_value}"},
+            headers={CAPABILITY_HEADER: capability},
         )
 
     assert response.status_code == 403
@@ -214,11 +230,11 @@ async def test_desktop_health_rejects_valid_cookie_from_remote_client(
 
 
 @pytest.mark.asyncio
-async def test_desktop_health_rejects_valid_cookie_with_hostile_origin(
+async def test_desktop_health_rejects_valid_capability_with_hostile_origin(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(settings, "local_setup_enabled", True)
-    session = DesktopSession.create()
+    session = bound_session()
     app = create_app(
         ApplicationContainer(),
         allow_local_setup=True,
@@ -228,12 +244,45 @@ async def test_desktop_health_rejects_valid_cookie_with_hostile_origin(
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 51000))
     async with httpx.AsyncClient(
         transport=transport,
-        base_url="http://127.0.0.1",
+        base_url=BASE_URL,
     ) as client:
-        await client.get(bootstrap_path, follow_redirects=False)
+        bootstrap = await client.get(bootstrap_path, follow_redirects=False)
+        capability = response_capability(bootstrap)
         response = await client.get(
             "/health",
-            headers={"Origin": "https://evil.example"},
+            headers={
+                "Origin": "https://evil.example",
+                CAPABILITY_HEADER: capability,
+            },
+        )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "local access only"}
+
+
+@pytest.mark.asyncio
+async def test_desktop_capability_is_bound_to_the_exact_loopback_port(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(settings, "local_setup_enabled", True)
+    session = bound_session()
+    app = create_app(
+        ApplicationContainer(),
+        allow_local_setup=True,
+        desktop_session=session,
+    )
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 51000))
+    async with httpx.AsyncClient(transport=transport, base_url=BASE_URL) as client:
+        bootstrap = await client.get(session.bootstrap_path, follow_redirects=False)
+    capability = response_capability(bootstrap)
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1:49153",
+    ) as client:
+        response = await client.get(
+            "/health",
+            headers={CAPABILITY_HEADER: capability},
         )
 
     assert response.status_code == 403

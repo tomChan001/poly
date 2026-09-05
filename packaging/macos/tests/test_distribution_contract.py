@@ -80,6 +80,16 @@ class DistributionContractTests(unittest.TestCase):
         )
         self.assertNotIn('"${BUNDLE_DIR}/postgres/bin/${program}"', verifier)
 
+    def test_runtime_bundles_a_build_identity_for_parent_authentication(self) -> None:
+        spec = self.read("poly-runtime.spec")
+        build = self.read("build-runtime.sh")
+
+        self.assertIn('os.environ["POLY_PARENT_IDENTITY_FILE"]', spec)
+        self.assertIn('(str(PARENT_IDENTITY_FILE), ".")', spec)
+        self.assertIn("ADHOC_VALIDATION_ONLY", build)
+        self.assertIn("POLY_EXPECTED_PARENT_TEAM_ID", build)
+        self.assertIn("POLY_PARENT_IDENTITY_FILE", build)
+
     def test_postgres_checksum_is_the_official_pin(self) -> None:
         self.assertEqual(
             self.read("postgres-SHA256SUMS"),

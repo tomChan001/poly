@@ -199,6 +199,7 @@ class DesktopRuntime:
                     UNCLEAN_SHUTDOWN_REASON
                 )
             self.server = self.server_factory(application)
+            desktop_session.bind_port(self.server.port)
             await self.server.start()
             self._ready = True
             ready = RuntimeEvent(

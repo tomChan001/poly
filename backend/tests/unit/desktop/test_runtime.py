@@ -43,6 +43,7 @@ def populate_self_test_layout(root: Path) -> dict[str, Path]:
         "frontend": root / "frontend" / "dist" / "index.html",
         "alembic": root / "alembic.ini",
         "migration": root / "migrations" / "env.py",
+        "parent_identity": root / "expected-parent-team-id",
         "initdb": root / "postgres" / "bin" / "initdb",
         "postgres": root / "postgres" / "bin" / "postgres",
         "pg_isready": root / "postgres" / "bin" / "pg_isready",
@@ -1153,6 +1154,24 @@ def test_self_test_reports_missing_resource_without_starting_runtime(
     assert event.fields == {
         "code": "resource_missing",
         "detail": "required packaged resource is unavailable",
+    }
+
+
+def test_default_entrypoint_rejects_an_untrusted_packaged_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output: list[str] = []
+    monkeypatch.setattr(desktop_main, "trusted_packaged_parent", lambda _root: False)
+    monkeypatch.setattr(desktop_main, "_stdout_writer", output.append)
+
+    result = desktop_main.main([])
+
+    assert result == 1
+    assert json.loads(output[0]) == {
+        "version": 1,
+        "state": "failed",
+        "code": "runtime_unavailable",
+        "detail": "desktop launcher is not trusted",
     }
 
 

@@ -19,6 +19,7 @@ _SENSITIVE_KEYS = {
     "secret",
     "signature",
     "token",
+    "xpolydesktopsession",
 }
 
 
@@ -103,6 +104,9 @@ def is_loopback_request(request: Request) -> bool:
 
 
 def _has_trusted_local_origin(request: Request) -> bool:
+    desktop_session = getattr(request.app.state, "desktop_session", None)
+    if desktop_session is not None:
+        return bool(desktop_session.has_trusted_authority(request))
     origin = request.headers.get("origin")
     if origin is None:
         # Native local tools do not send Origin. Browser requests do, which

@@ -3,6 +3,7 @@ import socket
 import sys
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
@@ -17,7 +18,7 @@ from backend.app.desktop.server import (
     LoopbackStartupError,
     bind_loopback_socket,
 )
-from backend.app.desktop.session import DesktopSession
+from backend.app.desktop.session import CAPABILITY_HEADER, DesktopSession
 from backend.app.main import create_app
 
 
@@ -129,6 +130,7 @@ async def test_static_mount_does_not_swallow_registered_routes(
 ) -> None:
     monkeypatch.setattr(settings, "local_setup_enabled", True)
     session = DesktopSession.create()
+    session.bind_port(51000)
     bootstrap_path = session.bootstrap_path
 
     (tmp_path / "index.html").write_text("desktop root", encoding="utf-8")
@@ -147,11 +149,15 @@ async def test_static_mount_does_not_swallow_registered_routes(
     )
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 51000))
     async with httpx.AsyncClient(
-        transport=transport, base_url="http://127.0.0.1"
+        transport=transport, base_url="http://127.0.0.1:51000"
     ) as client:
         bootstrap = await client.get(bootstrap_path, follow_redirects=False)
-        opportunities = await client.get("/api/opportunities")
-        health = await client.get("/health")
+        capability = parse_qs(urlsplit(bootstrap.headers["location"]).fragment)[
+            "poly_session"
+        ][0]
+        headers = {CAPABILITY_HEADER: capability}
+        opportunities = await client.get("/api/opportunities", headers=headers)
+        health = await client.get("/health", headers=headers)
 
     assert bootstrap.status_code == 303
     assert opportunities.status_code == 200

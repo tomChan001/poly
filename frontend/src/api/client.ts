@@ -14,10 +14,11 @@ import type {
   PairReviewInput,
   RuntimeStatus,
 } from '../types/runtime'
+import { sessionFetch } from './desktopSession'
 
 
 export async function getOpportunities(): Promise<Opportunity[]> {
-  const response = await fetch('/api/opportunities')
+  const response = await sessionFetch('/api/opportunities')
   if (!response.ok) {
     throw new Error(`opportunity request failed: ${response.status}`)
   }
@@ -26,7 +27,7 @@ export async function getOpportunities(): Promise<Opportunity[]> {
 
 
 export async function getExecutions(): Promise<Execution[]> {
-  const response = await fetch('/api/executions')
+  const response = await sessionFetch('/api/executions')
   if (!response.ok) {
     throw new Error(`execution request failed: ${response.status}`)
   }
@@ -35,7 +36,7 @@ export async function getExecutions(): Promise<Execution[]> {
 
 
 export async function getSystemStatus(): Promise<SystemStatus> {
-  const response = await fetch('/health')
+  const response = await sessionFetch('/health')
   if (!response.ok) {
     throw new Error(`system status request failed: ${response.status}`)
   }
@@ -44,7 +45,7 @@ export async function getSystemStatus(): Promise<SystemStatus> {
 
 
 async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, init)
+  const response = await sessionFetch(path, init)
   if (!response.ok) {
     const payload = await response.json().catch(() => null) as { detail?: unknown } | null
     const detail = formatApiDetail(payload?.detail) ?? `HTTP ${response.status}`
@@ -119,7 +120,7 @@ export function reviewPair(pairId: string, value: PairReviewInput): Promise<Exec
 
 
 async function integrationRequest<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`/api/integrations${path}`, init)
+  const response = await sessionFetch(`/api/integrations${path}`, init)
   if (!response.ok) {
     const payload = await response.json().catch(() => null) as { detail?: unknown } | null
     const detail = typeof payload?.detail === 'string' ? payload.detail : `HTTP ${response.status}`

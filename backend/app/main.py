@@ -19,7 +19,7 @@ from backend.app.api.routes.system_control import router as system_control_route
 from backend.app.container import ApplicationContainer
 from backend.app.core.config import Settings, desktop_mode_enabled, settings
 from backend.app.core.security import is_local_setup_request, is_loopback_request
-from backend.app.desktop.session import COOKIE_NAME, DesktopSession
+from backend.app.desktop.session import DesktopSession
 from backend.app.services.system_control import OpeningControlPersistenceError
 
 
@@ -116,6 +116,15 @@ def create_app(
     application.state.allow_local_setup = (
         owns_container if allow_local_setup is None else allow_local_setup
     )
+
+    @application.middleware("http")
+    async def desktop_security_headers(request: Request, call_next):
+        response = await call_next(request)
+        if desktop_session is not None:
+            response.headers["Content-Security-Policy"] = "frame-ancestors 'none'"
+            response.headers["X-Frame-Options"] = "DENY"
+        return response
+
     application.include_router(executions_router)
     application.include_router(integrations_router)
     application.include_router(mappings_router)
@@ -131,19 +140,19 @@ def create_app(
             raise HTTPException(status_code=404)
         if not is_loopback_request(request):
             raise HTTPException(status_code=403, detail="local access only")
-        cookie_value = desktop_session.exchange(token)
-        if cookie_value is None:
+        if not desktop_session.has_trusted_authority(request):
+            raise HTTPException(status_code=403, detail="local access only")
+        capability = desktop_session.exchange(token)
+        if capability is None:
             raise HTTPException(status_code=403, detail="invalid desktop bootstrap")
-        response = RedirectResponse("/", status_code=303)
-        response.set_cookie(
-            COOKIE_NAME,
-            cookie_value,
-            httponly=True,
-            secure=False,
-            samesite="strict",
-            path="/",
+        return RedirectResponse(
+            f"/#poly_session={capability}",
+            status_code=303,
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Security-Policy": "frame-ancestors 'none'",
+            },
         )
-        return response
 
     @application.get("/health")
     async def health(request: Request) -> dict[str, object]:
