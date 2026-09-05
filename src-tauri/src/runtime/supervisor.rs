@@ -444,6 +444,14 @@ where
                     observed.failure = RuntimeFailure::CleanupFailed;
                 }
             }
+            if observed.failure == RuntimeFailure::CleanupFailed {
+                if let Some(stderr_task) = stderr_task.take() {
+                    stderr_task.abort();
+                }
+                return self
+                    .publish_terminal(&notices, RuntimeFailure::CleanupFailed)
+                    .await;
+            }
             if let Some(stderr_task) = stderr_task {
                 match stderr_task.await {
                     Ok(Ok(())) => {}
@@ -629,6 +637,7 @@ mod tests {
         stdout_pending: bool,
         wait_pending: bool,
         kill_error: bool,
+        stderr_pending: bool,
     }
 
     impl ChildScript {
@@ -642,6 +651,7 @@ mod tests {
                 stdout_pending: false,
                 wait_pending: false,
                 kill_error: false,
+                stderr_pending: false,
             }
         }
 
@@ -655,6 +665,7 @@ mod tests {
                 stdout_pending: false,
                 wait_pending: false,
                 kill_error: false,
+                stderr_pending: false,
             }
         }
 
@@ -668,6 +679,7 @@ mod tests {
                 stdout_pending: false,
                 wait_pending: false,
                 kill_error: false,
+                stderr_pending: false,
             }
         }
 
@@ -681,6 +693,7 @@ mod tests {
                 stdout_pending: true,
                 wait_pending: true,
                 kill_error: false,
+                stderr_pending: false,
             }
         }
 
@@ -694,6 +707,14 @@ mod tests {
                 stdout_pending: false,
                 wait_pending: false,
                 kill_error: true,
+                stderr_pending: false,
+            }
+        }
+
+        fn wait_and_kill_error_with_pending_stderr() -> Self {
+            Self {
+                stderr_pending: true,
+                ..Self::wait_and_kill_error()
             }
         }
     }
@@ -750,6 +771,7 @@ mod tests {
         stdout_pending: bool,
         wait_pending: bool,
         kill_error: bool,
+        stderr_pending: bool,
     }
 
     impl RuntimeLauncher for FakeLauncher {
@@ -773,6 +795,7 @@ mod tests {
                 stdout_pending: script.stdout_pending,
                 wait_pending: script.wait_pending,
                 kill_error: script.kill_error,
+                stderr_pending: script.stderr_pending,
             }))
         }
     }
@@ -798,6 +821,9 @@ mod tests {
         fn take_stderr(&mut self) -> Option<Box<dyn AsyncBufRead + Send + Unpin>> {
             if let Some(kind) = self.stderr_error.take() {
                 return Some(Box::new(BufReader::new(FailingReader { kind })));
+            }
+            if self.stderr_pending {
+                return Some(Box::new(BufReader::new(PendingReader)));
             }
             self.stderr.take().map(|bytes| {
                 Box::new(BufReader::new(Cursor::new(bytes))) as Box<dyn AsyncBufRead + Send + Unpin>
@@ -1225,6 +1251,7 @@ mod tests {
             stdout_pending: false,
             wait_pending: false,
             kill_error: false,
+            stderr_pending: false,
         }];
         let (mut supervisor, state, _clock, support_dir) =
             fake_supervisor(scripts, "stderr-clean-stop");
@@ -1308,6 +1335,40 @@ mod tests {
             other => panic!("unexpected state: {other:?}"),
         }
         drop(state);
+        std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
+    fn cleanup_failure_does_not_wait_for_a_pending_stderr_pipe() {
+        let scripts = vec![
+            ChildScript::wait_and_kill_error_with_pending_stderr(),
+            ChildScript::crash(
+                "{\"version\":1,\"state\":\"initializing\"}\n",
+                Duration::ZERO,
+            ),
+        ];
+        let (mut supervisor, state, clock, support_dir) =
+            fake_supervisor(scripts, "cleanup-failure-pending-stderr");
+        let (sender, mut receiver) = mpsc::channel(8);
+
+        let timed = runtime().block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                supervisor.supervise_until_terminal(sender),
+            )
+            .await
+        });
+
+        assert_eq!(
+            timed.unwrap().unwrap(),
+            SupervisionOutcome::Terminal(RuntimeFailure::CleanupFailed)
+        );
+        assert_eq!(state.lock().unwrap().launches, 1);
+        assert!(clock.inner.lock().unwrap().sleeps.is_empty());
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            RuntimeSupervisorNotice::Terminal(RuntimeFailure::CleanupFailed)
+        ));
         std::fs::remove_dir_all(support_dir).unwrap();
     }
 
