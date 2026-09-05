@@ -151,8 +151,11 @@ def test_smoke_uses_calibrated_kernel_exec_tracing() -> None:
     workflow = read(WORKFLOW)
     for marker in (
         "/usr/bin/sudo -n /usr/bin/fs_usage -w -f exec",
-        "/usr/bin/python3 -c 'pass'",
+        '"/usr/bin/python3"',
         "CALIBRATION_TRACE",
+        "CALIBRATION_PARENT",
+        "/usr/bin/clang",
+        "posix_spawn",
         "APP_EXEC_TRACE",
         "Poly poly-runtime",
         "audit_exec_trace",
@@ -172,13 +175,39 @@ def test_smoke_uses_calibrated_kernel_exec_tracing() -> None:
         assert forbidden_command in workflow
     assert "/bin/ps -ww -axo pid=,ppid=,comm=" not in workflow
     assert "audit_app_processes" not in workflow
+    assert workflow.count('start_exec_trace "${') == 2
+    assert (
+        workflow.count('start_exec_trace "${CALIBRATION_TRACE}" Poly poly-runtime') == 1
+    )
+    assert workflow.count('start_exec_trace "${APP_EXEC_TRACE}" Poly poly-runtime') == 1
     assert re.search(
-        r"start_exec_trace.*?python3 -c 'pass'.*?stop_exec_trace.*?"
+        r"start_exec_trace.*?CALIBRATION_PARENT.*?stop_exec_trace.*?"
         r"grep.*?/usr/bin/python3",
         workflow,
         re.DOTALL,
     )
+    assert '[[ -s "${APP_EXEC_TRACE}" ]]' in workflow
+    assert re.search(
+        r"grep -Fq.*?RUNTIME_EXECUTABLE.*?APP_EXEC_TRACE.*?\|\|.*?"
+        r"grep -Fq.*?BUNDLED_POSTGRES.*?APP_EXEC_TRACE",
+        workflow,
+        re.DOTALL,
+    )
     assert '[[ ! -s "${TRACE_FAILURE}" ]]' in workflow
+
+
+def test_exec_trace_unexpected_exit_is_a_hard_failure() -> None:
+    workflow = read(WORKFLOW)
+    assert "assert_exec_trace_alive" in workflow
+    assert "fs_usage exited before intentional stop" in workflow
+    assert workflow.count("assert_exec_trace_alive") >= 4
+    assert "trace_stop_requested=1" in workflow
+    assert re.search(
+        r"stop_exec_trace\(\).*?trace_stop_requested=1.*?kill -INT.*?"
+        r"wait.*?\|\| true",
+        workflow,
+        re.DOTALL,
+    )
 
 
 def test_smoke_restores_trimmed_keychain_paths_or_fails_closed() -> None:
