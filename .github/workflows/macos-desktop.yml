@@ -192,7 +192,7 @@ jobs:
       - name: Install DMG into an isolated home and smoke test
         env:
           SMOKE_SERVICE: com.poly.desktop.integrations
-          SMOKE_ACCOUNT: com.poly.desktop.integrations.ci-smoke
+          SMOKE_ACCOUNT: ci-smoke-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
           SMOKE_ROOT="$(mktemp -d "${RUNNER_TEMP}/poly-smoke.XXXXXXXX")"
@@ -200,6 +200,10 @@ jobs:
           SMOKE_APPLICATIONS="${SMOKE_ROOT}/Applications"
           GUARD_DIR="${SMOKE_ROOT}/guard-bin"
           GUARD_LOG="${SMOKE_ROOT}/ambient-command.log"
+          AUDIT_LOG="${SMOKE_ROOT}/descendant-executables.log"
+          AUDIT_FAILURE="${SMOKE_ROOT}/descendant-executable-failures.log"
+          AUDIT_STOP="${SMOKE_ROOT}/stop-audit"
+          DIAGNOSTICS_DIR="${RUNNER_TEMP}/poly-diagnostics/smoke-${POLY_TARGET_ARCH}"
           MOUNT_POINT="${SMOKE_ROOT}/mounted-dmg"
           SMOKE_KEYCHAIN="${SMOKE_ROOT}/ci-smoke.keychain-db"
           SMOKE_KEYCHAIN_PASSWORD="$(uuidgen)"
@@ -207,22 +211,22 @@ jobs:
           APP_PATH="${GITHUB_WORKSPACE}/src-tauri/target/${POLY_TARGET_TRIPLE}/release/bundle/macos/Poly.app"
           DMG_PATH="$(find "${GITHUB_WORKSPACE}/src-tauri/target/${POLY_TARGET_TRIPLE}/release/bundle/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
           INSTALLED_APP="${SMOKE_APPLICATIONS}/Poly.app"
+          APP_EXECUTABLE="${INSTALLED_APP}/Contents/MacOS/Poly"
           RUNTIME_ROOT="${INSTALLED_APP}/Contents/Resources/poly-runtime"
+          UV_BIN="$(command -v uv)"
+          ORIGINAL_DEFAULT_KEYCHAIN="$(/usr/bin/security default-keychain -d user | /usr/bin/tr -d '\"')"
+          ORIGINAL_KEYCHAINS=()
+          while IFS= read -r keychain_path; do
+            ORIGINAL_KEYCHAINS+=("${keychain_path//\"/}")
+          done < <(/usr/bin/security list-keychains -d user)
           mkdir -p "${SMOKE_HOME}/Library/Application Support" "${SMOKE_HOME}/Library/Caches"
-          mkdir -p "${SMOKE_APPLICATIONS}" "${GUARD_DIR}" "${MOUNT_POINT}"
+          mkdir -p "${SMOKE_APPLICATIONS}" "${GUARD_DIR}" "${MOUNT_POINT}" "${DIAGNOSTICS_DIR}"
           chmod 700 "${SMOKE_HOME}" "${SMOKE_APPLICATIONS}"
           : >"${GUARD_LOG}"
+          : >"${AUDIT_LOG}"
+          : >"${AUDIT_FAILURE}"
 
           for command_name in python python3 node postgres aws docker brew; do
-            case "${command_name}" in
-              python) ;;
-              python3) ;;
-              node) ;;
-              postgres) ;;
-              aws) ;;
-              docker) ;;
-              brew) ;;
-            esac
             printf '%s\n' '#!/bin/sh' \
               'printf "%s\\n" "${0##*/}" >>"${POLY_GUARD_LOG}"' \
               'exit 97' >"${GUARD_DIR}/${command_name}"
@@ -230,82 +234,197 @@ jobs:
           done
 
           mounted=0
+          audit_pid=''
+          stop_audit() {
+            if [[ -n "${audit_pid}" ]]; then
+              /usr/bin/touch "${AUDIT_STOP}"
+              wait "${audit_pid}" || true
+              audit_pid=''
+            fi
+          }
+          copy_smoke_diagnostics() {
+            /bin/mkdir -p "${DIAGNOSTICS_DIR}"
+            /usr/bin/sort -u "${AUDIT_LOG}" -o "${DIAGNOSTICS_DIR}/descendant-executables.log" 2>/dev/null || true
+            /bin/cp "${GUARD_LOG}" "${DIAGNOSTICS_DIR}/ambient-command.log" 2>/dev/null || true
+            /bin/cp "${AUDIT_FAILURE}" "${DIAGNOSTICS_DIR}/descendant-executable-failures.log" 2>/dev/null || true
+          }
           cleanup_smoke() {
+            stop_audit
+            copy_smoke_diagnostics
             /usr/bin/osascript -e 'tell application id "com.poly.desktop" to quit' >/dev/null 2>&1 || true
-            security delete-generic-password -a "${SMOKE_ACCOUNT}" -s "${SMOKE_SERVICE}" "${SMOKE_KEYCHAIN}" >/dev/null 2>&1 || true
-            security delete-keychain "${SMOKE_KEYCHAIN}" >/dev/null 2>&1 || true
+            if [[ -n "${ORIGINAL_DEFAULT_KEYCHAIN}" ]]; then
+              /usr/bin/security default-keychain -d user -s "${ORIGINAL_DEFAULT_KEYCHAIN}" >/dev/null 2>&1 || true
+            fi
+            if [[ "${#ORIGINAL_KEYCHAINS[@]}" -gt 0 ]]; then
+              /usr/bin/security list-keychains -d user -s "${ORIGINAL_KEYCHAINS[@]}" >/dev/null 2>&1 || true
+            fi
+            /usr/bin/security delete-keychain "${SMOKE_KEYCHAIN}" >/dev/null 2>&1 || true
             if [[ "${mounted}" -eq 1 ]]; then
-              hdiutil detach "${MOUNT_POINT}" -force >/dev/null 2>&1 || true
+              /usr/bin/hdiutil detach "${MOUNT_POINT}" -force >/dev/null 2>&1 || true
             fi
           }
           trap cleanup_smoke EXIT INT TERM
 
+          keyring_probe() {
+            POLY_KEYRING_ACTION="$1" \
+            POLY_SMOKE_SERVICE="${SMOKE_SERVICE}" \
+            POLY_SMOKE_ACCOUNT="${SMOKE_ACCOUNT}" \
+            POLY_SMOKE_SECRET="${SMOKE_SECRET}" \
+            HOME="${SMOKE_HOME}" \
+              "${UV_BIN}" run --frozen python - <<'PY'
+          import asyncio
+          import hmac
+          import os
+
+          from backend.app.core.secrets import KeyringSecretStore
+
+
+          async def main() -> None:
+              store = KeyringSecretStore(os.environ["POLY_SMOKE_SERVICE"])
+              account = os.environ["POLY_SMOKE_ACCOUNT"]
+              action = os.environ["POLY_KEYRING_ACTION"]
+              if action == "set":
+                  await store.set(account, os.environ["POLY_SMOKE_SECRET"])
+              elif action == "get":
+                  actual = await store.get(account)
+                  assert actual is not None
+                  assert hmac.compare_digest(actual, os.environ["POLY_SMOKE_SECRET"])
+              elif action == "delete":
+                  await store.delete(account)
+                  assert await store.get(account) is None
+              else:
+                  raise AssertionError("unknown keyring smoke action")
+
+
+          asyncio.run(main())
+          PY
+          }
+
+          validate_executable() {
+            local executable="$1"
+            local executable_name="${executable##*/}"
+            case "${executable_name}" in
+              "python"|"python3"|"node"|"postgres"|"aws"|"docker"|"brew")
+                case "${executable}" in
+                  "${INSTALLED_APP}"/*) ;;
+                  *)
+                    printf 'forbidden ambient executable: %s\n' "${executable}" >>"${AUDIT_FAILURE}"
+                    return
+                    ;;
+                esac
+                ;;
+            esac
+            case "${executable}" in
+              "${INSTALLED_APP}"/*|/System/Library/*|/Library/Apple/System/Library/*|/usr/libexec/*|/usr/bin/*|/bin/*|/usr/sbin/*|/sbin/*) ;;
+              *) printf 'unapproved descendant executable: %s\n' "${executable}" >>"${AUDIT_FAILURE}" ;;
+            esac
+          }
+
+          audit_app_processes() {
+            local snapshot="${SMOKE_ROOT}/process-snapshot"
+            local tracked="${SMOKE_ROOT}/tracked-pids"
+            local expanded="${SMOKE_ROOT}/expanded-pids"
+            local combined="${SMOKE_ROOT}/combined-pids"
+            local executable
+            local pid
+            while [[ ! -e "${AUDIT_STOP}" ]]; do
+              /bin/ps -ww -axo pid=,ppid=,comm= >"${snapshot}"
+              /usr/bin/pgrep -f "^${APP_EXECUTABLE}([[:space:]]|$)" \
+                | /usr/bin/sort -u >"${tracked}" || true
+              while :; do
+                /usr/bin/awk '
+                  NR == FNR { parent[$1] = 1; next }
+                  $2 in parent { print $1 }
+                ' "${tracked}" "${snapshot}" | /usr/bin/sort -u >"${expanded}"
+                /usr/bin/sort -u "${tracked}" "${expanded}" >"${combined}"
+                if /usr/bin/cmp -s "${tracked}" "${combined}"; then
+                  break
+                fi
+                /bin/mv "${combined}" "${tracked}"
+              done
+              while IFS= read -r pid; do
+                [[ -n "${pid}" ]] || continue
+                executable="$(/usr/sbin/lsof -nP -a -p "${pid}" -d txt -Fn 2>/dev/null | /usr/bin/sed -n 's/^n//p' | /usr/bin/head -n 1 || true)"
+                [[ -n "${executable}" ]] || continue
+                printf '%s\t%s\n' "${pid}" "${executable}" >>"${AUDIT_LOG}"
+                validate_executable "${executable}"
+              done <"${tracked}"
+              /bin/sleep 0.02
+            done
+          }
+
           test -d "${APP_PATH}"
           test -n "${DMG_PATH}"
-          hdiutil attach "${DMG_PATH}" -mountpoint "${MOUNT_POINT}" -nobrowse -readonly
+          /usr/bin/hdiutil attach "${DMG_PATH}" -mountpoint "${MOUNT_POINT}" -nobrowse -readonly
           mounted=1
-          SOURCE_APP="$(find "${MOUNT_POINT}" -maxdepth 1 -type d -name 'Poly.app' -print -quit)"
+          SOURCE_APP="$(/usr/bin/find "${MOUNT_POINT}" -maxdepth 1 -type d -name 'Poly.app' -print -quit)"
           test -n "${SOURCE_APP}"
-          ditto "${SOURCE_APP}" "${INSTALLED_APP}"
-          hdiutil detach "${MOUNT_POINT}"
+          /usr/bin/ditto "${SOURCE_APP}" "${INSTALLED_APP}"
+          /usr/bin/hdiutil detach "${MOUNT_POINT}"
           mounted=0
 
-          security create-keychain -p "${SMOKE_KEYCHAIN_PASSWORD}" "${SMOKE_KEYCHAIN}"
-          security unlock-keychain -p "${SMOKE_KEYCHAIN_PASSWORD}" "${SMOKE_KEYCHAIN}"
-          security add-generic-password -a "${SMOKE_ACCOUNT}" -s "${SMOKE_SERVICE}" \
-            -w "${SMOKE_SECRET}" "${SMOKE_KEYCHAIN}"
+          /usr/bin/security create-keychain -p "${SMOKE_KEYCHAIN_PASSWORD}" "${SMOKE_KEYCHAIN}"
+          /usr/bin/security set-keychain-settings -lut 21600 "${SMOKE_KEYCHAIN}"
+          /usr/bin/security unlock-keychain -p "${SMOKE_KEYCHAIN_PASSWORD}" "${SMOKE_KEYCHAIN}"
+          /usr/bin/security list-keychains -d user -s "${SMOKE_KEYCHAIN}" "${ORIGINAL_KEYCHAINS[@]}"
+          /usr/bin/security default-keychain -d user -s "${SMOKE_KEYCHAIN}"
 
           export HOME="${SMOKE_HOME}"
-          export PATH="${GUARD_DIR}:/usr/bin:/bin"
+          export PATH="${GUARD_DIR}:/usr/bin:/bin:/usr/sbin:/sbin"
           export POLY_GUARD_LOG="${GUARD_LOG}"
+          keyring_probe set
+          audit_app_processes &
+          audit_pid=$!
           app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
           [[ "${app_count}" -eq 0 ]]
-          open -n "${INSTALLED_APP}"
-          for attempt in $(seq 1 60); do
-            runtime_pids="$(packaging/macos/verify-bundle.sh --enumerate-runtime "${RUNTIME_ROOT}/")"
+          /usr/bin/open -n "${INSTALLED_APP}"
+          for ((attempt = 1; attempt <= 60; attempt++)); do
+            runtime_pids="$("${GITHUB_WORKSPACE}/packaging/macos/verify-bundle.sh" --enumerate-runtime "${RUNTIME_ROOT}/")"
             listener_found=0
             while IFS= read -r pid; do
               [[ -n "${pid}" ]] || continue
-              if lsof -nP -a -p "${pid}" -iTCP -sTCP:LISTEN | grep -q 'TCP 127.0.0.1:'; then
+              if /usr/sbin/lsof -nP -a -p "${pid}" -iTCP -sTCP:LISTEN | /usr/bin/grep -q 'TCP 127.0.0.1:'; then
                 listener_found=1
                 break
               fi
             done <<<"${runtime_pids}"
             [[ "${listener_found}" -eq 1 ]] && break
-            sleep 1
+            /bin/sleep 1
           done
           [[ "${listener_found}" -eq 1 ]]
-          security find-generic-password -a "${SMOKE_ACCOUNT}" -s "${SMOKE_SERVICE}" \
-            -w "${SMOKE_KEYCHAIN}" >/dev/null
 
           /usr/bin/osascript -e 'tell application id "com.poly.desktop" to quit'
-          for attempt in $(seq 1 30); do
-            remaining="$(packaging/macos/verify-bundle.sh --enumerate-runtime "${RUNTIME_ROOT}/")"
+          for ((attempt = 1; attempt <= 30; attempt++)); do
+            remaining="$("${GITHUB_WORKSPACE}/packaging/macos/verify-bundle.sh" --enumerate-runtime "${RUNTIME_ROOT}/")"
             app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
             [[ -z "${remaining}" && "${app_count}" -eq 0 ]] && break
-            sleep 1
+            /bin/sleep 1
           done
           [[ -z "${remaining}" && "${app_count}" -eq 0 ]]
 
-          open -n "${INSTALLED_APP}"
-          sleep 2
-          security find-generic-password -a "${SMOKE_ACCOUNT}" -s "${SMOKE_SERVICE}" \
-            -w "${SMOKE_KEYCHAIN}" >/dev/null
-          open -n "${INSTALLED_APP}"
-          sleep 3
+          /usr/bin/open -n "${INSTALLED_APP}"
+          /bin/sleep 2
+          keyring_probe get
+          /usr/bin/open -n "${INSTALLED_APP}"
+          /bin/sleep 3
           app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
           [[ "${app_count}" -eq 1 ]]
 
           /usr/bin/osascript -e 'tell application id "com.poly.desktop" to quit'
-          for attempt in $(seq 1 30); do
-            remaining="$(packaging/macos/verify-bundle.sh --enumerate-runtime "${RUNTIME_ROOT}/")"
+          for ((attempt = 1; attempt <= 30; attempt++)); do
+            remaining="$("${GITHUB_WORKSPACE}/packaging/macos/verify-bundle.sh" --enumerate-runtime "${RUNTIME_ROOT}/")"
             app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
             [[ -z "${remaining}" && "${app_count}" -eq 0 ]] && break
-            sleep 1
+            /bin/sleep 1
           done
           [[ -z "${remaining}" && "${app_count}" -eq 0 ]]
-          security delete-generic-password -a "${SMOKE_ACCOUNT}" -s "${SMOKE_SERVICE}" "${SMOKE_KEYCHAIN}"
+          keyring_probe delete
+          stop_audit
+          copy_smoke_diagnostics
+          /usr/bin/grep -Fq "${APP_EXECUTABLE}" "${AUDIT_LOG}"
+          /usr/bin/grep -Fq "${RUNTIME_ROOT}/" "${AUDIT_LOG}"
           [[ ! -s "${GUARD_LOG}" ]]
+          [[ ! -s "${AUDIT_FAILURE}" ]]
 
       - name: Remove temporary signing keychain
         if: ${{ always() && env.IS_RELEASE == 'true' }}
@@ -314,6 +433,42 @@ jobs:
           CERTIFICATE_PATH="${POLY_SIGNING_CERTIFICATE:-${RUNNER_TEMP}/poly-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.p12}"
           security delete-keychain "${KEYCHAIN_PATH}" >/dev/null 2>&1 || true
           rm -f -- "${CERTIFICATE_PATH}"
+
+      - name: Collect sanitized validation diagnostics
+        if: ${{ always() && env.IS_RELEASE != 'true' }}
+        run: |
+          set +e
+          DIAGNOSTICS_DIR="${RUNNER_TEMP}/poly-diagnostics"
+          APP_PATH="${GITHUB_WORKSPACE}/src-tauri/target/${POLY_TARGET_TRIPLE}/release/bundle/macos/Poly.app"
+          /bin/mkdir -p "${DIAGNOSTICS_DIR}"
+          {
+            printf 'commit=%s\n' "${GITHUB_SHA}"
+            printf 'runner=%s\n' "${RUNNER_OS}"
+            printf 'target=%s\n' "${POLY_TARGET_TRIPLE}"
+            /usr/bin/uname -a
+            /usr/bin/xcodebuild -version
+            rustc --version
+            cargo --version
+          } >"${DIAGNOSTICS_DIR}/toolchain.txt" 2>&1
+          if [[ -d "${APP_PATH}" ]]; then
+            /usr/bin/codesign --verify --deep --strict --verbose=4 "${APP_PATH}" \
+              >"${DIAGNOSTICS_DIR}/codesign-verify.txt" 2>&1
+            /usr/bin/find "${APP_PATH}/Contents" -maxdepth 4 -type f -print \
+              | /usr/bin/sort >"${DIAGNOSTICS_DIR}/bundle-files.txt"
+          fi
+          DATA_ROOT="${RUNNER_TEMP}"
+          /usr/bin/find "${DATA_ROOT}" -path '*/Library/Application Support/Poly/*' -type f \
+            -exec /usr/bin/stat -f '%N %z bytes' {} \; \
+            >"${DIAGNOSTICS_DIR}/smoke-data-files.txt" 2>/dev/null
+
+      - name: Upload validation diagnostics
+        if: ${{ always() && env.IS_RELEASE != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-diagnostics-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/poly-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload architecture-specific DMG
         uses: actions/upload-artifact@v4

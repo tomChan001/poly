@@ -19,7 +19,7 @@ Intel 构建已配置，但在 `macos-15-intel` 的完整绿色原生 CI 运行�
 
 ## Apple Developer 前置条件
 
-发布人员需要有效的 Apple Developer Program membership、适用于该 Team 的 `Developer ID Application` certificate，以及可提交 notarization 的 Apple ID 凭据。在 GitHub 受保护 environment/repository secrets 中配置以下全部名称：
+发布人员需要有效的 Apple Developer Program membership、适用于该 Team 的 `Developer ID Application` certificate，以及可提交 notarization 的 Apple ID 凭据。在 GitHub repository secrets 中配置以下全部名称。当前 workflow 没有声明 GitHub Environment，因此不要把这些值只配置成 environment secrets：
 
 - `APPLE_CERTIFICATE`：Developer ID Application `.p12` 的 base64 内容。
 - `APPLE_CERTIFICATE_PASSWORD`：导出 `.p12` 时设置的密码。
@@ -29,7 +29,7 @@ Intel 构建已配置，但在 `macos-15-intel` 的完整绿色原生 CI 运行�
 - `APPLE_PASSWORD`：该 Apple ID 的 app-specific password。
 - `APPLE_TEAM_ID`：Apple Developer Team ID。
 
-不要把这些值写入 workflow、日志、issue、artifact 或本地 `.env`。CI 仅在 release tag 的签名步骤中注入它们；证书进入临时 keychain，`always()` cleanup 会删除临时 keychain 和证书文件。
+不要把这些值写入 workflow、日志、issue、artifact 或本地 `.env`。CI 仅在 release tag 的签名步骤中使用它们；证书进入临时 keychain，`always()` cleanup 会删除临时 keychain 和证书文件。Repository secrets 必须限制为受信任维护者可管理，release tag 创建权限也必须受保护。
 
 ## 验证与发布操作
 
@@ -39,6 +39,8 @@ Intel 构建已配置，但在 `macos-15-intel` 的完整绿色原生 CI 运行�
 4. 从该 tag 对应 run 下载 `Poly-macos-arm64`，以及仅在 Intel 原生 job 有绿色证据时下载 `Poly-macos-x86_64`。核对下载来源、run、commit 和架构；不要重命名 validation artifact 冒充 release。
 
 本 workflow 不连接真实市场服务，不使用真实市场凭证，也不执行真实订单。Python CI 只运行使用 fake/mock transports 的 unit 和 security 测试。
+
+隔离 smoke 使用唯一的合成值和临时默认 Keychain，并通过 Poly 的生产 `KeyringSecretStore` 边界执行 set/get/delete；它在两次应用启动之间读取同一值，结束时删除测试项和临时 Keychain。这个测试不会向正式应用增加调试 endpoint 或 secret readback，也不会修改发布 artifact。Smoke 同时使用 PATH deny shim 和应用后代进程采样，拒绝从 `.app` 外调用 `python`、`python3`、`node`、`postgres`、`aws`、`docker` 或 `brew`，并只允许 bundle 内可执行文件和明确允许的 macOS 系统路径。Validation 即使失败也通过独立的 `always()` step 上传不含凭证值的工具链、签名检查、bundle 清单和进程审计诊断。
 
 ## 安装与首次启动
 
@@ -50,7 +52,7 @@ Intel 构建已配置，但在 `macos-15-intel` 的完整绿色原生 CI 运行�
 
 ## 数据、日志与停止状态备份
 
-持久数据位于 `~/Library/Application Support/Poly`，诊断日志位于 `~/Library/Application Support/Poly/logs`。运行缓存位于 `~/Library/Caches/com.poly.desktop`。市场凭证保存在 macOS Keychain，不在数据目录或备份中。
+持久数据位于 `~/Library/Application Support/Poly`，诊断日志目录位于 `~/Library/Application Support/Poly/logs`，PostgreSQL 的独立日志文件位于 `~/Library/Application Support/Poly/postgres.log`。运行缓存位于 `~/Library/Caches/com.poly.desktop`。市场凭证保存在 macOS Keychain，不在数据目录或备份中。
 
 备份必须在 stopped state 完成：
 
