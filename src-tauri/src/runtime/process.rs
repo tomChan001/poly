@@ -325,10 +325,7 @@ impl RunningRuntime {
                 tokio::time::timeout(timeout, self.child.wait_for_exit_preserving_stdin()).await
             {
                 match result {
-                    Ok(()) => {
-                        self.cleanup_armed = false;
-                        return Ok(());
-                    }
+                    Ok(()) => return self.force_owned_cleanup().await,
                     Err(source) => {
                         let cleanup_failed = if self.child.kill_owned().await.is_err() {
                             true
@@ -582,8 +579,15 @@ impl RuntimeChild for ProductionChild {
 
     fn kill_owned<'a>(&'a mut self) -> ChildFuture<'a> {
         Box::pin(async move {
+            #[cfg(unix)]
+            let process_group = self.process_group;
             kill_owned_process_group(self).await?;
-            self.child.wait().await.map(|_| ())
+            self.child.wait().await?;
+            #[cfg(unix)]
+            if let Some(group) = process_group {
+                confirm_owned_process_group_gone(group).await?;
+            }
+            Ok(())
         })
     }
 
@@ -632,6 +636,58 @@ async fn kill_owned_process_group(child: &mut ProductionChild) -> io::Result<()>
             Ok(())
         } else {
             Err(error)
+        }
+    }
+}
+
+#[cfg(any(unix, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessGroupPresence {
+    Present,
+    Gone,
+}
+
+#[cfg(any(unix, test))]
+fn classify_process_group_probe(
+    result: i32,
+    raw_os_error: Option<i32>,
+) -> io::Result<ProcessGroupPresence> {
+    const EPERM: i32 = 1;
+    const ESRCH: i32 = 3;
+
+    if result == 0 || raw_os_error == Some(EPERM) {
+        Ok(ProcessGroupPresence::Present)
+    } else if raw_os_error == Some(ESRCH) {
+        Ok(ProcessGroupPresence::Gone)
+    } else {
+        Err(raw_os_error.map_or_else(io::Error::last_os_error, io::Error::from_raw_os_error))
+    }
+}
+
+#[cfg(unix)]
+async fn confirm_owned_process_group_gone(group: i32) -> io::Result<()> {
+    const PROBE_SIGNAL: i32 = 0;
+    const CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(1);
+    const PROBE_INTERVAL: Duration = Duration::from_millis(10);
+    extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+
+    let deadline = tokio::time::Instant::now() + CONFIRMATION_TIMEOUT;
+    loop {
+        let result = unsafe { kill(-group, PROBE_SIGNAL) };
+        let raw_os_error = (result != 0)
+            .then(|| io::Error::last_os_error().raw_os_error())
+            .flatten();
+        match classify_process_group_probe(result, raw_os_error)? {
+            ProcessGroupPresence::Gone => return Ok(()),
+            ProcessGroupPresence::Present if tokio::time::Instant::now() >= deadline => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "owned process group did not exit",
+                ));
+            }
+            ProcessGroupPresence::Present => tokio::time::sleep(PROBE_INTERVAL).await,
         }
     }
 }
@@ -771,35 +827,26 @@ where
     }
 }
 
-pub fn redact_diagnostic_line(line: &str) -> String {
-    const SENSITIVE_KEYS: &[&str] = &[
-        "authorization",
-        "cookie",
-        "private_key",
-        "private-key",
-        "privatekey",
-        "secret",
-        "signature",
-        "token",
-        "api_key",
-        "api-key",
-        "apikey",
-        "api_token",
-        "api-token",
-        "apitoken",
-        "api_secret",
-        "api-secret",
-        "apisecret",
-        "password",
-        "passphrase",
-        "client_secret",
-        "client-secret",
-        "clientsecret",
-        "access_token",
-        "access-token",
-        "accesstoken",
-    ];
+const SENSITIVE_KEYS: &[&str] = &[
+    "authorization",
+    "cookie",
+    "privatekey",
+    "secret",
+    "signature",
+    "token",
+    "apikey",
+    "apitoken",
+    "apisecret",
+    "password",
+    "passphrase",
+    "clientsecret",
+    "accesstoken",
+    "credential",
+    "credentials",
+    "refreshtoken",
+];
 
+pub fn redact_diagnostic_line(line: &str) -> String {
     let (content, line_ending) = if let Some(content) = line.strip_suffix("\r\n") {
         (content, "\r\n")
     } else if let Some(content) = line.strip_suffix('\n') {
@@ -809,14 +856,14 @@ pub fn redact_diagnostic_line(line: &str) -> String {
     };
 
     if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(content) {
-        redact_json_value(&mut value, SENSITIVE_KEYS);
+        redact_json_value(&mut value);
         if let Ok(mut serialized) = serde_json::to_string(&value) {
             serialized.push_str(line_ending);
             return serialized;
         }
     }
 
-    if contains_sensitive_assignment(content, SENSITIVE_KEYS) {
+    if contains_sensitive_assignment(content) {
         let mut redacted = "[REDACTED]".to_owned();
         redacted.push_str(line_ending);
         return redacted;
@@ -827,10 +874,7 @@ pub fn redact_diagnostic_line(line: &str) -> String {
     for word in content.split_whitespace() {
         if let Some((key, delimiter, value)) = split_field(word) {
             suppress_value = false;
-            if SENSITIVE_KEYS
-                .iter()
-                .any(|candidate| key.eq_ignore_ascii_case(candidate))
-            {
+            if is_sensitive_key(key) {
                 if value.is_empty() {
                     let mut redacted = "[REDACTED]".to_owned();
                     redacted.push_str(line_ending);
@@ -850,60 +894,48 @@ pub fn redact_diagnostic_line(line: &str) -> String {
     redacted
 }
 
-fn contains_sensitive_assignment(content: &str, sensitive_keys: &[&str]) -> bool {
-    let lowercase = content.to_ascii_lowercase();
-    for key in sensitive_keys {
-        let mut remainder = lowercase.as_str();
-        let mut offset = 0;
-        while let Some(relative_index) = remainder.find(key) {
-            let index = offset + relative_index;
-            let before_is_boundary = index == 0
-                || !lowercase.as_bytes()[index - 1].is_ascii_alphanumeric()
-                    && lowercase.as_bytes()[index - 1] != b'_';
-            let mut cursor = index + key.len();
-            let after_is_boundary = cursor == lowercase.len()
-                || !lowercase.as_bytes()[cursor].is_ascii_alphanumeric()
-                    && lowercase.as_bytes()[cursor] != b'_';
-            if before_is_boundary && after_is_boundary {
-                if lowercase.as_bytes().get(cursor) == Some(&b'"') {
-                    cursor += 1;
-                }
-                while lowercase
-                    .as_bytes()
-                    .get(cursor)
-                    .is_some_and(u8::is_ascii_whitespace)
-                {
-                    cursor += 1;
-                }
-                if matches!(lowercase.as_bytes().get(cursor), Some(b':' | b'=')) {
-                    return true;
-                }
+fn normalize_sensitive_key(key: &str) -> String {
+    key.bytes()
+        .filter(u8::is_ascii_alphanumeric)
+        .map(|byte| byte.to_ascii_lowercase() as char)
+        .collect()
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let normalized = normalize_sensitive_key(key);
+    SENSITIVE_KEYS
+        .iter()
+        .any(|candidate| normalized == *candidate)
+}
+
+fn contains_sensitive_assignment(content: &str) -> bool {
+    for (delimiter, _) in content.match_indices([':', '=']) {
+        let prefix = content[..delimiter].trim_end();
+        for (start, character) in prefix.char_indices() {
+            let begins_key = character.is_ascii_alphanumeric()
+                && (start == 0 || !prefix.as_bytes()[start - 1].is_ascii_alphanumeric());
+            if begins_key && is_sensitive_key(&prefix[start..]) {
+                return true;
             }
-            let next = index + key.len();
-            offset = next;
-            remainder = &lowercase[next..];
         }
     }
     false
 }
 
-fn redact_json_value(value: &mut serde_json::Value, sensitive_keys: &[&str]) {
+fn redact_json_value(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(object) => {
             for (key, value) in object {
-                if sensitive_keys
-                    .iter()
-                    .any(|candidate| key.eq_ignore_ascii_case(candidate))
-                {
+                if is_sensitive_key(key) {
                     *value = serde_json::Value::String("[REDACTED]".to_owned());
                 } else {
-                    redact_json_value(value, sensitive_keys);
+                    redact_json_value(value);
                 }
             }
         }
         serde_json::Value::Array(array) => {
             for value in array {
-                redact_json_value(value, sensitive_keys);
+                redact_json_value(value);
             }
         }
         _ => {}
@@ -1207,7 +1239,7 @@ mod tests {
     }
 
     #[test]
-    fn graceful_shutdown_does_not_kill_a_child_that_exits_in_time() {
+    fn graceful_shutdown_confirms_the_owned_group_after_the_leader_exits() {
         let state = Arc::new(Mutex::new(FakeState::default()));
         let launcher = FakeLauncher(Arc::clone(&state));
         let (data_dir, runtime_dir) = absolute_test_dirs();
@@ -1219,7 +1251,8 @@ mod tests {
             .block_on(running.shutdown_with_timeout(Duration::from_secs(1)))
             .unwrap();
 
-        assert_eq!(state.lock().unwrap().killed, 0);
+        drop(running);
+        assert_eq!(state.lock().unwrap().killed, 1);
     }
 
     #[test]
@@ -1521,6 +1554,13 @@ mod tests {
             "clientSecret",
             "access_token",
             "accessToken",
+            "credential",
+            "credentials",
+            "refresh_token",
+            "refresh-token",
+            "refreshToken",
+            "api.key",
+            "api key",
         ] {
             let secret = format!("value-for-{key}");
             for line in [
@@ -1531,5 +1571,22 @@ mod tests {
                 assert!(!redacted.contains(&secret), "leaked {key}: {redacted}");
             }
         }
+    }
+
+    #[test]
+    fn process_group_probe_only_confirms_esrch_as_gone() {
+        assert_eq!(
+            classify_process_group_probe(0, None).unwrap(),
+            ProcessGroupPresence::Present
+        );
+        assert_eq!(
+            classify_process_group_probe(-1, Some(3)).unwrap(),
+            ProcessGroupPresence::Gone
+        );
+        assert_eq!(
+            classify_process_group_probe(-1, Some(1)).unwrap(),
+            ProcessGroupPresence::Present
+        );
+        assert!(classify_process_group_probe(-1, Some(5)).is_err());
     }
 }

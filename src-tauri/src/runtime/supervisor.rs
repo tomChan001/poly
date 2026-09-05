@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use rand::Rng as _;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use super::process::{
     drain_stderr, launch_runtime, read_runtime_event, DiagnosticLog, LaunchError, ProcessError,
@@ -200,6 +200,7 @@ pub struct RuntimeSupervisor<L, C> {
     policy: RestartPolicy,
     state: Supervisor,
     terminal_failure: Option<RuntimeFailure>,
+    latest_notice: watch::Sender<Option<RuntimeSupervisorNotice>>,
 }
 
 impl<L> RuntimeSupervisor<L, SystemClock>
@@ -236,6 +237,7 @@ where
         application_support: PathBuf,
         policy: RestartPolicy,
     ) -> Self {
+        let (latest_notice, _) = watch::channel(None);
         Self {
             launcher,
             clock,
@@ -245,11 +247,16 @@ where
             policy,
             state: Supervisor::new(),
             terminal_failure: None,
+            latest_notice,
         }
     }
 
     pub const fn state(&self) -> &SupervisorState {
         self.state.state()
+    }
+
+    pub fn subscribe_notices(&self) -> watch::Receiver<Option<RuntimeSupervisorNotice>> {
+        self.latest_notice.subscribe()
     }
 
     pub fn explicit_operator_retry(&mut self) -> Result<(), RuntimeSupervisorError> {
@@ -264,7 +271,11 @@ where
         notices: mpsc::Sender<RuntimeSupervisorNotice>,
     ) -> Result<SupervisionOutcome, RuntimeSupervisorError> {
         if let Some(failure) = self.terminal_failure {
-            publish_notice(&notices, RuntimeSupervisorNotice::Terminal(failure));
+            publish_notice(
+                &self.latest_notice,
+                &notices,
+                RuntimeSupervisorNotice::Terminal(failure),
+            );
             return Ok(SupervisionOutcome::Terminal(failure));
         }
         loop {
@@ -281,6 +292,7 @@ where
                             RestartDecision::Retry { attempt, delay } => {
                                 self.state.begin_restart(attempt)?;
                                 publish_notice(
+                                    &self.latest_notice,
                                     &notices,
                                     RuntimeSupervisorNotice::RestartScheduled { attempt, delay },
                                 );
@@ -375,12 +387,16 @@ where
                                 drop_stderr: true,
                             };
                         }
-                        publish_notice(&notices, RuntimeSupervisorNotice::Runtime(event.clone()));
+                        publish_notice(
+                            &self.latest_notice,
+                            &notices,
+                            RuntimeSupervisorNotice::Runtime(event.clone()),
+                        );
                         if let RuntimeEvent::Failed { code, .. } = event {
                             break ObservedFailure {
                                 failure: RuntimeFailure::Reported(code),
                                 child_exited: false,
-                                drop_stderr: false,
+                                drop_stderr: true,
                             };
                         }
                     }
@@ -479,6 +495,7 @@ where
                 RestartDecision::Retry { attempt, delay } => {
                     self.state.begin_restart(attempt)?;
                     publish_notice(
+                        &self.latest_notice,
                         &notices,
                         RuntimeSupervisorNotice::RestartScheduled { attempt, delay },
                     );
@@ -501,7 +518,11 @@ where
             self.state.mark_terminal_failure(code, detail.to_owned());
         }
         self.terminal_failure = Some(failure);
-        publish_notice(notices, RuntimeSupervisorNotice::Terminal(failure));
+        publish_notice(
+            &self.latest_notice,
+            notices,
+            RuntimeSupervisorNotice::Terminal(failure),
+        );
         Ok(SupervisionOutcome::Terminal(failure))
     }
 
@@ -518,7 +539,11 @@ where
                 .await;
         }
         drop(stderr_drain);
-        publish_notice(notices, RuntimeSupervisorNotice::Stopped);
+        publish_notice(
+            &self.latest_notice,
+            notices,
+            RuntimeSupervisorNotice::Stopped,
+        );
         Ok(SupervisionOutcome::Stopped)
     }
 }
@@ -536,9 +561,11 @@ enum AttemptSignal {
 }
 
 fn publish_notice(
+    latest: &watch::Sender<Option<RuntimeSupervisorNotice>>,
     notices: &mpsc::Sender<RuntimeSupervisorNotice>,
     notice: RuntimeSupervisorNotice,
 ) {
+    latest.send_replace(Some(notice.clone()));
     match notices.try_send(notice) {
         Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
         Err(mpsc::error::TrySendError::Closed(_)) => {}
@@ -858,6 +885,12 @@ mod tests {
 
         fn take_stdout(&mut self) -> Option<Box<dyn AsyncBufRead + Send + Unpin>> {
             if self.stdout_pending {
+                if self.stdout.as_ref().is_some_and(|bytes| !bytes.is_empty()) {
+                    return self.stdout.take().map(|bytes| {
+                        Box::new(BufReader::new(PrefixPendingReader { bytes, offset: 0 }))
+                            as Box<dyn AsyncBufRead + Send + Unpin>
+                    });
+                }
                 return Some(Box::new(BufReader::new(PendingReader)));
             }
             self.stdout.take().map(|bytes| {
@@ -921,6 +954,11 @@ mod tests {
 
     struct PendingReader;
 
+    struct PrefixPendingReader {
+        bytes: Vec<u8>,
+        offset: usize,
+    }
+
     struct TrackedPendingReader(Arc<Mutex<LauncherState>>);
 
     impl Drop for TrackedPendingReader {
@@ -936,6 +974,23 @@ mod tests {
             _buffer: &mut tokio::io::ReadBuf<'_>,
         ) -> std::task::Poll<io::Result<()>> {
             std::task::Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncRead for PrefixPendingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if self.offset == self.bytes.len() {
+                return std::task::Poll::Pending;
+            }
+            let available = &self.bytes[self.offset..];
+            let length = available.len().min(buffer.remaining());
+            buffer.put_slice(&available[..length]);
+            self.offset += length;
+            std::task::Poll::Ready(Ok(()))
         }
     }
 
@@ -1508,6 +1563,40 @@ mod tests {
     }
 
     #[test]
+    fn reported_failure_cleans_descendants_before_pending_stderr() {
+        let scripts = vec![ChildScript {
+            stdout: concat!(
+                "{\"version\":1,\"state\":\"initializing\"}\n",
+                "{\"version\":1,\"state\":\"failed\",\"code\":\"migration_failed\",\"detail\":\"failed\"}\n"
+            )
+            .as_bytes()
+            .to_vec(),
+            stderr_pending: true,
+            ..ChildScript::crash("", Duration::ZERO)
+        }];
+        let (mut supervisor, state, clock, support_dir) =
+            fake_supervisor(scripts, "reported-failure-pending-stderr");
+        let (sender, _receiver) = mpsc::channel(8);
+
+        let timed = runtime().block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                supervisor.supervise_until_terminal(sender),
+            )
+            .await
+        });
+
+        assert_eq!(
+            timed.unwrap().unwrap(),
+            SupervisionOutcome::Terminal(RuntimeFailure::Reported(FailureCode::MigrationFailed))
+        );
+        assert_eq!(state.lock().unwrap().launches, 1);
+        assert_eq!(state.lock().unwrap().kills, 1);
+        assert!(clock.inner.lock().unwrap().sleeps.is_empty());
+        std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
     fn verified_stopped_does_not_wait_for_descendant_held_stderr() {
         let scripts = vec![ChildScript {
             stdout: concat!(
@@ -1522,6 +1611,7 @@ mod tests {
         }];
         let (mut supervisor, state, _clock, support_dir) =
             fake_supervisor(scripts, "stopped-pending-stderr");
+        let latest = supervisor.subscribe_notices();
         let (sender, _receiver) = mpsc::channel(8);
 
         let timed = runtime().block_on(async {
@@ -1534,6 +1624,10 @@ mod tests {
 
         assert_eq!(timed.unwrap().unwrap(), SupervisionOutcome::Stopped);
         assert_eq!(state.lock().unwrap().kills, 1);
+        assert!(matches!(
+            &*latest.borrow(),
+            Some(RuntimeSupervisorNotice::Stopped)
+        ));
         std::fs::remove_dir_all(support_dir).unwrap();
     }
 
@@ -1545,6 +1639,7 @@ mod tests {
             .collect();
         let (mut supervisor, state, _clock, support_dir) =
             fake_supervisor(scripts, "notice-backpressure");
+        let latest = supervisor.subscribe_notices();
         let (sender, _ignored_receiver) = mpsc::channel(1);
 
         let timed = runtime().block_on(async {
@@ -1560,6 +1655,82 @@ mod tests {
             SupervisionOutcome::Terminal(RuntimeFailure::UnexpectedExit)
         );
         assert_eq!(state.lock().unwrap().launches, 4);
+        assert!(matches!(
+            &*latest.borrow(),
+            Some(RuntimeSupervisorNotice::Terminal(
+                RuntimeFailure::UnexpectedExit
+            ))
+        ));
+        std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
+    fn slow_consumer_can_observe_latest_ready_while_runtime_stays_active() {
+        let script = ChildScript {
+            stdout: concat!(
+                "{\"version\":1,\"state\":\"initializing\"}\n",
+                "{\"version\":1,\"state\":\"preparing_database\"}\n",
+                "{\"version\":1,\"state\":\"migrating\"}\n",
+                "{\"version\":1,\"state\":\"starting_services\"}\n",
+                "{\"version\":1,\"state\":\"ready\",\"port\":49152,\"bootstrap_path\":\"/desktop/bootstrap/safe\"}\n"
+            )
+            .as_bytes()
+            .to_vec(),
+            stdout_pending: true,
+            wait_pending: true,
+            stderr_pending: true,
+            ..ChildScript::crash("", Duration::ZERO)
+        };
+        let (mut supervisor, state, _clock, support_dir) =
+            fake_supervisor(vec![script], "latest-ready");
+        let mut latest = supervisor.subscribe_notices();
+        let (sender, _ignored_receiver) = mpsc::channel(1);
+        let executor = runtime();
+
+        let observed = executor.block_on(async {
+            let supervision = supervisor.supervise_until_terminal(sender);
+            tokio::pin!(supervision);
+            tokio::time::timeout(Duration::from_millis(50), async {
+                enum Signal {
+                    Supervision(Result<SupervisionOutcome, RuntimeSupervisorError>),
+                    Changed(Result<(), watch::error::RecvError>),
+                }
+                loop {
+                    let mut changed = Box::pin(latest.changed());
+                    let signal = poll_fn(|context| {
+                        if let std::task::Poll::Ready(result) = supervision.as_mut().poll(context) {
+                            return std::task::Poll::Ready(Signal::Supervision(result));
+                        }
+                        if let std::task::Poll::Ready(result) = changed.as_mut().poll(context) {
+                            return std::task::Poll::Ready(Signal::Changed(result));
+                        }
+                        std::task::Poll::Pending
+                    })
+                    .await;
+                    drop(changed);
+                    match signal {
+                        Signal::Supervision(result) => {
+                            panic!("runtime stopped before Ready: {result:?}")
+                        }
+                        Signal::Changed(result) => assert!(result.is_ok()),
+                    }
+                    if matches!(
+                        &*latest.borrow(),
+                        Some(RuntimeSupervisorNotice::Runtime(RuntimeEvent::Ready { .. }))
+                    ) {
+                        return latest.borrow().clone();
+                    }
+                }
+            })
+            .await
+        });
+
+        assert!(matches!(
+            observed.unwrap(),
+            Some(RuntimeSupervisorNotice::Runtime(RuntimeEvent::Ready { .. }))
+        ));
+        assert_eq!(state.lock().unwrap().launches, 1);
+        assert_eq!(state.lock().unwrap().drop_signals, 1);
         std::fs::remove_dir_all(support_dir).unwrap();
     }
 
