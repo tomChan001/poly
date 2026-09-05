@@ -1091,7 +1091,7 @@ mod tests {
                     state.now += duration;
                 }
                 if self.block_sleep.load(Ordering::SeqCst) {
-                    self.sleep_entered.notify_waiters();
+                    self.sleep_entered.notify_one();
                     std::future::pending().await
                 }
             })

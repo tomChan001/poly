@@ -1038,7 +1038,7 @@ mod tests {
                 if attempt == 0 {
                     return Err(DesktopSetupFailure::PermissionDenied { logs_dir: None });
                 }
-                self.second_entered.notify_waiters();
+                self.second_entered.notify_one();
                 self.release_second.notified().await;
                 Ok(InstalledDesktopRuntime::new(
                     self.control.clone(),
@@ -1540,7 +1540,7 @@ mod tests {
             confirmation_started.notified().await;
             assert!(!completed.load(Ordering::SeqCst));
             assert_eq!(cancellations.load(Ordering::SeqCst), 1);
-            release_confirmation.notify_waiters();
+            release_confirmation.notify_one();
             cleanup_task.await.unwrap();
 
             assert!(completed.load(Ordering::SeqCst));
@@ -1923,7 +1923,10 @@ mod tests {
                 let setup = Arc::clone(&setup);
                 tauri::async_runtime::spawn(async move { setup.retry().await })
             };
-            second_entered.notified().await;
+            wait_for(|| setup.installer().attempts.load(Ordering::SeqCst) == 2).await;
+            tokio::time::timeout(Duration::from_millis(50), second_entered.notified())
+                .await
+                .expect("the setup-entry signal must be retained until observed");
             let duplicate = tokio::time::timeout(Duration::from_millis(50), setup.retry())
                 .await
                 .expect("a duplicate setup retry must return promptly");
@@ -1931,7 +1934,7 @@ mod tests {
                 duplicate,
                 Err(DesktopServiceError::AlreadyRunning)
             ));
-            release_second.notify_waiters();
+            release_second.notify_one();
             first.await.unwrap().unwrap();
 
             assert_eq!(setup.installer().attempts.load(Ordering::SeqCst), 2);
