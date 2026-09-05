@@ -1,0 +1,95 @@
+.desktop-boot-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  color: #183028;
+  background:
+    radial-gradient(circle at 50% 12%, rgba(92, 175, 139, 0.2), transparent 34rem),
+    #f4f7f5;
+}
+
+.desktop-boot-card {
+  width: min(100%, 440px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  padding: 48px 42px;
+  text-align: center;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(24, 48, 40, 0.1);
+  border-radius: 24px;
+  box-shadow: 0 24px 70px rgba(24, 48, 40, 0.12);
+}
+
+.desktop-boot-mark {
+  width: 54px;
+  height: 54px;
+  display: grid;
+  place-items: center;
+  color: white;
+  background: #1f7657;
+  border-radius: 15px;
+  font-size: 27px;
+  font-weight: 750;
+}
+
+.desktop-boot-card h1 {
+  margin: 4px 0 0;
+  font-size: clamp(24px, 5vw, 31px);
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+}
+
+.desktop-boot-card p {
+  min-height: 48px;
+  margin: 0;
+  color: #5c6b65;
+  line-height: 1.7;
+}
+
+.desktop-boot-progress {
+  width: 100%;
+  height: 5px;
+  overflow: hidden;
+  background: #dfe9e4;
+  border-radius: 999px;
+}
+
+.desktop-boot-progress span {
+  display: block;
+  width: 42%;
+  height: 100%;
+  background: #288b66;
+  border-radius: inherit;
+  animation: desktop-boot-progress 1.35s ease-in-out infinite;
+}
+
+.desktop-boot-card button {
+  width: 100%;
+  padding: 11px 16px;
+  border-radius: 10px;
+  font-weight: 650;
+}
+
+.desktop-boot-primary {
+  color: white;
+  background: #1f7657;
+  border: 1px solid #1f7657;
+}
+
+.desktop-boot-secondary {
+  color: #1f7657;
+  background: transparent;
+  border: 1px solid #9db9ad;
+}
+
+@keyframes desktop-boot-progress {
+  from { transform: translateX(-105%); }
+  to { transform: translateX(240%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .desktop-boot-progress span { animation: none; }
+}

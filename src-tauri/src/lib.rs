@@ -1,9 +1,77 @@
 pub mod runtime;
+pub mod webview;
 
 pub use runtime::process::{launch_runtime, ProductionLauncher, RunningRuntime};
 pub use runtime::supervisor::{
     RuntimeSupervisor, RuntimeSupervisorNotice, SupervisionOutcome, SystemClock,
 };
+use runtime::{
+    protocol::{FailureCode, RuntimeEvent},
+    supervisor::RuntimeFailure,
+};
+use url::Url;
+use webview::{ready_url, status_url_with_logs, DesktopUiState, NavigationError};
+
+pub struct DesktopNavigationController;
+
+impl DesktopNavigationController {
+    pub fn navigation_for_notice(notice: &RuntimeSupervisorNotice) -> Result<Url, NavigationError> {
+        match notice {
+            RuntimeSupervisorNotice::Runtime(RuntimeEvent::Ready {
+                port,
+                bootstrap_path,
+            }) => ready_url(port.get(), bootstrap_path),
+            RuntimeSupervisorNotice::Runtime(event) => Ok(status_url_with_logs(
+                ui_state_for_runtime_event(event),
+                matches!(event, RuntimeEvent::Failed { .. }),
+            )),
+            RuntimeSupervisorNotice::RestartScheduled { .. } => {
+                Ok(status_url_with_logs(DesktopUiState::Restarting, false))
+            }
+            RuntimeSupervisorNotice::Terminal(failure) => {
+                Ok(status_url_with_logs(ui_state_for_failure(failure), true))
+            }
+            RuntimeSupervisorNotice::Stopped => {
+                Ok(status_url_with_logs(DesktopUiState::ShuttingDown, false))
+            }
+        }
+    }
+}
+
+fn ui_state_for_runtime_event(event: &RuntimeEvent) -> DesktopUiState {
+    match event {
+        RuntimeEvent::Initializing => DesktopUiState::Initializing,
+        RuntimeEvent::PreparingDatabase => DesktopUiState::PreparingDatabase,
+        RuntimeEvent::Migrating { .. } => DesktopUiState::Migrating,
+        RuntimeEvent::StartingServices => DesktopUiState::StartingServices,
+        RuntimeEvent::ShuttingDown | RuntimeEvent::Stopped { .. } => DesktopUiState::ShuttingDown,
+        RuntimeEvent::Failed { code, .. } => ui_state_for_failure_code(*code),
+        RuntimeEvent::Ready { .. } => unreachable!("ready events are handled before status events"),
+    }
+}
+
+fn ui_state_for_failure(failure: &RuntimeFailure) -> DesktopUiState {
+    match failure {
+        RuntimeFailure::Reported(code) => ui_state_for_failure_code(*code),
+        RuntimeFailure::PermissionDenied => DesktopUiState::PermissionDenied,
+        RuntimeFailure::ResourceMissing => DesktopUiState::ResourceMissing,
+        RuntimeFailure::Protocol => DesktopUiState::ProtocolFailed,
+        RuntimeFailure::UnexpectedExit | RuntimeFailure::CleanupFailed => {
+            DesktopUiState::RuntimeUnavailable
+        }
+    }
+}
+
+const fn ui_state_for_failure_code(code: FailureCode) -> DesktopUiState {
+    match code {
+        FailureCode::MigrationFailed => DesktopUiState::MigrationFailed,
+        FailureCode::ResourceMissing => DesktopUiState::ResourceMissing,
+        FailureCode::DatabaseUnavailable
+        | FailureCode::InvalidStartCommand
+        | FailureCode::RuntimeUnavailable
+        | FailureCode::ShutdownFailed => DesktopUiState::RuntimeUnavailable,
+    }
+}
 
 #[cfg(target_os = "macos")]
 pub fn run() {
@@ -29,8 +97,11 @@ pub fn run() {
 mod tests {
     use std::num::NonZeroU16;
 
-    use crate::runtime::protocol::{RuntimeEvent, RuntimeState};
+    use crate::runtime::protocol::{FailureCode, RuntimeEvent, RuntimeState};
     use crate::runtime::state::{Supervisor, SupervisorAction, SupervisorState};
+    use crate::runtime::supervisor::{RuntimeFailure, RuntimeSupervisorNotice};
+    use crate::webview::DesktopUiState;
+    use crate::DesktopNavigationController;
 
     fn parse(json: &str) -> RuntimeEvent {
         RuntimeEvent::parse_line(json).expect("valid runtime event")
@@ -231,5 +302,100 @@ mod tests {
         supervisor.reset_for_operator_retry().unwrap();
 
         assert_eq!(supervisor.state(), &SupervisorState::Idle);
+    }
+
+    #[test]
+    fn desktop_controller_maps_runtime_lifecycle_notices() {
+        let cases = [
+            (
+                RuntimeSupervisorNotice::Runtime(RuntimeEvent::Initializing),
+                DesktopUiState::Initializing,
+            ),
+            (
+                RuntimeSupervisorNotice::Runtime(RuntimeEvent::PreparingDatabase),
+                DesktopUiState::PreparingDatabase,
+            ),
+            (
+                RuntimeSupervisorNotice::Runtime(RuntimeEvent::Migrating { revision: None }),
+                DesktopUiState::Migrating,
+            ),
+            (
+                RuntimeSupervisorNotice::Runtime(RuntimeEvent::StartingServices),
+                DesktopUiState::StartingServices,
+            ),
+            (
+                RuntimeSupervisorNotice::RestartScheduled {
+                    attempt: 1,
+                    delay: std::time::Duration::from_secs(1),
+                },
+                DesktopUiState::Restarting,
+            ),
+            (
+                RuntimeSupervisorNotice::Terminal(RuntimeFailure::PermissionDenied),
+                DesktopUiState::PermissionDenied,
+            ),
+            (
+                RuntimeSupervisorNotice::Terminal(RuntimeFailure::ResourceMissing),
+                DesktopUiState::ResourceMissing,
+            ),
+            (
+                RuntimeSupervisorNotice::Terminal(RuntimeFailure::Protocol),
+                DesktopUiState::ProtocolFailed,
+            ),
+            (
+                RuntimeSupervisorNotice::Runtime(RuntimeEvent::Failed {
+                    code: FailureCode::MigrationFailed,
+                    detail: "migration failed".to_owned(),
+                }),
+                DesktopUiState::MigrationFailed,
+            ),
+            (
+                RuntimeSupervisorNotice::Stopped,
+                DesktopUiState::ShuttingDown,
+            ),
+        ];
+
+        for (notice, expected_state) in cases {
+            let url = DesktopNavigationController::navigation_for_notice(&notice).unwrap();
+            assert_eq!(
+                url.query_pairs()
+                    .find(|(key, _)| key == "desktop-state")
+                    .map(|(_, value)| value.into_owned()),
+                Some(expected_state.as_str().to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_controller_navigates_ready_only_to_validated_loopback_url() {
+        let ready = RuntimeSupervisorNotice::Runtime(RuntimeEvent::Ready {
+            port: NonZeroU16::new(49152).unwrap(),
+            bootstrap_path: "/desktop/bootstrap/safe_token-1".to_owned(),
+        });
+
+        let url = DesktopNavigationController::navigation_for_notice(&ready).unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:49152/desktop/bootstrap/safe_token-1"
+        );
+    }
+
+    #[test]
+    fn a_disconnect_notice_immediately_maps_to_restarting_before_relaunch() {
+        let disconnected = RuntimeSupervisorNotice::RestartScheduled {
+            attempt: 2,
+            delay: std::time::Duration::from_secs(2),
+        };
+
+        let url = DesktopNavigationController::navigation_for_notice(&disconnected).unwrap();
+
+        assert_eq!(url.scheme(), "tauri");
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "desktop-state")
+                .map(|(_, value)| value.into_owned()),
+            Some("restarting".to_owned())
+        );
     }
 }
