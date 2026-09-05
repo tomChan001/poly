@@ -1,4 +1,6 @@
 import asyncio
+import os
+import stat
 import subprocess
 import time
 from collections.abc import Awaitable, Callable
@@ -206,7 +208,7 @@ class AsyncioSubprocessRunner:
         )
 
     async def spawn(self, argv: list[str], *, log_file: Path) -> _AsyncioOwnedChild:
-        log_stream = log_file.open("ab")
+        log_stream = _open_private_append_log(log_file)
         try:
             process = await asyncio.create_subprocess_exec(
                 *argv,
@@ -217,6 +219,30 @@ class AsyncioSubprocessRunner:
             log_stream.close()
             raise
         return _AsyncioOwnedChild(process, log_stream)
+
+
+def _open_private_append_log(path: Path) -> BinaryIO:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_BINARY", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        opened = os.fstat(descriptor)
+        named = os.lstat(path)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_ISLNK(named.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+        ):
+            raise OSError("unsafe postgres log file")
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        return os.fdopen(descriptor, "ab")
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 class _PathFileSystem:

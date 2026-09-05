@@ -803,7 +803,7 @@ impl DiagnosticLog {
         let rotated_path = directory.join("runtime.stderr.log.1");
         bound_existing_file(&path)?;
         bound_existing_file(&rotated_path)?;
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let file = open_private_log(&path, true, false)?;
         let length = file.metadata()?.len();
         Ok(Self {
             path,
@@ -842,18 +842,14 @@ impl DiagnosticLog {
         if self.path.exists() {
             fs::rename(&self.path, &self.rotated_path)?;
         }
-        self.file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
+        self.file = open_private_log(&self.path, false, true)?;
         self.length = 0;
         Ok(())
     }
 }
 
 fn bound_existing_file(path: &Path) -> io::Result<()> {
-    match OpenOptions::new().write(true).open(path) {
+    match open_private_log(path, false, false) {
         Ok(file) => {
             if file.metadata()?.len() > MAX_DIAGNOSTIC_FILE_BYTES {
                 file.set_len(MAX_DIAGNOSTIC_FILE_BYTES)?;
@@ -862,6 +858,49 @@ fn bound_existing_file(path: &Path) -> io::Result<()> {
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+fn open_private_log(path: &Path, append: bool, truncate: bool) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .create(append || truncate)
+        .append(append)
+        .truncate(truncate);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    let opened = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    if !opened.is_file() || named.file_type().is_symlink() || opened.nlink() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe diagnostic log file",
+        ));
+    }
+    Ok(file)
+}
+
+trait LinkCount {
+    fn nlink(&self) -> u64;
+}
+
+#[cfg(unix)]
+impl LinkCount for fs::Metadata {
+    fn nlink(&self) -> u64 {
+        std::os::unix::fs::MetadataExt::nlink(self)
+    }
+}
+
+#[cfg(not(unix))]
+impl LinkCount for fs::Metadata {
+    fn nlink(&self) -> u64 {
+        1
     }
 }
 
@@ -1532,6 +1571,50 @@ mod tests {
             }
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostic_log_rejects_hardlinked_files_without_mutating_targets() {
+        for name in ["runtime.stderr.log", "runtime.stderr.log.1"] {
+            let root = std::env::temp_dir().join(format!(
+                "poly-runtime-hardlink-log-test-{}",
+                generate_launch_token().unwrap()
+            ));
+            let log_dir = root.join("Poly").join("logs");
+            fs::create_dir_all(&log_dir).unwrap();
+            let target = root.join("outside.log");
+            let original = vec![b'x'; MAX_DIAGNOSTIC_FILE_BYTES as usize + 1];
+            fs::write(&target, &original).unwrap();
+            fs::hard_link(&target, log_dir.join(name)).unwrap();
+
+            assert!(DiagnosticLog::under_application_support(&root).is_err());
+            assert_eq!(fs::read(&target).unwrap(), original);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostic_log_rejects_symlinked_files_without_mutating_targets() {
+        use std::os::unix::fs::symlink;
+
+        for name in ["runtime.stderr.log", "runtime.stderr.log.1"] {
+            let root = std::env::temp_dir().join(format!(
+                "poly-runtime-symlink-log-test-{}",
+                generate_launch_token().unwrap()
+            ));
+            let log_dir = root.join("Poly").join("logs");
+            fs::create_dir_all(&log_dir).unwrap();
+            let target = root.join("outside.log");
+            let original = vec![b'x'; MAX_DIAGNOSTIC_FILE_BYTES as usize + 1];
+            fs::write(&target, &original).unwrap();
+            symlink(&target, log_dir.join(name)).unwrap();
+
+            assert!(DiagnosticLog::under_application_support(&root).is_err());
+            assert_eq!(fs::read(&target).unwrap(), original);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     struct LeaseState {

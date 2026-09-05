@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 import traceback
 from collections import deque
@@ -262,6 +263,45 @@ async def test_asyncio_runner_spawns_terminates_and_waits_for_child(
 
     assert child.returncode is not None
     assert (tmp_path / "child.log").is_file()
+
+
+@pytest.mark.asyncio
+async def test_asyncio_runner_rejects_symlink_log_without_mutating_target(
+    tmp_path: Path,
+) -> None:
+    runner = AsyncioSubprocessRunner()
+    target = tmp_path / "outside.log"
+    target.write_bytes(b"sentinel")
+    log_file = tmp_path / "postgres.log"
+    try:
+        log_file.symlink_to(target)
+    except OSError as error:
+        pytest.skip(f"symlink unavailable: {error}")
+
+    with pytest.raises(OSError):
+        await runner.spawn(
+            [sys.executable, "-c", "raise SystemExit(0)"], log_file=log_file
+        )
+
+    assert target.read_bytes() == b"sentinel"
+
+
+@pytest.mark.asyncio
+async def test_asyncio_runner_rejects_hardlinked_log_without_mutating_target(
+    tmp_path: Path,
+) -> None:
+    runner = AsyncioSubprocessRunner()
+    target = tmp_path / "outside.log"
+    target.write_bytes(b"sentinel")
+    log_file = tmp_path / "postgres.log"
+    os.link(target, log_file)
+
+    with pytest.raises(OSError):
+        await runner.spawn(
+            [sys.executable, "-c", "raise SystemExit(0)"], log_file=log_file
+        )
+
+    assert target.read_bytes() == b"sentinel"
 
 
 @pytest.mark.asyncio
