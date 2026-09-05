@@ -76,20 +76,32 @@ describe('DesktopBootScreen', () => {
     expect(revealLogs).toHaveBeenCalledOnce()
   })
 
-  test('omits the logs action unless explicitly enabled and tolerates a missing adapter', () => {
+  test('omits the logs action unless explicitly enabled and reports a missing adapter', async () => {
     render(<DesktopBootScreen state="runtime_unavailable" />)
 
     expect(screen.queryByRole('button', { name: '在 Finder 中显示诊断日志' })).not.toBeInTheDocument()
-    expect(() => fireEvent.click(screen.getByRole('button', { name: '重试' }))).not.toThrow()
+    fireEvent.click(screen.getByRole('button', { name: '重试' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('无法连接桌面端，请重试。')
+  })
+
+  test('reports rejected desktop actions accessibly', async () => {
+    window.__POLY_DESKTOP__ = {
+      retry: vi.fn().mockRejectedValue(new Error('not terminal')),
+      revealLogs: vi.fn().mockResolvedValue(undefined),
+    }
+    render(<DesktopBootScreen state="runtime_unavailable" />)
+
+    fireEvent.click(screen.getByRole('button', { name: '重试' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('操作未能完成，请重试或查看诊断日志。')
   })
 })
 
 describe('desktopBootPropsFromLocation', () => {
   test('accepts only an allowlisted state on the bundled scheme', () => {
-    expect(desktopBootPropsFromLocation({
-      protocol: 'tauri:',
-      search: '?desktop-state=migrating&can-reveal-logs=true',
-    })).toEqual({ state: 'migrating', canRevealLogs: true })
+    expect(desktopBootPropsFromLocation(
+      new URL('tauri://localhost/?desktop-state=migrating&can-reveal-logs=true'),
+    )).toEqual({ state: 'migrating', canRevealLogs: true })
   })
 
   test.each([
@@ -99,13 +111,28 @@ describe('desktopBootPropsFromLocation', () => {
     ['http:', '?desktop-state=runtime_unavailable&can-reveal-logs=true'],
     ['tauri:', '?can-reveal-logs=true'],
   ])('falls back to the normal app for invalid launch input', (protocol, search) => {
-    expect(desktopBootPropsFromLocation({ protocol, search })).toBeNull()
+    expect(desktopBootPropsFromLocation(
+      new URL(`${protocol}//localhost/${search}`),
+    )).toBeNull()
+  })
+
+  test('rejects an allowed state from a non-bundled Tauri host', () => {
+    expect(desktopBootPropsFromLocation(
+      new URL('tauri://evil.example/?desktop-state=migrating'),
+    )).toBeNull()
+  })
+
+  test.each([
+    'tauri://localhost:444/?desktop-state=migrating',
+    'tauri://operator@localhost/?desktop-state=migrating',
+    'tauri://operator:secret@localhost/?desktop-state=migrating',
+  ])('rejects a non-exact bundled authority', (url) => {
+    expect(desktopBootPropsFromLocation(new URL(url))).toBeNull()
   })
 
   test('does not treat arbitrary log flag values as permission', () => {
-    expect(desktopBootPropsFromLocation({
-      protocol: 'tauri:',
-      search: '?desktop-state=protocol_failed&can-reveal-logs=yes',
-    })).toEqual({ state: 'protocol_failed', canRevealLogs: false })
+    expect(desktopBootPropsFromLocation(
+      new URL('tauri://localhost/?desktop-state=protocol_failed&can-reveal-logs=yes'),
+    )).toEqual({ state: 'protocol_failed', canRevealLogs: false })
   })
 })

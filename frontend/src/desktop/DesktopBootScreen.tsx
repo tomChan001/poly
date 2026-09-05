@@ -1,3 +1,5 @@
+import { useState } from 'react'
+
 import './desktop.css'
 
 /* oxlint-disable react/only-export-components -- Query parsing lives with its allowlisted desktop state contract. */
@@ -35,7 +37,7 @@ type DesktopBootScreenProps = {
   canRevealLogs?: boolean
 }
 
-type DesktopBootLocation = Pick<Location, 'protocol' | 'search'>
+type DesktopBootLocation = Pick<Location, 'href'>
 
 const TRANSIENT_STATES = new Set<DesktopUiState>([
   'initializing',
@@ -100,9 +102,20 @@ const COPY: Record<DesktopUiState, { heading: string; explanation: string }> = {
 export function desktopBootPropsFromLocation(
   location: DesktopBootLocation,
 ): DesktopBootScreenProps | null {
-  if (location.protocol !== 'tauri:') return null
+  let url: URL
+  try {
+    url = new URL(location.href)
+  } catch {
+    return null
+  }
+  if (
+    url.protocol !== 'tauri:'
+    || url.host !== 'localhost'
+    || url.username !== ''
+    || url.password !== ''
+  ) return null
 
-  const parameters = new URLSearchParams(location.search)
+  const parameters = url.searchParams
   const state = parameters.get('desktop-state')
   if (!state || !isDesktopUiState(state)) return null
 
@@ -119,6 +132,22 @@ function isDesktopUiState(value: string): value is DesktopUiState {
 export function DesktopBootScreen({ state, canRevealLogs = false }: DesktopBootScreenProps) {
   const copy = COPY[state]
   const transient = TRANSIENT_STATES.has(state)
+  const [actionError, setActionError] = useState<string | null>(null)
+
+  const runAction = async (action: keyof DesktopAdapter) => {
+    const adapter = window.__POLY_DESKTOP__
+    if (!adapter) {
+      setActionError('无法连接桌面端，请重试。')
+      return
+    }
+
+    setActionError(null)
+    try {
+      await adapter[action]()
+    } catch {
+      setActionError('操作未能完成，请重试或查看诊断日志。')
+    }
+  }
 
   return (
     <main className="desktop-boot-shell">
@@ -136,15 +165,16 @@ export function DesktopBootScreen({ state, canRevealLogs = false }: DesktopBootS
             <span />
           </div>
         ) : (
-          <button type="button" className="desktop-boot-primary" onClick={() => window.__POLY_DESKTOP__?.retry()}>
+          <button type="button" className="desktop-boot-primary" onClick={() => void runAction('retry')}>
             重试
           </button>
         )}
         {canRevealLogs && (
-          <button type="button" className="desktop-boot-secondary" onClick={() => window.__POLY_DESKTOP__?.revealLogs()}>
+          <button type="button" className="desktop-boot-secondary" onClick={() => void runAction('revealLogs')}>
             在 Finder 中显示诊断日志
           </button>
         )}
+        {actionError && <p className="desktop-boot-action-error" role="alert">{actionError}</p>}
       </section>
     </main>
   )

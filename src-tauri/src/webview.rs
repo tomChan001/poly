@@ -102,7 +102,7 @@ fn validate_loopback_url(
 ) -> Result<(), NavigationError> {
     let safe = url.scheme() == "http"
         && url.host_str() == Some("127.0.0.1")
-        && url.port() == Some(expected_port)
+        && url.port_or_known_default() == Some(expected_port)
         && url.username().is_empty()
         && url.password().is_none()
         && url.path() == expected_path
@@ -143,6 +143,14 @@ mod tests {
         assert_eq!(url.password(), None);
         assert_eq!(url.query(), None);
         assert_eq!(url.fragment(), None);
+    }
+
+    #[test]
+    fn accepts_an_explicit_nonzero_default_http_port() {
+        let url = ready_url(80, "/desktop/bootstrap/safe").unwrap();
+
+        assert_eq!(url.port_or_known_default(), Some(80));
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
     }
 
     #[test]

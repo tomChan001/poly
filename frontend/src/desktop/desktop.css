@@ -85,6 +85,12 @@
   border: 1px solid #9db9ad;
 }
 
+.desktop-boot-card .desktop-boot-action-error {
+  min-height: 0;
+  color: #a33c32;
+  font-size: 14px;
+}
+
 @keyframes desktop-boot-progress {
   from { transform: translateX(-105%); }
   to { transform: translateX(240%); }
