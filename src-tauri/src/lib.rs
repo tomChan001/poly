@@ -175,12 +175,16 @@ impl DesktopInstaller for ProductionDesktopInstaller {
             );
             let shutdown = Arc::new(supervisor.shutdown_control());
             let notices = supervisor.subscribe_notices();
-            let service = Arc::new(DesktopRuntimeService::with_reporter_and_shutdown(
-                supervisor,
-                self.navigator.clone(),
-                self.reporter.clone(),
-                shutdown,
-            ));
+            let service = Arc::new(
+                DesktopRuntimeService::with_reporter_shutdown_and_start_permit(
+                    supervisor,
+                    self.navigator.clone(),
+                    self.reporter.clone(),
+                    shutdown,
+                    Arc::clone(&self.runtime_shutdown)
+                        as Arc<dyn desktop_service::RuntimeStartPermit>,
+                ),
+            );
             if !service.start_supervision() {
                 return Err(DesktopSetupFailure::RuntimeUnavailable {
                     logs_dir: paths.revealable_logs_dir(),

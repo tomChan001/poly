@@ -39,7 +39,6 @@ struct FakeApp {
     window: Arc<FakeWindow>,
     exits: AtomicUsize,
     reports: AtomicUsize,
-    runtime_starts: AtomicUsize,
 }
 
 impl LifecycleApplication for FakeApp {
@@ -153,7 +152,6 @@ fn second_instance_only_restores_and_focuses_existing_window() {
     assert_eq!(app.window.shows.load(Ordering::SeqCst), 1);
     assert_eq!(app.window.unminimizes.load(Ordering::SeqCst), 1);
     assert_eq!(app.window.focuses.load(Ordering::SeqCst), 1);
-    assert_eq!(app.runtime_starts.load(Ordering::SeqCst), 0);
 }
 
 #[test]

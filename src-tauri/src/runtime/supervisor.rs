@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::future::{poll_fn, Future};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,7 @@ const CRASH_WINDOW: Duration = Duration::from_secs(60);
 const STABLE_RUN: Duration = Duration::from_secs(5 * 60);
 const MAX_DELAY: Duration = Duration::from_secs(8);
 const MAX_JITTER: Duration = Duration::from_millis(250);
+pub(crate) const SHUTDOWN_CONTROL_TIMEOUT: Duration = Duration::from_secs(17);
 
 type StderrDrain = Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>;
 
@@ -197,9 +199,10 @@ pub enum RuntimeSupervisorError {
 #[derive(Clone)]
 pub struct RuntimeShutdownControl {
     requests: mpsc::UnboundedSender<RuntimeControlMessage>,
-    active_cleanup: Arc<RwLock<Option<Arc<dyn OwnedRuntimeCleanup>>>>,
+    retained_cleanup: Arc<RwLock<Option<Arc<dyn OwnedRuntimeCleanup>>>>,
     pending_cleanup: Arc<Mutex<Option<PendingOwnedCleanup>>>,
     supervision_active: watch::Sender<bool>,
+    cleanup_requested: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -220,7 +223,7 @@ impl RuntimeShutdownControl {
         self.requests
             .send(RuntimeControlMessage::Shutdown { reason, completion })
             .map_err(|_| RuntimeShutdownError::Unavailable)?;
-        tokio::time::timeout(Duration::from_secs(17), async move {
+        tokio::time::timeout(SHUTDOWN_CONTROL_TIMEOUT, async move {
             let mut completed = Box::pin(completed);
             loop {
                 let mut changed = Box::pin(active.changed());
@@ -258,8 +261,11 @@ impl RuntimeShutdown for RuntimeShutdownControl {
     }
 
     fn cleanup_owned(&self) {
+        if self.cleanup_requested.swap(true, Ordering::AcqRel) {
+            return;
+        }
         if let Some(cleanup) = self
-            .active_cleanup
+            .retained_cleanup
             .read()
             .expect("owned cleanup lock poisoned")
             .clone()
@@ -274,6 +280,13 @@ impl RuntimeShutdown for RuntimeShutdownControl {
             });
         }
         let _ = self.requests.send(RuntimeControlMessage::CleanupOwned);
+    }
+
+    fn owned_cleanup_handle(&self) -> Option<Arc<dyn OwnedRuntimeCleanup>> {
+        self.retained_cleanup
+            .read()
+            .expect("owned cleanup lock poisoned")
+            .clone()
     }
 
     fn wait_for_cleanup(&self) -> ShutdownFuture<'_> {
@@ -304,10 +317,6 @@ struct PendingOwnedCleanup {
     signal_failed: bool,
 }
 
-struct OwnedCleanupRegistration {
-    active: Arc<RwLock<Option<Arc<dyn OwnedRuntimeCleanup>>>>,
-}
-
 struct SupervisionActivityGuard {
     active: watch::Sender<bool>,
 }
@@ -322,22 +331,6 @@ impl SupervisionActivityGuard {
 impl Drop for SupervisionActivityGuard {
     fn drop(&mut self) {
         self.active.send_replace(false);
-    }
-}
-
-impl OwnedCleanupRegistration {
-    fn new(
-        active: Arc<RwLock<Option<Arc<dyn OwnedRuntimeCleanup>>>>,
-        cleanup: Option<Arc<dyn OwnedRuntimeCleanup>>,
-    ) -> Self {
-        *active.write().expect("owned cleanup lock poisoned") = cleanup;
-        Self { active }
-    }
-}
-
-impl Drop for OwnedCleanupRegistration {
-    fn drop(&mut self) {
-        *self.active.write().expect("owned cleanup lock poisoned") = None;
     }
 }
 
@@ -399,7 +392,7 @@ where
     ) -> Self {
         let (latest_notice, _) = watch::channel(None);
         let (requests, shutdown_requests) = mpsc::unbounded_channel();
-        let active_cleanup = Arc::new(RwLock::new(None));
+        let retained_cleanup = Arc::new(RwLock::new(None));
         let (supervision_active, _) = watch::channel(false);
         Self {
             launcher,
@@ -414,9 +407,10 @@ where
             shutdown_requests,
             shutdown_control: RuntimeShutdownControl {
                 requests,
-                active_cleanup,
+                retained_cleanup,
                 pending_cleanup: Arc::new(Mutex::new(None)),
                 supervision_active,
+                cleanup_requested: Arc::new(AtomicBool::new(false)),
             },
         }
     }
@@ -485,10 +479,11 @@ where
                         }
                     }
                 };
-            let cleanup_registration = OwnedCleanupRegistration::new(
-                Arc::clone(&self.shutdown_control.active_cleanup),
-                running.owned_cleanup_handle(),
-            );
+            *self
+                .shutdown_control
+                .retained_cleanup
+                .write()
+                .expect("owned cleanup lock poisoned") = running.owned_cleanup_handle();
 
             let mut stdout = match running.take_stdout() {
                 Ok(stdout) => stdout,
@@ -704,8 +699,6 @@ where
                     }
                 }
             }
-
-            drop(cleanup_registration);
 
             if classify_failure(&observed.failure) == FailureDisposition::Terminal {
                 return self.publish_terminal(&notices, observed.failure).await;
@@ -1060,6 +1053,7 @@ mod tests {
         stderr_drops: usize,
         exact_signals: usize,
         exact_confirmations: usize,
+        exact_confirmation_error: bool,
     }
 
     #[derive(Clone, Default)]
@@ -1128,8 +1122,13 @@ mod tests {
 
         fn confirm(&self) -> IoFuture<'_> {
             Box::pin(async move {
-                self.0.lock().unwrap().exact_confirmations += 1;
-                Ok(())
+                let mut state = self.0.lock().unwrap();
+                state.exact_confirmations += 1;
+                if state.exact_confirmation_error {
+                    Err(io::Error::other("fake exact cleanup confirmation failed"))
+                } else {
+                    Ok(())
+                }
             })
         }
     }
@@ -2156,16 +2155,50 @@ mod tests {
             while observed_state.lock().unwrap().launches == 0 {
                 tokio::task::yield_now().await;
             }
-            RuntimeShutdown::cleanup_owned(&cleanup);
             supervision.abort();
             let _ = supervision.await;
+            RuntimeShutdown::cleanup_owned(&cleanup);
             RuntimeShutdown::wait_for_cleanup(&cleanup).await.unwrap();
         });
 
         let state = state.lock().unwrap();
-        assert_eq!(state.exact_signals, 1);
+        assert_eq!(state.exact_signals, 0);
         assert_eq!(state.exact_confirmations, 1);
-        assert_eq!(state.drop_signals, 0);
+        assert_eq!(state.drop_signals, 1);
+        drop(state);
+        std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
+    fn retained_cleanup_confirmation_failure_is_not_reported_as_success() {
+        let script = ChildScript {
+            stdout_pending: true,
+            wait_pending: true,
+            stderr_pending: true,
+            ..ChildScript::crash("", Duration::ZERO)
+        };
+        let (mut supervisor, state, _clock, support_dir) =
+            fake_supervisor(vec![script], "failed-confirmed-abort-cleanup");
+        state.lock().unwrap().exact_confirmation_error = true;
+        let cleanup = supervisor.shutdown_control();
+        let observed_state = Arc::clone(&state);
+        let (sender, _receiver) = mpsc::channel(16);
+
+        runtime().block_on(async move {
+            let supervision =
+                tokio::spawn(async move { supervisor.supervise_until_terminal(sender).await });
+            while observed_state.lock().unwrap().launches == 0 {
+                tokio::task::yield_now().await;
+            }
+            supervision.abort();
+            let _ = supervision.await;
+            RuntimeShutdown::cleanup_owned(&cleanup);
+            assert!(RuntimeShutdown::wait_for_cleanup(&cleanup).await.is_err());
+        });
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.exact_confirmations, 1);
+        assert_eq!(state.drop_signals, 1);
         drop(state);
         std::fs::remove_dir_all(support_dir).unwrap();
     }

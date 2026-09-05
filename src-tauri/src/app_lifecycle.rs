@@ -44,6 +44,11 @@ pub type ShutdownFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ()>> + Send
 pub trait RuntimeShutdown: Send + Sync {
     fn shutdown(&self, reason: &'static str) -> ShutdownFuture<'_>;
     fn cleanup_owned(&self);
+    fn owned_cleanup_handle(
+        &self,
+    ) -> Option<Arc<dyn crate::runtime::process::OwnedRuntimeCleanup>> {
+        None
+    }
     fn wait_for_cleanup(&self) -> ShutdownFuture<'_> {
         Box::pin(async { Ok(()) })
     }
@@ -233,12 +238,15 @@ impl RuntimeShutdownRegistry {
         true
     }
 
-    fn close_and_current(&self) -> Option<Arc<dyn RuntimeShutdown>> {
+    fn begin_closing(&self) {
         self.setup
             .state
             .lock()
             .expect("setup barrier lock poisoned")
             .closing = true;
+    }
+
+    fn current(&self) -> Option<Arc<dyn RuntimeShutdown>> {
         self.current
             .read()
             .expect("runtime shutdown lock poisoned")
@@ -268,6 +276,21 @@ impl RuntimeShutdownRegistry {
 }
 
 #[cfg(any(target_os = "macos", test))]
+impl crate::desktop_service::RuntimeStartPermit for RuntimeShutdownRegistry {
+    fn start_if_open(&self, start: &mut dyn FnMut() -> bool) -> bool {
+        let state = self
+            .setup
+            .state
+            .lock()
+            .expect("setup barrier lock poisoned");
+        if state.closing {
+            return false;
+        }
+        start()
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
 pub(crate) async fn cleanup_rejected_runtime(
     runtime: Arc<dyn RuntimeShutdown>,
     reporter: Arc<dyn crate::desktop_service::DesktopDiagnosticReporter>,
@@ -281,19 +304,22 @@ pub(crate) async fn cleanup_rejected_runtime(
 #[cfg(any(target_os = "macos", test))]
 impl RuntimeShutdown for RuntimeShutdownRegistry {
     fn shutdown(&self, reason: &'static str) -> ShutdownFuture<'_> {
-        let current = self.close_and_current();
+        self.begin_closing();
         Box::pin(async move {
+            let setup_result = self.wait_for_setup().await;
+            let current = self.current();
             let shutdown_result = if let Some(current) = current {
                 current.shutdown(reason).await
             } else {
                 Ok(())
             };
-            shutdown_result.and(self.wait_for_setup().await)
+            setup_result.and(shutdown_result)
         })
     }
 
     fn cleanup_owned(&self) {
-        if let Some(current) = self.close_and_current() {
+        self.begin_closing();
+        if let Some(current) = self.current() {
             current.cleanup_owned();
         }
     }
