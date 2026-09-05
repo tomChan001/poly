@@ -392,6 +392,41 @@ async def test_unexpected_service_exit_fails_closed_and_keeps_recovery_marker(
 
 
 @pytest.mark.asyncio
+async def test_service_exit_latches_failure_before_overlapping_parent_shutdown(
+    tmp_path: Path,
+) -> None:
+    trace: list[str] = []
+    events: list[RuntimeEvent] = []
+    postgres = FakePostgres(trace)
+    runtime = make_runtime(tmp_path, trace, events=events, postgres=postgres)
+    await runtime.start(
+        StartCommand(PurePosixPath("/data"), PurePosixPath("/run"), "x" * 43)
+    )
+    server = cast(FakeServer, runtime.server)
+    cleanup_entered = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def slow_server_stop() -> None:
+        cleanup_entered.set()
+        await release_cleanup.wait()
+        await FakeServer.stop(server)
+
+    server.stop = slow_server_stop  # type: ignore[method-assign]
+    failure_task = asyncio.create_task(runtime.wait_for_failure())
+    postgres.exited.set()
+    await asyncio.wait_for(cleanup_entered.wait(), timeout=1)
+
+    overlapping_stop = await runtime.stop("parent process ended")
+
+    assert overlapping_stop.state is RuntimeState.FAILED
+    assert overlapping_stop.fields["code"] == "runtime_unavailable"
+    assert events[-1] == overlapping_stop
+    assert (tmp_path / "data" / "unclean_shutdown").exists()
+    release_cleanup.set()
+    assert await asyncio.wait_for(failure_task, timeout=1) == overlapping_stop
+
+
+@pytest.mark.asyncio
 async def test_unclean_marker_disables_opening_before_worker_lifespan(
     tmp_path: Path,
 ) -> None:

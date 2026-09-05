@@ -261,27 +261,55 @@ class DesktopRuntime:
             asyncio.create_task(self.postgres.wait()),
             asyncio.create_task(self.server.wait()),
         }
+        finalize_task: asyncio.Task[RuntimeEvent] | None = None
         try:
             done, _pending = await asyncio.wait(
                 watchers, return_when=asyncio.FIRST_COMPLETED
             )
             for task in done:
-                await task
-        except asyncio.CancelledError:
-            raise
-        except Exception as service_error:  # noqa: BLE001 - sanitize failures
-            del service_error
+                try:
+                    task.result()
+                except Exception as service_error:  # noqa: BLE001
+                    del service_error
+
+            # Latch the terminal outcome without yielding. A simultaneous parent
+            # shutdown must never overwrite an observed service crash with STOPPED.
+            self._ready = False
+            failed = RuntimeEvent(
+                RuntimeState.FAILED,
+                {
+                    "code": "runtime_unavailable",
+                    "detail": "desktop service stopped unexpectedly",
+                },
+            )
+            self._terminal_event = failed
+            finalize_task = asyncio.create_task(
+                self._finalize_unexpected_failure(failed)
+            )
+            try:
+                return await asyncio.shield(finalize_task)
+            except asyncio.CancelledError:
+                while not finalize_task.done():
+                    try:
+                        await asyncio.shield(finalize_task)
+                    except asyncio.CancelledError:
+                        continue
+                raise
         finally:
             for task in watchers:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*watchers, return_exceptions=True)
 
-        self._ready = False
+    async def _finalize_unexpected_failure(
+        self, failed: RuntimeEvent
+    ) -> RuntimeEvent:
+        try:
+            await self._emit(failed)
+        except Exception as emit_error:  # noqa: BLE001 - cleanup still owns resources
+            del emit_error
         await self._finish_cleanup(clean=False, disable_reason=None)
-        return await self._failure(
-            "runtime_unavailable", "desktop service stopped unexpectedly"
-        )
+        return failed
 
     async def _finish_cleanup(self, *, clean: bool, disable_reason: str | None) -> bool:
         cleanup_task = self._cleanup_task

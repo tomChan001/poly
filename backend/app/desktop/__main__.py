@@ -158,6 +158,8 @@ async def run_stdio(
             if failure_task in done:
                 await failure_task
                 return 1
+            failure_task.cancel()
+            await asyncio.gather(failure_task, return_exceptions=True)
             line = await line_task
             if not line:
                 stopped = await active_runtime.stop("parent process ended")
