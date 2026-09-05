@@ -40,7 +40,9 @@ Intel 构建已配置，但在 `macos-15-intel` 的完整绿色原生 CI 运行�
 
 本 workflow 不连接真实市场服务，不使用真实市场凭证，也不执行真实订单。Python CI 只运行使用 fake/mock transports 的 unit 和 security 测试。
 
-隔离 smoke 使用唯一的合成值和临时默认 Keychain，并通过 Poly 的生产 `KeyringSecretStore` 边界执行 set/get/delete；它在两次应用启动之间读取同一值，结束时删除测试项和临时 Keychain。这个测试不会向正式应用增加调试 endpoint 或 secret readback，也不会修改发布 artifact。Smoke 同时使用 PATH deny shim 和应用后代进程采样，拒绝从 `.app` 外调用 `python`、`python3`、`node`、`postgres`、`aws`、`docker` 或 `brew`，并只允许 bundle 内可执行文件和明确允许的 macOS 系统路径。Validation 即使失败也通过独立的 `always()` step 上传不含凭证值的工具链、签名检查、bundle 清单和进程审计诊断。
+隔离 smoke 使用唯一的合成值和临时默认 Keychain，并调用安装后 `.app` 内的 `poly-runtime --keychain-smoke`，由打包的生产 `KeyringSecretStore` 和 macOS backend 执行 set/verify/delete。Secret 只经 stdin 传入，绝不出现在参数、日志或输出中；该命令固定使用 `com.poly.desktop.integrations`，只接受 `ci-smoke-*` account，也不提供 secret readback。测试在两次应用启动之间验证同一值，结束时删除测试项。临时 Keychain 只有在原 default/search list 成功恢复后才会删除，恢复失败会保留诊断并使 job 失败。
+
+Smoke 同时使用 PATH deny shim 和以 `sudo -n /usr/bin/fs_usage -w -f exec` 启动的 macOS exec/spawn kernel trace。Trace 先用短生命周期 `/usr/bin/python3` 校准，校准事件必须被同一 parser 检出；随后只跟踪 `Poly` 与 `poly-runtime` 发起的 exec/spawn，避免 Actions runner 噪声，并拒绝 bundle 外的 `python`、`python3`、`node`、`postgres`、`aws`、`docker` 或 `brew`。Tracer 不可用、校准缺失、停止失败或发现环境运行时都会使 smoke 失败。Validation 即使失败也通过独立的 `always()` step 上传不含凭证值的工具链、签名检查、bundle 清单和 trace 诊断。
 
 ## 安装与首次启动
 

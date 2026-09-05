@@ -97,6 +97,9 @@ def test_workflow_has_the_required_ordered_locked_pipeline() -> None:
 
 def test_smoke_uses_an_isolated_home_installed_dmg_and_command_guards() -> None:
     workflow = read(WORKFLOW)
+    smoke = workflow.split(
+        "- name: Install DMG into an isolated home and smoke test", 1
+    )[1].split("- name: Remove temporary signing keychain", 1)[0]
     for marker in (
         "mktemp -d",
         "SMOKE_HOME",
@@ -105,10 +108,9 @@ def test_smoke_uses_an_isolated_home_installed_dmg_and_command_guards() -> None:
         "hdiutil detach",
         "ditto",
         "open -n",
-        "KeyringSecretStore",
-        "await store.set",
-        "await store.get",
-        "await store.delete",
+        '"${RUNTIME_EXECUTABLE}" --keychain-smoke set --account',
+        '"${RUNTIME_EXECUTABLE}" --keychain-smoke verify --account',
+        '"${RUNTIME_EXECUTABLE}" --keychain-smoke delete --account',
         "security default-keychain -d user -s",
         "security list-keychains -d user -s",
         'tell application id "com.poly.desktop" to quit',
@@ -131,25 +133,31 @@ def test_smoke_uses_an_isolated_home_installed_dmg_and_command_guards() -> None:
     assert workflow.count("open -n") >= 2
     assert "security add-generic-password" not in workflow
     assert "security find-generic-password" not in workflow
+    assert "uv run" not in smoke
     assert re.search(
-        r"keyring_probe set.*?/usr/bin/open -n.*?tell application id.*?"
-        r"/usr/bin/open -n.*?keyring_probe get.*?keyring_probe delete",
-        workflow,
+        r"printf '%s' \"\$\{SMOKE_SECRET\}\"\s*\\?\s*\|\s*"
+        r'"\$\{RUNTIME_EXECUTABLE\}" --keychain-smoke',
+        smoke,
+    )
+    assert re.search(
+        r"--keychain-smoke set.*?/usr/bin/open -n.*?tell application id.*?"
+        r"/usr/bin/open -n.*?--keychain-smoke verify.*?--keychain-smoke delete",
+        smoke,
         re.DOTALL,
     )
 
 
-def test_smoke_audits_app_descendant_executables_not_just_path_lookups() -> None:
+def test_smoke_uses_calibrated_kernel_exec_tracing() -> None:
     workflow = read(WORKFLOW)
     for marker in (
-        "/bin/ps -ww -axo pid=,ppid=,comm=",
-        '/usr/bin/pgrep -f "^${APP_EXECUTABLE}',
-        "/usr/sbin/lsof -nP -a -p",
-        "AUDIT_FAILURE",
-        "audit_app_processes &",
-        '"${INSTALLED_APP}"/*',
-        "/System/Library/*",
-        "/usr/libexec/*",
+        "/usr/bin/sudo -n /usr/bin/fs_usage -w -f exec",
+        "/usr/bin/python3 -c 'pass'",
+        "CALIBRATION_TRACE",
+        "APP_EXEC_TRACE",
+        "Poly poly-runtime",
+        "audit_exec_trace",
+        "exec-trace-failures.log",
+        "${RUNTIME_ROOT}/postgres/bin/",
     ):
         assert marker in workflow
     for forbidden_command in (
@@ -161,10 +169,36 @@ def test_smoke_audits_app_descendant_executables_not_just_path_lookups() -> None
         "docker",
         "brew",
     ):
-        assert f'"{forbidden_command}"' in workflow
-    assert '/usr/bin/grep -Fq "${APP_EXECUTABLE}" "${AUDIT_LOG}"' in workflow
-    assert '/usr/bin/grep -Fq "${RUNTIME_ROOT}/" "${AUDIT_LOG}"' in workflow
-    assert '[[ ! -s "${AUDIT_FAILURE}" ]]' in workflow
+        assert forbidden_command in workflow
+    assert "/bin/ps -ww -axo pid=,ppid=,comm=" not in workflow
+    assert "audit_app_processes" not in workflow
+    assert re.search(
+        r"start_exec_trace.*?python3 -c 'pass'.*?stop_exec_trace.*?"
+        r"grep.*?/usr/bin/python3",
+        workflow,
+        re.DOTALL,
+    )
+    assert '[[ ! -s "${TRACE_FAILURE}" ]]' in workflow
+
+
+def test_smoke_restores_trimmed_keychain_paths_or_fails_closed() -> None:
+    workflow = read(WORKFLOW)
+    for marker in (
+        "KEYCHAIN_RESTORE_FAILURE",
+        "restore_keychains",
+        "keychain-restore-failure.log",
+        "[[:space:]]",
+    ):
+        assert marker in workflow
+    assert not re.search(
+        r"security (?:default-keychain|list-keychains).*?\|\| true", workflow
+    )
+    assert re.search(
+        r"if restore_keychains; then.*?security delete-keychain.*?else.*?"
+        r"KEYCHAIN_RESTORE_FAILURE",
+        workflow,
+        re.DOTALL,
+    )
 
 
 def test_non_release_diagnostics_are_collected_and_uploaded_even_on_failure() -> None:

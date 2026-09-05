@@ -191,7 +191,6 @@ jobs:
 
       - name: Install DMG into an isolated home and smoke test
         env:
-          SMOKE_SERVICE: com.poly.desktop.integrations
           SMOKE_ACCOUNT: ci-smoke-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
@@ -200,9 +199,11 @@ jobs:
           SMOKE_APPLICATIONS="${SMOKE_ROOT}/Applications"
           GUARD_DIR="${SMOKE_ROOT}/guard-bin"
           GUARD_LOG="${SMOKE_ROOT}/ambient-command.log"
-          AUDIT_LOG="${SMOKE_ROOT}/descendant-executables.log"
-          AUDIT_FAILURE="${SMOKE_ROOT}/descendant-executable-failures.log"
-          AUDIT_STOP="${SMOKE_ROOT}/stop-audit"
+          CALIBRATION_TRACE="${SMOKE_ROOT}/fs-usage-calibration.log"
+          CALIBRATION_EVIDENCE="${SMOKE_ROOT}/fs-usage-calibration-evidence.log"
+          APP_EXEC_TRACE="${SMOKE_ROOT}/fs-usage-app.log"
+          TRACE_FAILURE="${SMOKE_ROOT}/exec-trace-failures.log"
+          KEYCHAIN_RESTORE_FAILURE="${SMOKE_ROOT}/keychain-restore-failure.log"
           DIAGNOSTICS_DIR="${RUNNER_TEMP}/poly-diagnostics/smoke-${POLY_TARGET_ARCH}"
           MOUNT_POINT="${SMOKE_ROOT}/mounted-dmg"
           SMOKE_KEYCHAIN="${SMOKE_ROOT}/ci-smoke.keychain-db"
@@ -211,20 +212,25 @@ jobs:
           APP_PATH="${GITHUB_WORKSPACE}/src-tauri/target/${POLY_TARGET_TRIPLE}/release/bundle/macos/Poly.app"
           DMG_PATH="$(find "${GITHUB_WORKSPACE}/src-tauri/target/${POLY_TARGET_TRIPLE}/release/bundle/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
           INSTALLED_APP="${SMOKE_APPLICATIONS}/Poly.app"
-          APP_EXECUTABLE="${INSTALLED_APP}/Contents/MacOS/Poly"
           RUNTIME_ROOT="${INSTALLED_APP}/Contents/Resources/poly-runtime"
-          UV_BIN="$(command -v uv)"
-          ORIGINAL_DEFAULT_KEYCHAIN="$(/usr/bin/security default-keychain -d user | /usr/bin/tr -d '\"')"
+          RUNTIME_EXECUTABLE="${RUNTIME_ROOT}/poly-runtime"
+
+          trim_keychain_path() {
+            /usr/bin/sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//'
+          }
+          ORIGINAL_DEFAULT_KEYCHAIN="$(/usr/bin/security default-keychain -d user | trim_keychain_path)"
           ORIGINAL_KEYCHAINS=()
           while IFS= read -r keychain_path; do
-            ORIGINAL_KEYCHAINS+=("${keychain_path//\"/}")
+            keychain_path="$(printf '%s\n' "${keychain_path}" | trim_keychain_path)"
+            [[ -n "${keychain_path}" ]] && ORIGINAL_KEYCHAINS+=("${keychain_path}")
           done < <(/usr/bin/security list-keychains -d user)
+          [[ -n "${ORIGINAL_DEFAULT_KEYCHAIN}" ]]
+          [[ "${#ORIGINAL_KEYCHAINS[@]}" -gt 0 ]]
           mkdir -p "${SMOKE_HOME}/Library/Application Support" "${SMOKE_HOME}/Library/Caches"
           mkdir -p "${SMOKE_APPLICATIONS}" "${GUARD_DIR}" "${MOUNT_POINT}" "${DIAGNOSTICS_DIR}"
           chmod 700 "${SMOKE_HOME}" "${SMOKE_APPLICATIONS}"
           : >"${GUARD_LOG}"
-          : >"${AUDIT_LOG}"
-          : >"${AUDIT_FAILURE}"
+          : >"${TRACE_FAILURE}"
 
           for command_name in python python3 node postgres aws docker brew; do
             printf '%s\n' '#!/bin/sh' \
@@ -234,124 +240,103 @@ jobs:
           done
 
           mounted=0
-          audit_pid=''
-          stop_audit() {
-            if [[ -n "${audit_pid}" ]]; then
-              /usr/bin/touch "${AUDIT_STOP}"
-              wait "${audit_pid}" || true
-              audit_pid=''
+          keychain_created=0
+          trace_pid=''
+          start_exec_trace() {
+            local output="$1"
+            shift
+            : >"${output}"
+            /usr/bin/sudo -n /usr/bin/fs_usage -w -f exec "$@" >"${output}" 2>&1 &
+            trace_pid=$!
+            /bin/sleep 1
+            if ! /bin/kill -0 "${trace_pid}" 2>/dev/null; then
+              printf 'fs_usage failed to start\n' >>"${TRACE_FAILURE}"
+              wait "${trace_pid}" || true
+              trace_pid=''
+              return 1
+            fi
+          }
+          stop_exec_trace() {
+            if [[ -z "${trace_pid}" ]]; then
+              return 0
+            fi
+            if ! /usr/bin/sudo -n /bin/kill -INT "${trace_pid}" 2>/dev/null; then
+              printf 'fs_usage failed to stop\n' >>"${TRACE_FAILURE}"
+              /usr/bin/sudo -n /bin/kill -TERM "${trace_pid}" 2>/dev/null || true
+              wait "${trace_pid}" || true
+              trace_pid=''
+              return 1
+            fi
+            for ((trace_wait = 1; trace_wait <= 50; trace_wait++)); do
+              /bin/kill -0 "${trace_pid}" 2>/dev/null || break
+              /bin/sleep 0.1
+            done
+            if /bin/kill -0 "${trace_pid}" 2>/dev/null; then
+              printf 'fs_usage did not stop after SIGINT\n' >>"${TRACE_FAILURE}"
+              /usr/bin/sudo -n /bin/kill -TERM "${trace_pid}" 2>/dev/null || true
+              wait "${trace_pid}" || true
+              trace_pid=''
+              return 1
+            fi
+            wait "${trace_pid}" || true
+            trace_pid=''
+          }
+          audit_exec_trace() {
+            local trace_input="$1"
+            local failure_output="$2"
+            /usr/bin/awk -v postgres_bin="${RUNTIME_ROOT}/postgres/bin/" '
+              {
+                lowered = tolower($0)
+                if (index(lowered, "exec") == 0 && index(lowered, "spawn") == 0) next
+                if (lowered !~ /(^|[[:space:]\/])(python|python3([.][0-9]+)*|node|nodejs|postgres|initdb|pg_isready|psql|createdb|aws|docker|brew)([[:space:]]|$)/) next
+                if (index($0, postgres_bin) > 0) next
+                print
+              }
+            ' "${trace_input}" >"${failure_output}"
+          }
+          restore_keychains() {
+            local restore_failed=0
+            /usr/bin/security default-keychain -d user -s "${ORIGINAL_DEFAULT_KEYCHAIN}" >/dev/null 2>&1 || restore_failed=1
+            /usr/bin/security list-keychains -d user -s "${ORIGINAL_KEYCHAINS[@]}" >/dev/null 2>&1 || restore_failed=1
+            if [[ "${restore_failed}" -ne 0 ]]; then
+              printf 'failed to restore original user Keychain configuration\n' >"${KEYCHAIN_RESTORE_FAILURE}"
+              return 1
             fi
           }
           copy_smoke_diagnostics() {
             /bin/mkdir -p "${DIAGNOSTICS_DIR}"
-            /usr/bin/sort -u "${AUDIT_LOG}" -o "${DIAGNOSTICS_DIR}/descendant-executables.log" 2>/dev/null || true
             /bin/cp "${GUARD_LOG}" "${DIAGNOSTICS_DIR}/ambient-command.log" 2>/dev/null || true
-            /bin/cp "${AUDIT_FAILURE}" "${DIAGNOSTICS_DIR}/descendant-executable-failures.log" 2>/dev/null || true
+            /bin/cp "${CALIBRATION_EVIDENCE}" "${DIAGNOSTICS_DIR}/fs-usage-calibration-evidence.log" 2>/dev/null || true
+            /bin/cp "${APP_EXEC_TRACE}" "${DIAGNOSTICS_DIR}/fs-usage-app.log" 2>/dev/null || true
+            /bin/cp "${TRACE_FAILURE}" "${DIAGNOSTICS_DIR}/exec-trace-failures.log" 2>/dev/null || true
+            /bin/cp "${KEYCHAIN_RESTORE_FAILURE}" "${DIAGNOSTICS_DIR}/keychain-restore-failure.log" 2>/dev/null || true
           }
           cleanup_smoke() {
-            stop_audit
-            copy_smoke_diagnostics
+            local original_status="$1"
+            local cleanup_status=0
+            stop_exec_trace || cleanup_status=1
             /usr/bin/osascript -e 'tell application id "com.poly.desktop" to quit' >/dev/null 2>&1 || true
-            if [[ -n "${ORIGINAL_DEFAULT_KEYCHAIN}" ]]; then
-              /usr/bin/security default-keychain -d user -s "${ORIGINAL_DEFAULT_KEYCHAIN}" >/dev/null 2>&1 || true
+            if [[ "${keychain_created}" -eq 1 ]]; then
+              if restore_keychains; then
+                /usr/bin/security delete-keychain "${SMOKE_KEYCHAIN}" >/dev/null 2>&1 || cleanup_status=1
+              else
+                printf 'temporary Keychain retained because restoration failed\n' >>"${KEYCHAIN_RESTORE_FAILURE}"
+                cleanup_status=1
+              fi
             fi
-            if [[ "${#ORIGINAL_KEYCHAINS[@]}" -gt 0 ]]; then
-              /usr/bin/security list-keychains -d user -s "${ORIGINAL_KEYCHAINS[@]}" >/dev/null 2>&1 || true
-            fi
-            /usr/bin/security delete-keychain "${SMOKE_KEYCHAIN}" >/dev/null 2>&1 || true
             if [[ "${mounted}" -eq 1 ]]; then
               /usr/bin/hdiutil detach "${MOUNT_POINT}" -force >/dev/null 2>&1 || true
             fi
+            copy_smoke_diagnostics
+            trap - EXIT INT TERM
+            if [[ "${original_status}" -ne 0 ]]; then
+              exit "${original_status}"
+            fi
+            exit "${cleanup_status}"
           }
-          trap cleanup_smoke EXIT INT TERM
-
-          keyring_probe() {
-            POLY_KEYRING_ACTION="$1" \
-            POLY_SMOKE_SERVICE="${SMOKE_SERVICE}" \
-            POLY_SMOKE_ACCOUNT="${SMOKE_ACCOUNT}" \
-            POLY_SMOKE_SECRET="${SMOKE_SECRET}" \
-            HOME="${SMOKE_HOME}" \
-              "${UV_BIN}" run --frozen python - <<'PY'
-          import asyncio
-          import hmac
-          import os
-
-          from backend.app.core.secrets import KeyringSecretStore
-
-
-          async def main() -> None:
-              store = KeyringSecretStore(os.environ["POLY_SMOKE_SERVICE"])
-              account = os.environ["POLY_SMOKE_ACCOUNT"]
-              action = os.environ["POLY_KEYRING_ACTION"]
-              if action == "set":
-                  await store.set(account, os.environ["POLY_SMOKE_SECRET"])
-              elif action == "get":
-                  actual = await store.get(account)
-                  assert actual is not None
-                  assert hmac.compare_digest(actual, os.environ["POLY_SMOKE_SECRET"])
-              elif action == "delete":
-                  await store.delete(account)
-                  assert await store.get(account) is None
-              else:
-                  raise AssertionError("unknown keyring smoke action")
-
-
-          asyncio.run(main())
-          PY
-          }
-
-          validate_executable() {
-            local executable="$1"
-            local executable_name="${executable##*/}"
-            case "${executable_name}" in
-              "python"|"python3"|"node"|"postgres"|"aws"|"docker"|"brew")
-                case "${executable}" in
-                  "${INSTALLED_APP}"/*) ;;
-                  *)
-                    printf 'forbidden ambient executable: %s\n' "${executable}" >>"${AUDIT_FAILURE}"
-                    return
-                    ;;
-                esac
-                ;;
-            esac
-            case "${executable}" in
-              "${INSTALLED_APP}"/*|/System/Library/*|/Library/Apple/System/Library/*|/usr/libexec/*|/usr/bin/*|/bin/*|/usr/sbin/*|/sbin/*) ;;
-              *) printf 'unapproved descendant executable: %s\n' "${executable}" >>"${AUDIT_FAILURE}" ;;
-            esac
-          }
-
-          audit_app_processes() {
-            local snapshot="${SMOKE_ROOT}/process-snapshot"
-            local tracked="${SMOKE_ROOT}/tracked-pids"
-            local expanded="${SMOKE_ROOT}/expanded-pids"
-            local combined="${SMOKE_ROOT}/combined-pids"
-            local executable
-            local pid
-            while [[ ! -e "${AUDIT_STOP}" ]]; do
-              /bin/ps -ww -axo pid=,ppid=,comm= >"${snapshot}"
-              /usr/bin/pgrep -f "^${APP_EXECUTABLE}([[:space:]]|$)" \
-                | /usr/bin/sort -u >"${tracked}" || true
-              while :; do
-                /usr/bin/awk '
-                  NR == FNR { parent[$1] = 1; next }
-                  $2 in parent { print $1 }
-                ' "${tracked}" "${snapshot}" | /usr/bin/sort -u >"${expanded}"
-                /usr/bin/sort -u "${tracked}" "${expanded}" >"${combined}"
-                if /usr/bin/cmp -s "${tracked}" "${combined}"; then
-                  break
-                fi
-                /bin/mv "${combined}" "${tracked}"
-              done
-              while IFS= read -r pid; do
-                [[ -n "${pid}" ]] || continue
-                executable="$(/usr/sbin/lsof -nP -a -p "${pid}" -d txt -Fn 2>/dev/null | /usr/bin/sed -n 's/^n//p' | /usr/bin/head -n 1 || true)"
-                [[ -n "${executable}" ]] || continue
-                printf '%s\t%s\n' "${pid}" "${executable}" >>"${AUDIT_LOG}"
-                validate_executable "${executable}"
-              done <"${tracked}"
-              /bin/sleep 0.02
-            done
-          }
+          trap 'cleanup_smoke $?' EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
 
           test -d "${APP_PATH}"
           test -n "${DMG_PATH}"
@@ -363,7 +348,20 @@ jobs:
           /usr/bin/hdiutil detach "${MOUNT_POINT}"
           mounted=0
 
+          start_exec_trace "${CALIBRATION_TRACE}"
+          /usr/bin/python3 -c 'pass'
+          /bin/sleep 1
+          stop_exec_trace
+          audit_exec_trace "${CALIBRATION_TRACE}" "${TRACE_FAILURE}"
+          if ! /usr/bin/grep -Fq '/usr/bin/python3' "${TRACE_FAILURE}"; then
+            printf 'fs_usage calibration did not observe /usr/bin/python3\n' >>"${TRACE_FAILURE}"
+            exit 1
+          fi
+          printf 'fs_usage parser observed the synthetic /usr/bin/python3 exec\n' >"${CALIBRATION_EVIDENCE}"
+          : >"${TRACE_FAILURE}"
+
           /usr/bin/security create-keychain -p "${SMOKE_KEYCHAIN_PASSWORD}" "${SMOKE_KEYCHAIN}"
+          keychain_created=1
           /usr/bin/security set-keychain-settings -lut 21600 "${SMOKE_KEYCHAIN}"
           /usr/bin/security unlock-keychain -p "${SMOKE_KEYCHAIN_PASSWORD}" "${SMOKE_KEYCHAIN}"
           /usr/bin/security list-keychains -d user -s "${SMOKE_KEYCHAIN}" "${ORIGINAL_KEYCHAINS[@]}"
@@ -372,9 +370,9 @@ jobs:
           export HOME="${SMOKE_HOME}"
           export PATH="${GUARD_DIR}:/usr/bin:/bin:/usr/sbin:/sbin"
           export POLY_GUARD_LOG="${GUARD_LOG}"
-          keyring_probe set
-          audit_app_processes &
-          audit_pid=$!
+          printf '%s' "${SMOKE_SECRET}" \
+            | "${RUNTIME_EXECUTABLE}" --keychain-smoke set --account "${SMOKE_ACCOUNT}" >/dev/null
+          start_exec_trace "${APP_EXEC_TRACE}" Poly poly-runtime
           app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
           [[ "${app_count}" -eq 0 ]]
           /usr/bin/open -n "${INSTALLED_APP}"
@@ -404,7 +402,8 @@ jobs:
 
           /usr/bin/open -n "${INSTALLED_APP}"
           /bin/sleep 2
-          keyring_probe get
+          printf '%s' "${SMOKE_SECRET}" \
+            | "${RUNTIME_EXECUTABLE}" --keychain-smoke verify --account "${SMOKE_ACCOUNT}" >/dev/null
           /usr/bin/open -n "${INSTALLED_APP}"
           /bin/sleep 3
           app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
@@ -418,13 +417,12 @@ jobs:
             /bin/sleep 1
           done
           [[ -z "${remaining}" && "${app_count}" -eq 0 ]]
-          keyring_probe delete
-          stop_audit
+          "${RUNTIME_EXECUTABLE}" --keychain-smoke delete --account "${SMOKE_ACCOUNT}" >/dev/null
+          stop_exec_trace
+          audit_exec_trace "${APP_EXEC_TRACE}" "${TRACE_FAILURE}"
           copy_smoke_diagnostics
-          /usr/bin/grep -Fq "${APP_EXECUTABLE}" "${AUDIT_LOG}"
-          /usr/bin/grep -Fq "${RUNTIME_ROOT}/" "${AUDIT_LOG}"
           [[ ! -s "${GUARD_LOG}" ]]
-          [[ ! -s "${AUDIT_FAILURE}" ]]
+          [[ ! -s "${TRACE_FAILURE}" ]]
 
       - name: Remove temporary signing keychain
         if: ${{ always() && env.IS_RELEASE == 'true' }}

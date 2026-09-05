@@ -10,6 +10,7 @@ import threading
 import types
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import cast
 
@@ -841,6 +842,153 @@ def test_self_test_checks_resources_and_writable_temp_directory(tmp_path: Path) 
     event = desktop_main.self_test(project_root=tmp_path, temp_root=tmp_path)
 
     assert event == RuntimeEvent(RuntimeState.STOPPED, {"self_test": "ok"})
+
+
+class FakeKeychainSmokeStore:
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+
+    async def get(self, key: str) -> str | None:
+        return self.values.get(key)
+
+    async def set(self, key: str, value: str) -> None:
+        self.values[key] = value
+
+    async def delete(self, key: str) -> None:
+        self.values.pop(key, None)
+
+
+@pytest.mark.asyncio
+async def test_keychain_smoke_uses_fixed_service_and_never_outputs_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = FakeKeychainSmokeStore()
+    services: list[str] = []
+
+    def keyring_store(service: str) -> FakeKeychainSmokeStore:
+        services.append(service)
+        return store
+
+    monkeypatch.setattr(desktop_main, "KeyringSecretStore", keyring_store)
+    account = "ci-smoke-1234-arm64"
+    secret = b"synthetic-secret-that-must-not-be-printed"
+
+    written = await desktop_main.keychain_smoke(
+        "set", account, secret_stream=BytesIO(secret)
+    )
+    verified = await desktop_main.keychain_smoke(
+        "verify", account, secret_stream=BytesIO(secret)
+    )
+    deleted = await desktop_main.keychain_smoke("delete", account)
+
+    assert services == ["com.poly.desktop.integrations"] * 3
+    assert store.values == {}
+    assert [written.state, verified.state, deleted.state] == [
+        RuntimeState.STOPPED,
+        RuntimeState.STOPPED,
+        RuntimeState.STOPPED,
+    ]
+    output = "".join(event.to_json() for event in (written, verified, deleted))
+    assert secret.decode() not in output
+    assert account not in output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "account",
+    [
+        "ci-smoke-",
+        "production-account",
+        "ci-smoke-../../login",
+        "ci-smoke-with_underscore",
+        "ci-smoke-" + "x" * 100,
+    ],
+)
+async def test_keychain_smoke_rejects_non_ci_accounts_before_keyring_access(
+    monkeypatch: pytest.MonkeyPatch,
+    account: str,
+) -> None:
+    def unexpected_store(_service: str) -> FakeKeychainSmokeStore:
+        raise AssertionError("invalid accounts must not reach Keychain")
+
+    monkeypatch.setattr(desktop_main, "KeyringSecretStore", unexpected_store)
+
+    event = await desktop_main.keychain_smoke(
+        "set", account, secret_stream=BytesIO(b"synthetic")
+    )
+
+    assert event.state is RuntimeState.FAILED
+    assert event.fields == {
+        "code": "keychain_smoke_failed",
+        "detail": "keychain smoke failed",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "secret",
+    [b"", b"line-one\nline-two", b"x" * 4097, b"\xff"],
+)
+async def test_keychain_smoke_rejects_unsafe_stdin_without_leaking_it(
+    monkeypatch: pytest.MonkeyPatch,
+    secret: bytes,
+) -> None:
+    store = FakeKeychainSmokeStore()
+    monkeypatch.setattr(desktop_main, "KeyringSecretStore", lambda _service: store)
+
+    event = await desktop_main.keychain_smoke(
+        "set", "ci-smoke-safe", secret_stream=BytesIO(secret)
+    )
+
+    assert event.state is RuntimeState.FAILED
+    assert store.values == {}
+    assert "keychain smoke failed" in event.to_json()
+    decoded = secret.decode("utf-8", errors="ignore")
+    if decoded:
+        assert decoded not in event.to_json()
+
+
+@pytest.mark.asyncio
+async def test_keychain_smoke_verify_mismatch_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = FakeKeychainSmokeStore()
+    store.values["ci-smoke-safe"] = "stored-value"
+    monkeypatch.setattr(desktop_main, "KeyringSecretStore", lambda _service: store)
+
+    event = await desktop_main.keychain_smoke(
+        "verify", "ci-smoke-safe", secret_stream=BytesIO(b"different-value")
+    )
+
+    assert event.state is RuntimeState.FAILED
+    assert event.fields["code"] == "keychain_smoke_failed"
+    assert "stored-value" not in event.to_json()
+    assert "different-value" not in event.to_json()
+
+
+def test_keychain_smoke_cli_reads_secret_only_from_stdin_and_emits_status(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = FakeKeychainSmokeStore()
+    secret = b"stdin-only-synthetic-secret"
+    monkeypatch.setattr(desktop_main, "KeyringSecretStore", lambda _service: store)
+    monkeypatch.setattr(
+        desktop_main.sys,
+        "stdin",
+        types.SimpleNamespace(buffer=BytesIO(secret)),
+    )
+
+    result = desktop_main.main(["--keychain-smoke", "set", "--account", "ci-smoke-cli"])
+
+    output = capsys.readouterr().out
+    assert result == 0
+    assert json.loads(output) == {
+        "version": 1,
+        "state": "stopped",
+        "keychain_smoke": "set",
+    }
+    assert secret.decode() not in output
 
 
 @pytest.mark.parametrize(

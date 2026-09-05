@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import inspect
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -12,6 +14,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Protocol
 
+from backend.app.core.secrets import KeyringSecretStore, SecretStore
 from backend.app.desktop.protocol import (
     RuntimeEvent,
     RuntimeState,
@@ -23,10 +26,17 @@ from backend.app.desktop.runtime import DesktopRuntime, packaged_project_root
 
 LineReader = Callable[[], bytes | Awaitable[bytes]]
 EventWriter = Callable[[str], None | Awaitable[None]]
+_KEYCHAIN_SMOKE_SERVICE = "com.poly.desktop.integrations"
+_KEYCHAIN_SMOKE_ACCOUNT = re.compile(r"ci-smoke-[a-zA-Z0-9][a-zA-Z0-9-]{0,63}\Z")
+_KEYCHAIN_SMOKE_SECRET_LIMIT = 4096
 
 
 class _BinaryLineStream(Protocol):
     def readline(self) -> bytes: ...
+
+
+class _BinaryReadStream(Protocol):
+    def read(self, size: int = -1) -> bytes: ...
 
 
 class _StdinLeaseReader:
@@ -193,6 +203,51 @@ def self_test(
     return RuntimeEvent(RuntimeState.STOPPED, {"self_test": "ok"})
 
 
+def _read_keychain_smoke_secret(stream: _BinaryReadStream) -> str:
+    raw = stream.read(_KEYCHAIN_SMOKE_SECRET_LIMIT + 1)
+    if not raw or len(raw) > _KEYCHAIN_SMOKE_SECRET_LIMIT:
+        raise ValueError("invalid keychain smoke input")
+    try:
+        secret = raw.decode("utf-8", errors="strict")
+    except UnicodeError:
+        raise ValueError("invalid keychain smoke input") from None
+    if "\x00" in secret or "\r" in secret or "\n" in secret:
+        raise ValueError("invalid keychain smoke input")
+    return secret
+
+
+async def keychain_smoke(
+    action: str,
+    account: str,
+    *,
+    secret_stream: _BinaryReadStream | None = None,
+    store: SecretStore | None = None,
+) -> RuntimeEvent:
+    """Exercise only CI-owned Keychain records without exposing their values."""
+    if action not in {
+        "set",
+        "verify",
+        "delete",
+    } or not _KEYCHAIN_SMOKE_ACCOUNT.fullmatch(account):
+        return _failure("keychain_smoke_failed", "keychain smoke failed")
+    try:
+        active_store = store or KeyringSecretStore(_KEYCHAIN_SMOKE_SERVICE)
+        if action == "delete":
+            await active_store.delete(account)
+            if await active_store.get(account) is not None:
+                raise ValueError("keychain smoke deletion failed")
+        else:
+            secret = _read_keychain_smoke_secret(secret_stream or sys.stdin.buffer)
+            if action == "set":
+                await active_store.set(account, secret)
+            actual = await active_store.get(account)
+            if actual is None or not hmac.compare_digest(actual, secret):
+                raise ValueError("keychain smoke verification failed")
+    except Exception:  # noqa: BLE001 - diagnostic output must be stable and secret-free.
+        return _failure("keychain_smoke_failed", "keychain smoke failed")
+    return RuntimeEvent(RuntimeState.STOPPED, {"keychain_smoke": action})
+
+
 def _is_safe_packaged_file(path: Path, expected_subtree: Path) -> bool:
     try:
         if path.is_symlink():
@@ -214,10 +269,19 @@ def _is_safe_packaged_executable(path: Path, expected_subtree: Path) -> bool:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="poly-runtime")
-    parser.add_argument("--self-test", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--self-test", action="store_true")
+    mode.add_argument(
+        "--keychain-smoke", choices=("set", "verify", "delete"), default=None
+    )
+    parser.add_argument("--account")
     args = parser.parse_args(argv)
     if args.self_test:
         event = self_test()
+        _stdout_writer(event.to_json())
+        return 0 if event.state is RuntimeState.STOPPED else 1
+    if args.keychain_smoke is not None:
+        event = asyncio.run(keychain_smoke(args.keychain_smoke, args.account or ""))
         _stdout_writer(event.to_json())
         return 0 if event.state is RuntimeState.STOPPED else 1
     return asyncio.run(run_stdio())
