@@ -246,16 +246,83 @@ jobs:
           keychain_created=0
           trace_pid=''
           trace_stop_requested=0
-          assert_exec_trace_alive() {
-            if [[ -z "${trace_pid}" || "${trace_stop_requested}" -ne 0 ]] \
-              || ! /usr/bin/sudo -n /bin/kill -0 "${trace_pid}" 2>/dev/null; then
-              printf 'fs_usage exited before intentional stop\n' >>"${TRACE_FAILURE}"
-              if [[ -n "${trace_pid}" ]]; then
-                wait "${trace_pid}" || true
-              fi
-              trace_pid=''
+          trace_is_alive() {
+            local probe_error="${SMOKE_ROOT}/fs-usage-probe-error"
+            : >"${probe_error}"
+            if /usr/bin/sudo -n /bin/kill -0 "${trace_pid}" 2>"${probe_error}"; then
+              return 0
+            fi
+            if /usr/bin/grep -qi 'No such process' "${probe_error}"; then
               return 1
             fi
+            printf 'fs_usage liveness probe failed\n' >>"${TRACE_FAILURE}"
+            return 2
+          }
+          wait_for_trace_exit() {
+            local probe_status
+            for ((trace_wait = 1; trace_wait <= 30; trace_wait++)); do
+              probe_status=0
+              trace_is_alive || probe_status=$?
+              if [[ "${probe_status}" -eq 0 ]]; then
+                /bin/sleep 0.1
+                continue
+              fi
+              [[ "${probe_status}" -eq 1 ]] && return 0
+              return 2
+            done
+            return 3
+          }
+          reap_confirmed_trace() {
+            wait "${trace_pid}" || true
+            trace_pid=''
+            trace_stop_requested=0
+          }
+          bounded_stop_and_reap() {
+            local cleanup_failed=0
+            local probe_status=0
+            local signal_name
+            local wait_status
+            trace_is_alive || probe_status=$?
+            if [[ "${probe_status}" -ne 0 ]]; then
+              if [[ "${probe_status}" -eq 1 ]]; then
+                reap_confirmed_trace
+                return 0
+              fi
+              cleanup_failed=1
+            fi
+            trace_stop_requested=1
+            for signal_name in INT TERM KILL; do
+              if ! /usr/bin/sudo -n /bin/kill -"${signal_name}" "${trace_pid}" 2>/dev/null; then
+                printf 'failed to send fs_usage signal: %s\n' "${signal_name}" >>"${TRACE_FAILURE}"
+                cleanup_failed=1
+              fi
+              wait_status=0
+              wait_for_trace_exit || wait_status=$?
+              if [[ "${wait_status}" -eq 0 ]]; then
+                reap_confirmed_trace
+                return "${cleanup_failed}"
+              fi
+              [[ "${wait_status}" -eq 2 ]] && cleanup_failed=1
+            done
+            printf 'fs_usage did not terminate after SIGKILL\n' >>"${TRACE_FAILURE}"
+            return 1
+          }
+          assert_exec_trace_alive() {
+            if [[ -z "${trace_pid}" ]]; then
+              printf 'fs_usage exited before intentional stop\n' >>"${TRACE_FAILURE}"
+              return 1
+            fi
+            if [[ "${trace_stop_requested}" -ne 0 ]]; then
+              printf 'fs_usage exited before intentional stop\n' >>"${TRACE_FAILURE}"
+              bounded_stop_and_reap || true
+              return 1
+            fi
+            if trace_is_alive; then
+              return 0
+            fi
+            printf 'fs_usage exited before intentional stop\n' >>"${TRACE_FAILURE}"
+            bounded_stop_and_reap || true
+            return 1
           }
           start_exec_trace() {
             local output="$1"
@@ -271,33 +338,18 @@ jobs:
             fi
           }
           stop_exec_trace() {
+            local probe_status=0
             if [[ -z "${trace_pid}" ]]; then
               return 0
             fi
+            trace_is_alive || probe_status=$?
+            if [[ "${probe_status}" -ne 0 ]]; then
+              printf 'fs_usage exited before intentional stop\n' >>"${TRACE_FAILURE}"
+              bounded_stop_and_reap || true
+              return 1
+            fi
             trace_stop_requested=1
-            if ! /usr/bin/sudo -n /bin/kill -INT "${trace_pid}" 2>/dev/null; then
-              printf 'fs_usage failed to stop\n' >>"${TRACE_FAILURE}"
-              /usr/bin/sudo -n /bin/kill -TERM "${trace_pid}" 2>/dev/null || true
-              wait "${trace_pid}" || true
-              trace_pid=''
-              trace_stop_requested=0
-              return 1
-            fi
-            for ((trace_wait = 1; trace_wait <= 50; trace_wait++)); do
-              /usr/bin/sudo -n /bin/kill -0 "${trace_pid}" 2>/dev/null || break
-              /bin/sleep 0.1
-            done
-            if /usr/bin/sudo -n /bin/kill -0 "${trace_pid}" 2>/dev/null; then
-              printf 'fs_usage did not stop after SIGINT\n' >>"${TRACE_FAILURE}"
-              /usr/bin/sudo -n /bin/kill -TERM "${trace_pid}" 2>/dev/null || true
-              wait "${trace_pid}" || true
-              trace_pid=''
-              trace_stop_requested=0
-              return 1
-            fi
-            wait "${trace_pid}" || true
-            trace_pid=''
-            trace_stop_requested=0
+            bounded_stop_and_reap
           }
           audit_exec_trace() {
             local trace_input="$1"

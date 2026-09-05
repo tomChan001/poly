@@ -204,13 +204,33 @@ def test_exec_trace_unexpected_exit_is_a_hard_failure() -> None:
     assert "trace_stop_requested=1" in workflow
     assert "! /bin/kill -0" not in workflow
     assert "if /bin/kill -0" not in workflow
-    assert workflow.count("/usr/bin/sudo -n /bin/kill -0") >= 3
-    assert re.search(
-        r"stop_exec_trace\(\).*?trace_stop_requested=1.*?kill -INT.*?"
-        r"wait.*?\|\| true",
-        workflow,
-        re.DOTALL,
-    )
+    assert workflow.count("/usr/bin/sudo -n /bin/kill -0") == 1
+    assert workflow.count("trace_is_alive") >= 5
+    for marker in (
+        "bounded_stop_and_reap",
+        "wait_for_trace_exit",
+        "reap_confirmed_trace",
+        "fs_usage liveness probe failed",
+        "failed to send fs_usage signal",
+        "for ((trace_wait = 1; trace_wait <=",
+    ):
+        assert marker in workflow
+    stop = workflow.split("bounded_stop_and_reap()", 1)[1].split(
+        "assert_exec_trace_alive()", 1
+    )[0]
+    assert "if ! trace_is_alive" not in stop
+    assert "trace_is_alive || probe_status=$?" in stop
+    assert "wait_for_trace_exit || wait_status=$?" in stop
+    assert "for signal_name in INT TERM KILL" in stop
+    assert workflow.count('wait "${trace_pid}"') == 1
+    reap = workflow.split("reap_confirmed_trace()", 1)[1].split(
+        "bounded_stop_and_reap()", 1
+    )[0]
+    assert 'wait "${trace_pid}" || true' in reap
+    unexpected = workflow.split("assert_exec_trace_alive()", 1)[1].split(
+        "start_exec_trace()", 1
+    )[0]
+    assert "bounded_stop_and_reap" in unexpected
 
 
 def test_smoke_restores_trimmed_keychain_paths_or_fails_closed() -> None:
