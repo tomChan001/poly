@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use super::process::{
     drain_stderr, launch_runtime, read_runtime_event, DiagnosticLog, LaunchError, ProcessError,
-    RuntimeLauncher, RuntimeStreamItem,
+    RunningRuntime, RuntimeLauncher, RuntimeStreamItem,
 };
 use super::protocol::{FailureCode, RuntimeEvent};
 use super::state::{Supervisor, SupervisorState, TransitionError};
@@ -195,6 +195,7 @@ pub struct RuntimeSupervisor<L, C> {
     application_support: PathBuf,
     policy: RestartPolicy,
     state: Supervisor,
+    terminal_failure: Option<RuntimeFailure>,
 }
 
 impl<L> RuntimeSupervisor<L, SystemClock>
@@ -239,6 +240,7 @@ where
             application_support,
             policy,
             state: Supervisor::new(),
+            terminal_failure: None,
         }
     }
 
@@ -249,6 +251,7 @@ where
     pub fn explicit_operator_retry(&mut self) -> Result<(), RuntimeSupervisorError> {
         self.state.reset_for_operator_retry()?;
         self.policy.explicit_retry();
+        self.terminal_failure = None;
         Ok(())
     }
 
@@ -256,6 +259,12 @@ where
         &mut self,
         notices: mpsc::Sender<RuntimeSupervisorNotice>,
     ) -> Result<SupervisionOutcome, RuntimeSupervisorError> {
+        if let Some(failure) = self.terminal_failure {
+            let _ = notices
+                .send(RuntimeSupervisorNotice::Terminal(failure))
+                .await;
+            return Ok(SupervisionOutcome::Terminal(failure));
+        }
         loop {
             let started = self.clock.now();
             let mut running =
@@ -316,19 +325,18 @@ where
 
                 match signal {
                     AttemptSignal::Stream(Ok(RuntimeStreamItem::Event(event))) => {
+                        if self.state.apply(event.clone()).is_err() {
+                            break ObservedFailure {
+                                failure: RuntimeFailure::Protocol,
+                                child_exited: false,
+                            };
+                        }
                         let _ = notices
                             .send(RuntimeSupervisorNotice::Runtime(event.clone()))
                             .await;
                         if let RuntimeEvent::Failed { code, .. } = event {
-                            self.state.apply(event)?;
                             break ObservedFailure {
                                 failure: RuntimeFailure::Reported(code),
-                                child_exited: false,
-                            };
-                        }
-                        if self.state.apply(event).is_err() {
-                            break ObservedFailure {
-                                failure: RuntimeFailure::Protocol,
                                 child_exited: false,
                             };
                         }
@@ -337,9 +345,12 @@ where
                         let result = running.wait().await;
                         if result.is_ok() && matches!(self.state.state(), SupervisorState::Stopped)
                         {
-                            let _ = stderr_task.await;
-                            let _ = notices.send(RuntimeSupervisorNotice::Stopped).await;
-                            return Ok(SupervisionOutcome::Stopped);
+                            return self
+                                .complete_clean_stop(&notices, &mut running, stderr_task)
+                                .await;
+                        }
+                        if result.is_err() {
+                            let _ = running.force_owned_cleanup().await;
                         }
                         break ObservedFailure {
                             failure: RuntimeFailure::UnexpectedExit,
@@ -355,9 +366,12 @@ where
                     AttemptSignal::Exit(result) => {
                         if result.is_ok() && matches!(self.state.state(), SupervisorState::Stopped)
                         {
-                            let _ = stderr_task.await;
-                            let _ = notices.send(RuntimeSupervisorNotice::Stopped).await;
-                            return Ok(SupervisionOutcome::Stopped);
+                            return self
+                                .complete_clean_stop(&notices, &mut running, stderr_task)
+                                .await;
+                        }
+                        if result.is_err() {
+                            let _ = running.force_owned_cleanup().await;
                         }
                         break ObservedFailure {
                             failure: RuntimeFailure::UnexpectedExit,
@@ -368,12 +382,29 @@ where
             };
 
             if !observed.child_exited {
-                let _ = running.shutdown().await;
+                if observed.failure == RuntimeFailure::Protocol {
+                    let _ = running.force_owned_cleanup().await;
+                } else {
+                    let _ = running.shutdown().await;
+                }
             }
-            if stderr_task.await.is_err() {
-                return self
-                    .publish_terminal(&notices, RuntimeFailure::ResourceMissing)
-                    .await;
+            match stderr_task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    let _ = running.force_owned_cleanup().await;
+                    let failure = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                        RuntimeFailure::PermissionDenied
+                    } else {
+                        RuntimeFailure::ResourceMissing
+                    };
+                    return self.publish_terminal(&notices, failure).await;
+                }
+                Err(_) => {
+                    let _ = running.force_owned_cleanup().await;
+                    return self
+                        .publish_terminal(&notices, RuntimeFailure::ResourceMissing)
+                        .await;
+                }
             }
 
             if classify_failure(&observed.failure) == FailureDisposition::Terminal {
@@ -403,12 +434,33 @@ where
     ) -> Result<SupervisionOutcome, RuntimeSupervisorError> {
         if !matches!(self.state.state(), SupervisorState::Failed { .. }) {
             let (code, detail) = failure_state(&failure);
-            self.state.mark_terminal_failure(code, detail.to_owned())?;
+            self.state.mark_terminal_failure(code, detail.to_owned());
         }
+        self.terminal_failure = Some(failure);
         let _ = notices
             .send(RuntimeSupervisorNotice::Terminal(failure))
             .await;
         Ok(SupervisionOutcome::Terminal(failure))
+    }
+
+    async fn complete_clean_stop(
+        &mut self,
+        notices: &mpsc::Sender<RuntimeSupervisorNotice>,
+        running: &mut RunningRuntime,
+        stderr_task: tokio::task::JoinHandle<std::io::Result<()>>,
+    ) -> Result<SupervisionOutcome, RuntimeSupervisorError> {
+        let failure = match stderr_task.await {
+            Ok(Ok(())) => {
+                let _ = notices.send(RuntimeSupervisorNotice::Stopped).await;
+                return Ok(SupervisionOutcome::Stopped);
+            }
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                RuntimeFailure::PermissionDenied
+            }
+            Ok(Err(_)) | Err(_) => RuntimeFailure::ResourceMissing,
+        };
+        let _ = running.force_owned_cleanup().await;
+        self.publish_terminal(notices, failure).await
     }
 }
 
@@ -483,6 +535,8 @@ mod tests {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
         uptime: Duration,
+        wait_error: bool,
+        stderr_error: Option<io::ErrorKind>,
     }
 
     impl ChildScript {
@@ -491,6 +545,28 @@ mod tests {
                 stdout: stdout.as_bytes().to_vec(),
                 stderr: Vec::new(),
                 uptime,
+                wait_error: false,
+                stderr_error: None,
+            }
+        }
+
+        fn wait_error() -> Self {
+            Self {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                uptime: Duration::ZERO,
+                wait_error: true,
+                stderr_error: None,
+            }
+        }
+
+        fn stderr_error(kind: io::ErrorKind) -> Self {
+            Self {
+                stdout: b"{\"version\":1,\"state\":\"initializing\"}\n".to_vec(),
+                stderr: Vec::new(),
+                uptime: Duration::ZERO,
+                wait_error: false,
+                stderr_error: Some(kind),
             }
         }
     }
@@ -542,6 +618,8 @@ mod tests {
         stdout: Option<Vec<u8>>,
         stderr: Option<Vec<u8>>,
         uptime: Duration,
+        wait_error: bool,
+        stderr_error: Option<io::ErrorKind>,
     }
 
     impl RuntimeLauncher for FakeLauncher {
@@ -560,6 +638,8 @@ mod tests {
                 stdout: Some(script.stdout),
                 stderr: Some(script.stderr),
                 uptime: script.uptime,
+                wait_error: script.wait_error,
+                stderr_error: script.stderr_error,
             }))
         }
     }
@@ -580,17 +660,25 @@ mod tests {
         }
 
         fn take_stderr(&mut self) -> Option<Box<dyn AsyncBufRead + Send + Unpin>> {
+            if let Some(kind) = self.stderr_error.take() {
+                return Some(Box::new(BufReader::new(FailingReader { kind })));
+            }
             self.stderr.take().map(|bytes| {
                 Box::new(BufReader::new(Cursor::new(bytes))) as Box<dyn AsyncBufRead + Send + Unpin>
             })
         }
 
-        fn wait<'a>(&'a mut self) -> IoFuture<'a> {
+        fn wait_for_exit_preserving_stdin<'a>(&'a mut self) -> IoFuture<'a> {
             let clock = self.clock.clone();
             let uptime = self.uptime;
+            let wait_error = self.wait_error;
             Box::pin(async move {
                 clock.inner.lock().unwrap().now += uptime;
-                Ok(())
+                if wait_error {
+                    Err(io::Error::other("wait failed"))
+                } else {
+                    Ok(())
+                }
             })
         }
 
@@ -600,6 +688,20 @@ mod tests {
                 state.lock().unwrap().kills += 1;
                 Ok(())
             })
+        }
+    }
+
+    struct FailingReader {
+        kind: io::ErrorKind,
+    }
+
+    impl tokio::io::AsyncRead for FailingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+            _buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Err(io::Error::new(self.kind, "stderr failed")))
         }
     }
 
@@ -774,6 +876,13 @@ mod tests {
             }
         }
         assert_eq!(restarts.len(), 3);
+
+        let (sender, _receiver) = mpsc::channel(4);
+        let second = runtime()
+            .block_on(supervisor.supervise_until_terminal(sender))
+            .unwrap();
+        assert_eq!(second, outcome);
+        assert_eq!(state.lock().unwrap().launches, 4);
         std::fs::remove_dir_all(support_dir).unwrap();
     }
 
@@ -827,6 +936,148 @@ mod tests {
                 ..
             })
         ));
+        std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_transition_is_not_published_and_becomes_controlled_protocol_terminal() {
+        let stdout = "{\"version\":1,\"state\":\"ready\",\"port\":49152,\"bootstrap_path\":\"/desktop/bootstrap/safe\"}\n";
+        let scripts = vec![ChildScript::crash(stdout, Duration::ZERO)];
+        let (mut supervisor, state, _clock, support_dir) =
+            fake_supervisor(scripts, "invalid-transition");
+        let (sender, mut receiver) = mpsc::channel(8);
+
+        let outcome = runtime()
+            .block_on(supervisor.supervise_until_terminal(sender))
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            SupervisionOutcome::Terminal(RuntimeFailure::Protocol)
+        );
+        assert_eq!(state.lock().unwrap().launches, 1);
+        assert_eq!(state.lock().unwrap().kills, 1);
+        assert!(!matches!(
+            receiver.try_recv().unwrap(),
+            RuntimeSupervisorNotice::Runtime(RuntimeEvent::Ready { .. })
+        ));
+        std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
+    fn failed_event_before_initializing_is_controlled_protocol_terminal() {
+        let stdout = "{\"version\":1,\"state\":\"failed\",\"code\":\"migration_failed\",\"detail\":\"failed\"}\n";
+        let scripts = vec![ChildScript::crash(stdout, Duration::ZERO)];
+        let (mut supervisor, state, _clock, support_dir) =
+            fake_supervisor(scripts, "invalid-failed-event");
+        let (sender, mut receiver) = mpsc::channel(8);
+
+        let outcome = runtime().block_on(supervisor.supervise_until_terminal(sender));
+
+        assert_eq!(
+            outcome.unwrap(),
+            SupervisionOutcome::Terminal(RuntimeFailure::Protocol)
+        );
+        assert_eq!(state.lock().unwrap().kills, 1);
+        assert!(!matches!(
+            receiver.try_recv().unwrap(),
+            RuntimeSupervisorNotice::Runtime(RuntimeEvent::Failed { .. })
+        ));
+        std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_transition_after_shutdown_state_is_controlled_protocol_terminal() {
+        let stdout = concat!(
+            "{\"version\":1,\"state\":\"initializing\"}\n",
+            "{\"version\":1,\"state\":\"shutting_down\"}\n",
+            "{\"version\":1,\"state\":\"ready\",\"port\":49152,\"bootstrap_path\":\"/desktop/bootstrap/safe\"}\n"
+        );
+        let scripts = vec![ChildScript::crash(stdout, Duration::ZERO)];
+        let (mut supervisor, state, _clock, support_dir) =
+            fake_supervisor(scripts, "invalid-after-shutdown");
+        let (sender, _receiver) = mpsc::channel(8);
+
+        let outcome = runtime().block_on(supervisor.supervise_until_terminal(sender));
+
+        assert_eq!(
+            outcome.unwrap(),
+            SupervisionOutcome::Terminal(RuntimeFailure::Protocol)
+        );
+        assert_eq!(state.lock().unwrap().kills, 1);
+        std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
+    fn wait_error_forces_owned_cleanup_before_retrying() {
+        let scripts = vec![
+            ChildScript::wait_error(),
+            ChildScript::crash(
+                concat!(
+                    "{\"version\":1,\"state\":\"initializing\"}\n",
+                    "{\"version\":1,\"state\":\"failed\",\"code\":\"migration_failed\",\"detail\":\"failed\"}\n"
+                ),
+                Duration::ZERO,
+            ),
+        ];
+        let (mut supervisor, state, _clock, support_dir) = fake_supervisor(scripts, "wait-error");
+        let (sender, _receiver) = mpsc::channel(8);
+
+        runtime()
+            .block_on(supervisor.supervise_until_terminal(sender))
+            .unwrap();
+
+        assert!(state.lock().unwrap().kills >= 1);
+        std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
+    fn stderr_inner_error_is_terminal_and_forces_owned_cleanup() {
+        let scripts = vec![ChildScript::stderr_error(io::ErrorKind::PermissionDenied)];
+        let (mut supervisor, state, clock, support_dir) = fake_supervisor(scripts, "stderr-error");
+        let (sender, _receiver) = mpsc::channel(8);
+
+        let outcome = runtime()
+            .block_on(supervisor.supervise_until_terminal(sender))
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            SupervisionOutcome::Terminal(RuntimeFailure::PermissionDenied)
+        );
+        assert_eq!(state.lock().unwrap().kills, 1);
+        assert!(clock.inner.lock().unwrap().sleeps.is_empty());
+        std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
+    fn stderr_inner_error_overrides_an_otherwise_clean_stop() {
+        let scripts = vec![ChildScript {
+            stdout: concat!(
+                "{\"version\":1,\"state\":\"initializing\"}\n",
+                "{\"version\":1,\"state\":\"shutting_down\"}\n",
+                "{\"version\":1,\"state\":\"stopped\"}\n"
+            )
+            .as_bytes()
+            .to_vec(),
+            stderr: Vec::new(),
+            uptime: Duration::ZERO,
+            wait_error: false,
+            stderr_error: Some(io::ErrorKind::PermissionDenied),
+        }];
+        let (mut supervisor, state, _clock, support_dir) =
+            fake_supervisor(scripts, "stderr-clean-stop");
+        let (sender, _receiver) = mpsc::channel(8);
+
+        let outcome = runtime()
+            .block_on(supervisor.supervise_until_terminal(sender))
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            SupervisionOutcome::Terminal(RuntimeFailure::PermissionDenied)
+        );
+        assert_eq!(state.lock().unwrap().kills, 1);
         std::fs::remove_dir_all(support_dir).unwrap();
     }
 

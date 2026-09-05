@@ -77,21 +77,8 @@ impl Supervisor {
         Ok(())
     }
 
-    pub fn mark_terminal_failure(
-        &mut self,
-        code: FailureCode,
-        detail: String,
-    ) -> Result<(), TransitionError> {
-        if matches!(
-            self.state,
-            SupervisorState::ShuttingDown | SupervisorState::Stopped
-        ) {
-            return Err(TransitionError::TerminalFrom {
-                from: self.state.clone(),
-            });
-        }
+    pub fn mark_terminal_failure(&mut self, code: FailureCode, detail: String) {
         self.state = SupervisorState::Failed { code, detail };
-        Ok(())
     }
 
     pub fn apply(&mut self, event: RuntimeEvent) -> Result<SupervisorAction, TransitionError> {
@@ -196,6 +183,4 @@ pub enum TransitionError {
     RetryFrom { from: SupervisorState, attempt: u8 },
     #[error("cannot reset runtime supervisor from {from:?}")]
     ResetFrom { from: SupervisorState },
-    #[error("cannot record terminal runtime failure from {from:?}")]
-    TerminalFrom { from: SupervisorState },
 }

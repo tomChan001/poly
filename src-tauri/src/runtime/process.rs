@@ -60,7 +60,9 @@ pub trait RuntimeChild: Send {
     fn write_stdin<'a>(&'a mut self, bytes: &'a [u8]) -> ChildFuture<'a>;
     fn take_stdout(&mut self) -> Option<Box<dyn AsyncBufRead + Send + Unpin>>;
     fn take_stderr(&mut self) -> Option<Box<dyn AsyncBufRead + Send + Unpin>>;
-    fn wait<'a>(&'a mut self) -> ChildFuture<'a>;
+    /// Monitoring exit must never close or take the parent-owned stdin lease.
+    /// The future is cancellation-safe and later `write_stdin` calls remain valid.
+    fn wait_for_exit_preserving_stdin<'a>(&'a mut self) -> ChildFuture<'a>;
     fn kill_owned<'a>(&'a mut self) -> ChildFuture<'a>;
 }
 
@@ -208,7 +210,17 @@ impl RunningRuntime {
     }
 
     pub async fn wait(&mut self) -> Result<(), ProcessError> {
-        self.child.wait().await.map_err(ProcessError::Io)
+        self.child
+            .wait_for_exit_preserving_stdin()
+            .await
+            .map_err(ProcessError::Io)
+    }
+
+    pub async fn force_owned_cleanup(&mut self) -> Result<(), ProcessError> {
+        self.child
+            .kill_owned()
+            .await
+            .map_err(ProcessError::ForcedCleanup)
     }
 
     pub async fn shutdown_with_timeout(&mut self, timeout: Duration) -> Result<(), ProcessError> {
@@ -225,7 +237,9 @@ impl RunningRuntime {
         }
 
         if !timeout.is_zero() {
-            if let Ok(result) = tokio::time::timeout(timeout, self.child.wait()).await {
+            if let Ok(result) =
+                tokio::time::timeout(timeout, self.child.wait_for_exit_preserving_stdin()).await
+            {
                 if result.is_ok() {
                     return Ok(());
                 }
@@ -417,16 +431,19 @@ fn configure_process_group(_command: &mut Command) {}
 
 struct ProductionChild {
     child: Child,
+    stdin: Option<tokio::process::ChildStdin>,
     #[cfg(unix)]
     process_group: Option<i32>,
 }
 
 impl ProductionChild {
-    fn new(child: Child) -> Self {
+    fn new(mut child: Child) -> Self {
         #[cfg(unix)]
         let process_group = child.id().and_then(|id| i32::try_from(id).ok());
+        let stdin = child.stdin.take();
         Self {
             child,
+            stdin,
             #[cfg(unix)]
             process_group,
         }
@@ -436,10 +453,10 @@ impl ProductionChild {
 impl RuntimeChild for ProductionChild {
     fn write_stdin<'a>(&'a mut self, bytes: &'a [u8]) -> ChildFuture<'a> {
         Box::pin(async move {
-            let stdin =
-                self.child.stdin.as_mut().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "stdin unavailable")
-                })?;
+            let stdin = self
+                .stdin
+                .as_mut()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "stdin unavailable"))?;
             tokio::io::AsyncWriteExt::write_all(stdin, bytes).await?;
             tokio::io::AsyncWriteExt::flush(stdin).await
         })
@@ -459,7 +476,7 @@ impl RuntimeChild for ProductionChild {
             .map(|stderr| Box::new(BufReader::new(stderr)) as Box<_>)
     }
 
-    fn wait<'a>(&'a mut self) -> ChildFuture<'a> {
+    fn wait_for_exit_preserving_stdin<'a>(&'a mut self) -> ChildFuture<'a> {
         Box::pin(async move { self.child.wait().await.map(|_| ()) })
     }
 
@@ -656,6 +673,12 @@ pub fn redact_diagnostic_line(line: &str) -> String {
         }
     }
 
+    if contains_sensitive_assignment(content, SENSITIVE_KEYS) {
+        let mut redacted = "[REDACTED]".to_owned();
+        redacted.push_str(line_ending);
+        return redacted;
+    }
+
     let mut result = Vec::new();
     let mut suppress_value = false;
     for word in content.split_whitespace() {
@@ -682,6 +705,43 @@ pub fn redact_diagnostic_line(line: &str) -> String {
     let mut redacted = result.join(" ");
     redacted.push_str(line_ending);
     redacted
+}
+
+fn contains_sensitive_assignment(content: &str, sensitive_keys: &[&str]) -> bool {
+    let lowercase = content.to_ascii_lowercase();
+    for key in sensitive_keys {
+        let mut remainder = lowercase.as_str();
+        let mut offset = 0;
+        while let Some(relative_index) = remainder.find(key) {
+            let index = offset + relative_index;
+            let before_is_boundary = index == 0
+                || !lowercase.as_bytes()[index - 1].is_ascii_alphanumeric()
+                    && lowercase.as_bytes()[index - 1] != b'_';
+            let mut cursor = index + key.len();
+            let after_is_boundary = cursor == lowercase.len()
+                || !lowercase.as_bytes()[cursor].is_ascii_alphanumeric()
+                    && lowercase.as_bytes()[cursor] != b'_';
+            if before_is_boundary && after_is_boundary {
+                if lowercase.as_bytes().get(cursor) == Some(&b'"') {
+                    cursor += 1;
+                }
+                while lowercase
+                    .as_bytes()
+                    .get(cursor)
+                    .is_some_and(u8::is_ascii_whitespace)
+                {
+                    cursor += 1;
+                }
+                if matches!(lowercase.as_bytes().get(cursor), Some(b':' | b'=')) {
+                    return true;
+                }
+            }
+            let next = index + key.len();
+            offset = next;
+            remainder = &lowercase[next..];
+        }
+    }
+    false
 }
 
 fn redact_json_value(value: &mut serde_json::Value, sensitive_keys: &[&str]) {
@@ -796,7 +856,7 @@ mod tests {
             None
         }
 
-        fn wait<'a>(&'a mut self) -> IoFuture<'a> {
+        fn wait_for_exit_preserving_stdin<'a>(&'a mut self) -> IoFuture<'a> {
             let result = self.0.lock().unwrap().waits.pop_front().unwrap_or(Ok(()));
             Box::pin(async move { result })
         }
@@ -936,16 +996,29 @@ mod tests {
         for value in ["abc", "session", "pem", "hush", "sig", "tok"] {
             assert!(!redacted.contains(value), "leaked {value}: {redacted}");
         }
-        assert!(redacted.contains("safe=value"));
-        assert_eq!(redacted.matches("[REDACTED]").count(), 6);
+        assert!(redacted.contains("[REDACTED]"));
 
         for ambiguous in [
             "cookie: session=abc safe=value",
             "Authorization: Bearer abc next=x",
+            "token = split-secret safe=value",
+            "INFO {\"token\":\"prefixed-secret\",\"safe\":\"visible\"}",
+            "private_key : pem-secret",
+            "SeCrEt = hush-secret",
+            "signature: signature-secret",
         ] {
             let redacted = redact_diagnostic_line(ambiguous);
-            assert!(!redacted.contains("session=abc"), "leaked: {redacted}");
-            assert!(!redacted.contains("Bearer abc"), "leaked: {redacted}");
+            for secret in [
+                "session=abc",
+                "Bearer abc",
+                "split-secret",
+                "prefixed-secret",
+                "pem-secret",
+                "hush-secret",
+                "signature-secret",
+            ] {
+                assert!(!redacted.contains(secret), "leaked {secret}: {redacted}");
+            }
         }
 
         let json = redact_diagnostic_line(
@@ -1103,5 +1176,89 @@ mod tests {
             }
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    struct LeaseState {
+        lease_open: bool,
+        writes: Vec<Vec<u8>>,
+        kills: usize,
+    }
+
+    struct LeaseLauncher(Arc<Mutex<LeaseState>>);
+
+    struct LeaseChild(Arc<Mutex<LeaseState>>);
+
+    impl RuntimeLauncher for LeaseLauncher {
+        fn launch(&self, _request: LaunchRequest) -> Result<Box<dyn RuntimeChild>, LaunchError> {
+            self.0.lock().unwrap().lease_open = true;
+            Ok(Box::new(LeaseChild(Arc::clone(&self.0))))
+        }
+    }
+
+    impl RuntimeChild for LeaseChild {
+        fn write_stdin<'a>(&'a mut self, bytes: &'a [u8]) -> IoFuture<'a> {
+            let state = Arc::clone(&self.0);
+            Box::pin(async move {
+                let mut state = state.lock().unwrap();
+                if !state.lease_open {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "lease closed"));
+                }
+                state.writes.push(bytes.to_vec());
+                Ok(())
+            })
+        }
+
+        fn take_stdout(&mut self) -> Option<Box<dyn AsyncBufRead + Send + Unpin>> {
+            None
+        }
+
+        fn take_stderr(&mut self) -> Option<Box<dyn AsyncBufRead + Send + Unpin>> {
+            None
+        }
+
+        fn wait_for_exit_preserving_stdin<'a>(&'a mut self) -> IoFuture<'a> {
+            Box::pin(std::future::pending())
+        }
+
+        fn kill_owned<'a>(&'a mut self) -> IoFuture<'a> {
+            let state = Arc::clone(&self.0);
+            Box::pin(async move {
+                let mut state = state.lock().unwrap();
+                state.kills += 1;
+                state.lease_open = false;
+                Ok(())
+            })
+        }
+    }
+
+    #[test]
+    fn cancelled_exit_monitor_preserves_parent_lease_for_later_shutdown() {
+        let state = Arc::new(Mutex::new(LeaseState {
+            lease_open: false,
+            writes: Vec::new(),
+            kills: 0,
+        }));
+        let launcher = LeaseLauncher(Arc::clone(&state));
+        let (data_dir, runtime_dir) = absolute_test_dirs();
+        let mut running = runtime()
+            .block_on(launch_runtime(&launcher, &data_dir, &runtime_dir))
+            .unwrap();
+
+        let quiet = runtime().block_on(async {
+            tokio::time::timeout(Duration::from_millis(1), running.wait()).await
+        });
+        assert!(quiet.is_err());
+        assert!(state.lock().unwrap().lease_open);
+
+        runtime()
+            .block_on(running.shutdown_with_timeout(Duration::ZERO))
+            .unwrap();
+        let state = state.lock().unwrap();
+        assert_eq!(state.writes.len(), 2);
+        assert_eq!(
+            state.writes[1],
+            b"{\"version\":1,\"command\":\"shutdown\"}\n"
+        );
+        assert_eq!(state.kills, 1);
     }
 }
