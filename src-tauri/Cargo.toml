@@ -3,7 +3,7 @@ name = "poly-desktop"
 version = "0.1.0"
 description = "Poly local desktop shell"
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.88"
 
 [lib]
 name = "poly_desktop_lib"

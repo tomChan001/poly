@@ -21,6 +21,8 @@ const STABLE_RUN: Duration = Duration::from_secs(5 * 60);
 const MAX_DELAY: Duration = Duration::from_secs(8);
 const MAX_JITTER: Duration = Duration::from_millis(250);
 
+type StderrDrain = Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JitterMode {
     Production,
@@ -262,9 +264,7 @@ where
         notices: mpsc::Sender<RuntimeSupervisorNotice>,
     ) -> Result<SupervisionOutcome, RuntimeSupervisorError> {
         if let Some(failure) = self.terminal_failure {
-            let _ = notices
-                .send(RuntimeSupervisorNotice::Terminal(failure))
-                .await;
+            publish_notice(&notices, RuntimeSupervisorNotice::Terminal(failure));
             return Ok(SupervisionOutcome::Terminal(failure));
         }
         loop {
@@ -274,7 +274,23 @@ where
                     Ok(running) => running,
                     Err(error) => {
                         let failure = classify_process_error(&error);
-                        return self.publish_terminal(&notices, failure).await;
+                        if classify_failure(&failure) == FailureDisposition::Terminal {
+                            return self.publish_terminal(&notices, failure).await;
+                        }
+                        match self.policy.record_crash(self.clock.now(), Duration::ZERO) {
+                            RestartDecision::Retry { attempt, delay } => {
+                                self.state.begin_restart(attempt)?;
+                                publish_notice(
+                                    &notices,
+                                    RuntimeSupervisorNotice::RestartScheduled { attempt, delay },
+                                );
+                                self.clock.sleep(delay).await;
+                                continue;
+                            }
+                            RestartDecision::Terminal => {
+                                return self.publish_terminal(&notices, failure).await;
+                            }
+                        }
                     }
                 };
 
@@ -314,14 +330,15 @@ where
                         return self.publish_terminal(&notices, failure).await;
                     }
                 };
-            let mut stderr_task = Some(tokio::spawn(drain_stderr(stderr, diagnostic_log)));
+            let mut stderr_drain =
+                Some(Box::pin(drain_stderr(stderr, diagnostic_log)) as StderrDrain);
 
             let observed = loop {
                 let mut event_future = Box::pin(read_runtime_event(&mut stdout));
                 let mut wait_future = Box::pin(running.wait());
                 let signal = poll_fn(|context| {
-                    if let Some(task) = stderr_task.as_mut() {
-                        if let std::task::Poll::Ready(result) = Pin::new(task).poll(context) {
+                    if let Some(task) = stderr_drain.as_mut() {
+                        if let std::task::Poll::Ready(result) = task.as_mut().poll(context) {
                             return std::task::Poll::Ready(AttemptSignal::Stderr(result));
                         }
                     }
@@ -338,22 +355,15 @@ where
                 drop(wait_future);
 
                 match signal {
-                    AttemptSignal::Stderr(Ok(Ok(()))) => {
-                        stderr_task = None;
+                    AttemptSignal::Stderr(Ok(())) => {
+                        stderr_drain = None;
                     }
-                    AttemptSignal::Stderr(Ok(Err(error))) => {
+                    AttemptSignal::Stderr(Err(error)) => {
+                        drop(stderr_drain.take());
                         let failure = if running.force_owned_cleanup().await.is_err() {
                             RuntimeFailure::CleanupFailed
                         } else {
                             classify_stderr_error(&error)
-                        };
-                        return self.publish_terminal(&notices, failure).await;
-                    }
-                    AttemptSignal::Stderr(Err(_)) => {
-                        let failure = if running.force_owned_cleanup().await.is_err() {
-                            RuntimeFailure::CleanupFailed
-                        } else {
-                            RuntimeFailure::ResourceMissing
                         };
                         return self.publish_terminal(&notices, failure).await;
                     }
@@ -362,15 +372,15 @@ where
                             break ObservedFailure {
                                 failure: RuntimeFailure::Protocol,
                                 child_exited: false,
+                                drop_stderr: true,
                             };
                         }
-                        let _ = notices
-                            .send(RuntimeSupervisorNotice::Runtime(event.clone()))
-                            .await;
+                        publish_notice(&notices, RuntimeSupervisorNotice::Runtime(event.clone()));
                         if let RuntimeEvent::Failed { code, .. } = event {
                             break ObservedFailure {
                                 failure: RuntimeFailure::Reported(code),
                                 child_exited: false,
+                                drop_stderr: false,
                             };
                         }
                     }
@@ -379,52 +389,45 @@ where
                         if result.is_ok() && matches!(self.state.state(), SupervisorState::Stopped)
                         {
                             return self
-                                .complete_clean_stop(&notices, &mut running, stderr_task)
+                                .complete_clean_stop(&notices, &mut running, stderr_drain)
                                 .await;
                         }
-                        if result.is_err() {
-                            let failure = if running.force_owned_cleanup().await.is_err() {
-                                RuntimeFailure::CleanupFailed
-                            } else {
-                                RuntimeFailure::UnexpectedExit
-                            };
-                            break ObservedFailure {
-                                failure,
-                                child_exited: true,
-                            };
+                        if running.force_owned_cleanup().await.is_err() {
+                            drop(stderr_drain.take());
+                            return self
+                                .publish_terminal(&notices, RuntimeFailure::CleanupFailed)
+                                .await;
                         }
                         break ObservedFailure {
                             failure: RuntimeFailure::UnexpectedExit,
                             child_exited: true,
+                            drop_stderr: true,
                         };
                     }
                     AttemptSignal::Stream(Err(_)) => {
                         break ObservedFailure {
                             failure: RuntimeFailure::Protocol,
                             child_exited: false,
+                            drop_stderr: true,
                         };
                     }
                     AttemptSignal::Exit(result) => {
                         if result.is_ok() && matches!(self.state.state(), SupervisorState::Stopped)
                         {
                             return self
-                                .complete_clean_stop(&notices, &mut running, stderr_task)
+                                .complete_clean_stop(&notices, &mut running, stderr_drain)
                                 .await;
                         }
-                        if result.is_err() {
-                            let failure = if running.force_owned_cleanup().await.is_err() {
-                                RuntimeFailure::CleanupFailed
-                            } else {
-                                RuntimeFailure::UnexpectedExit
-                            };
-                            break ObservedFailure {
-                                failure,
-                                child_exited: true,
-                            };
+                        if running.force_owned_cleanup().await.is_err() {
+                            drop(stderr_drain.take());
+                            return self
+                                .publish_terminal(&notices, RuntimeFailure::CleanupFailed)
+                                .await;
                         }
                         break ObservedFailure {
                             failure: RuntimeFailure::UnexpectedExit,
                             child_exited: true,
+                            drop_stderr: true,
                         };
                     }
                 }
@@ -445,29 +448,22 @@ where
                 }
             }
             if observed.failure == RuntimeFailure::CleanupFailed {
-                if let Some(stderr_task) = stderr_task.take() {
-                    stderr_task.abort();
-                }
+                drop(stderr_drain.take());
                 return self
                     .publish_terminal(&notices, RuntimeFailure::CleanupFailed)
                     .await;
             }
-            if let Some(stderr_task) = stderr_task {
-                match stderr_task.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
+            if observed.drop_stderr {
+                stderr_drain = None;
+            }
+            if let Some(stderr_drain) = stderr_drain {
+                match stderr_drain.await {
+                    Ok(()) => {}
+                    Err(error) => {
                         let failure = if running.force_owned_cleanup().await.is_err() {
                             RuntimeFailure::CleanupFailed
                         } else {
                             classify_stderr_error(&error)
-                        };
-                        return self.publish_terminal(&notices, failure).await;
-                    }
-                    Err(_) => {
-                        let failure = if running.force_owned_cleanup().await.is_err() {
-                            RuntimeFailure::CleanupFailed
-                        } else {
-                            RuntimeFailure::ResourceMissing
                         };
                         return self.publish_terminal(&notices, failure).await;
                     }
@@ -482,9 +478,10 @@ where
             match self.policy.record_crash(self.clock.now(), uptime) {
                 RestartDecision::Retry { attempt, delay } => {
                     self.state.begin_restart(attempt)?;
-                    let _ = notices
-                        .send(RuntimeSupervisorNotice::RestartScheduled { attempt, delay })
-                        .await;
+                    publish_notice(
+                        &notices,
+                        RuntimeSupervisorNotice::RestartScheduled { attempt, delay },
+                    );
                     self.clock.sleep(delay).await;
                 }
                 RestartDecision::Terminal => {
@@ -504,9 +501,7 @@ where
             self.state.mark_terminal_failure(code, detail.to_owned());
         }
         self.terminal_failure = Some(failure);
-        let _ = notices
-            .send(RuntimeSupervisorNotice::Terminal(failure))
-            .await;
+        publish_notice(notices, RuntimeSupervisorNotice::Terminal(failure));
         Ok(SupervisionOutcome::Terminal(failure))
     }
 
@@ -514,40 +509,40 @@ where
         &mut self,
         notices: &mpsc::Sender<RuntimeSupervisorNotice>,
         running: &mut RunningRuntime,
-        stderr_task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+        stderr_drain: Option<StderrDrain>,
     ) -> Result<SupervisionOutcome, RuntimeSupervisorError> {
-        let Some(stderr_task) = stderr_task else {
-            let _ = notices.send(RuntimeSupervisorNotice::Stopped).await;
-            return Ok(SupervisionOutcome::Stopped);
-        };
-        let failure = match stderr_task.await {
-            Ok(Ok(())) => {
-                let _ = notices.send(RuntimeSupervisorNotice::Stopped).await;
-                return Ok(SupervisionOutcome::Stopped);
-            }
-            Ok(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                RuntimeFailure::PermissionDenied
-            }
-            Ok(Err(_)) | Err(_) => RuntimeFailure::ResourceMissing,
-        };
         if running.force_owned_cleanup().await.is_err() {
+            drop(stderr_drain);
             return self
                 .publish_terminal(notices, RuntimeFailure::CleanupFailed)
                 .await;
         }
-        self.publish_terminal(notices, failure).await
+        drop(stderr_drain);
+        publish_notice(notices, RuntimeSupervisorNotice::Stopped);
+        Ok(SupervisionOutcome::Stopped)
     }
 }
 
 struct ObservedFailure {
     failure: RuntimeFailure,
     child_exited: bool,
+    drop_stderr: bool,
 }
 
 enum AttemptSignal {
-    Stderr(Result<std::io::Result<()>, tokio::task::JoinError>),
+    Stderr(std::io::Result<()>),
     Stream(Result<RuntimeStreamItem, ProcessError>),
     Exit(Result<(), ProcessError>),
+}
+
+fn publish_notice(
+    notices: &mpsc::Sender<RuntimeSupervisorNotice>,
+    notice: RuntimeSupervisorNotice,
+) {
+    match notices.try_send(notice) {
+        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
+    }
 }
 
 fn classify_stderr_error(error: &std::io::Error) -> RuntimeFailure {
@@ -561,6 +556,25 @@ fn classify_stderr_error(error: &std::io::Error) -> RuntimeFailure {
 fn classify_process_error(error: &ProcessError) -> RuntimeFailure {
     match error {
         ProcessError::Launch(LaunchError::NotExecutable) => RuntimeFailure::PermissionDenied,
+        ProcessError::Launch(LaunchError::Io(source))
+            if source.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            RuntimeFailure::PermissionDenied
+        }
+        ProcessError::StartCommandWrite {
+            cleanup_failed: true,
+            ..
+        } => RuntimeFailure::CleanupFailed,
+        ProcessError::StartCommandWrite {
+            kind: std::io::ErrorKind::BrokenPipe,
+            cleanup_failed: false,
+        } => RuntimeFailure::UnexpectedExit,
+        ProcessError::StartCommandWrite { kind, .. }
+            if *kind == std::io::ErrorKind::PermissionDenied =>
+        {
+            RuntimeFailure::PermissionDenied
+        }
+        ProcessError::StartCommandWrite { .. } => RuntimeFailure::ResourceMissing,
         ProcessError::Launch(_)
         | ProcessError::DirectoryNotAbsolute(_)
         | ProcessError::TokenGeneration
@@ -638,6 +652,7 @@ mod tests {
         wait_pending: bool,
         kill_error: bool,
         stderr_pending: bool,
+        start_write_error: bool,
     }
 
     impl ChildScript {
@@ -652,6 +667,7 @@ mod tests {
                 wait_pending: false,
                 kill_error: false,
                 stderr_pending: false,
+                start_write_error: false,
             }
         }
 
@@ -666,6 +682,7 @@ mod tests {
                 wait_pending: false,
                 kill_error: false,
                 stderr_pending: false,
+                start_write_error: false,
             }
         }
 
@@ -680,6 +697,7 @@ mod tests {
                 wait_pending: false,
                 kill_error: false,
                 stderr_pending: false,
+                start_write_error: false,
             }
         }
 
@@ -694,6 +712,7 @@ mod tests {
                 wait_pending: true,
                 kill_error: false,
                 stderr_pending: false,
+                start_write_error: false,
             }
         }
 
@@ -708,6 +727,7 @@ mod tests {
                 wait_pending: false,
                 kill_error: true,
                 stderr_pending: false,
+                start_write_error: false,
             }
         }
 
@@ -715,6 +735,21 @@ mod tests {
             Self {
                 stderr_pending: true,
                 ..Self::wait_and_kill_error()
+            }
+        }
+
+        fn start_write_error() -> Self {
+            Self {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                uptime: Duration::ZERO,
+                wait_error: false,
+                stderr_error: None,
+                stdout_pending: false,
+                wait_pending: false,
+                kill_error: false,
+                stderr_pending: false,
+                start_write_error: true,
             }
         }
     }
@@ -725,6 +760,8 @@ mod tests {
         launches: usize,
         writes: Vec<Vec<u8>>,
         kills: usize,
+        drop_signals: usize,
+        stderr_drops: usize,
     }
 
     #[derive(Clone, Default)]
@@ -772,6 +809,7 @@ mod tests {
         wait_pending: bool,
         kill_error: bool,
         stderr_pending: bool,
+        start_write_error: bool,
     }
 
     impl RuntimeLauncher for FakeLauncher {
@@ -796,6 +834,7 @@ mod tests {
                 wait_pending: script.wait_pending,
                 kill_error: script.kill_error,
                 stderr_pending: script.stderr_pending,
+                start_write_error: script.start_write_error,
             }))
         }
     }
@@ -803,9 +842,17 @@ mod tests {
     impl RuntimeChild for FakeChild {
         fn write_stdin<'a>(&'a mut self, bytes: &'a [u8]) -> IoFuture<'a> {
             let state = Arc::clone(&self.state);
+            let start_write_error = self.start_write_error;
             Box::pin(async move {
                 state.lock().unwrap().writes.push(bytes.to_vec());
-                Ok(())
+                if start_write_error {
+                    Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "token=start-secret",
+                    ))
+                } else {
+                    Ok(())
+                }
             })
         }
 
@@ -823,7 +870,9 @@ mod tests {
                 return Some(Box::new(BufReader::new(FailingReader { kind })));
             }
             if self.stderr_pending {
-                return Some(Box::new(BufReader::new(PendingReader)));
+                return Some(Box::new(BufReader::new(TrackedPendingReader(Arc::clone(
+                    &self.state,
+                )))));
             }
             self.stderr.take().map(|bytes| {
                 Box::new(BufReader::new(Cursor::new(bytes))) as Box<dyn AsyncBufRead + Send + Unpin>
@@ -860,6 +909,10 @@ mod tests {
                 }
             })
         }
+
+        fn signal_owned_on_drop(&mut self) {
+            self.state.lock().unwrap().drop_signals += 1;
+        }
     }
 
     struct FailingReader {
@@ -868,7 +921,25 @@ mod tests {
 
     struct PendingReader;
 
+    struct TrackedPendingReader(Arc<Mutex<LauncherState>>);
+
+    impl Drop for TrackedPendingReader {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().stderr_drops += 1;
+        }
+    }
+
     impl tokio::io::AsyncRead for PendingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+            _buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncRead for TrackedPendingReader {
         fn poll_read(
             self: Pin<&mut Self>,
             _context: &mut std::task::Context<'_>,
@@ -1067,7 +1138,9 @@ mod tests {
             .unwrap();
         assert_eq!(second, outcome);
         assert_eq!(state.lock().unwrap().launches, 4);
-        std::fs::remove_dir_all(support_dir).unwrap();
+        if support_dir.exists() {
+            std::fs::remove_dir_all(support_dir).unwrap();
+        }
     }
 
     #[test]
@@ -1086,6 +1159,34 @@ mod tests {
             SupervisionOutcome::Terminal(RuntimeFailure::UnexpectedExit)
         );
         assert_eq!(state.lock().unwrap().launches, 4);
+        std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
+    fn cancelling_active_supervision_signals_the_exact_owned_child() {
+        let script = ChildScript {
+            stdout_pending: true,
+            wait_pending: true,
+            stderr_pending: true,
+            ..ChildScript::crash("", Duration::ZERO)
+        };
+        let (mut supervisor, state, _clock, support_dir) =
+            fake_supervisor(vec![script], "cancel-owned-child");
+        let (sender, _receiver) = mpsc::channel(1);
+
+        let executor = runtime();
+        let result = executor.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                supervisor.supervise_until_terminal(sender),
+            )
+            .await
+        });
+
+        assert!(result.is_err());
+        assert_eq!(state.lock().unwrap().drop_signals, 1);
+        assert_eq!(state.lock().unwrap().stderr_drops, 1);
+        assert_eq!(state.lock().unwrap().launches, 1);
         std::fs::remove_dir_all(support_dir).unwrap();
     }
 
@@ -1252,6 +1353,7 @@ mod tests {
             wait_pending: false,
             kill_error: false,
             stderr_pending: false,
+            start_write_error: false,
         }];
         let (mut supervisor, state, _clock, support_dir) =
             fake_supervisor(scripts, "stderr-clean-stop");
@@ -1370,6 +1472,138 @@ mod tests {
             RuntimeSupervisorNotice::Terminal(RuntimeFailure::CleanupFailed)
         ));
         std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
+    fn leader_exit_cleans_descendants_before_pending_stderr_and_restart() {
+        let scripts = vec![
+            ChildScript {
+                stderr_pending: true,
+                ..ChildScript::crash("", Duration::ZERO)
+            },
+            ChildScript::crash(
+                concat!(
+                    "{\"version\":1,\"state\":\"initializing\"}\n",
+                    "{\"version\":1,\"state\":\"failed\",\"code\":\"migration_failed\",\"detail\":\"failed\"}\n"
+                ),
+                Duration::ZERO,
+            ),
+        ];
+        let (mut supervisor, state, _clock, support_dir) =
+            fake_supervisor(scripts, "leader-exit-pending-stderr");
+        let (sender, _receiver) = mpsc::channel(16);
+
+        let timed = runtime().block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                supervisor.supervise_until_terminal(sender),
+            )
+            .await
+        });
+
+        assert!(timed.is_ok());
+        assert_eq!(state.lock().unwrap().launches, 2);
+        assert!(state.lock().unwrap().kills >= 1);
+        std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
+    fn verified_stopped_does_not_wait_for_descendant_held_stderr() {
+        let scripts = vec![ChildScript {
+            stdout: concat!(
+                "{\"version\":1,\"state\":\"initializing\"}\n",
+                "{\"version\":1,\"state\":\"shutting_down\"}\n",
+                "{\"version\":1,\"state\":\"stopped\"}\n"
+            )
+            .as_bytes()
+            .to_vec(),
+            stderr_pending: true,
+            ..ChildScript::crash("", Duration::ZERO)
+        }];
+        let (mut supervisor, state, _clock, support_dir) =
+            fake_supervisor(scripts, "stopped-pending-stderr");
+        let (sender, _receiver) = mpsc::channel(8);
+
+        let timed = runtime().block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                supervisor.supervise_until_terminal(sender),
+            )
+            .await
+        });
+
+        assert_eq!(timed.unwrap().unwrap(), SupervisionOutcome::Stopped);
+        assert_eq!(state.lock().unwrap().kills, 1);
+        std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
+    fn full_notice_channel_never_blocks_process_ownership_loop() {
+        let initializing = "{\"version\":1,\"state\":\"initializing\"}\n";
+        let scripts = (0..4)
+            .map(|_| ChildScript::crash(initializing, Duration::ZERO))
+            .collect();
+        let (mut supervisor, state, _clock, support_dir) =
+            fake_supervisor(scripts, "notice-backpressure");
+        let (sender, _ignored_receiver) = mpsc::channel(1);
+
+        let timed = runtime().block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                supervisor.supervise_until_terminal(sender),
+            )
+            .await
+        });
+
+        assert_eq!(
+            timed.unwrap().unwrap(),
+            SupervisionOutcome::Terminal(RuntimeFailure::UnexpectedExit)
+        );
+        assert_eq!(state.lock().unwrap().launches, 4);
+        std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
+    fn broken_pipe_start_write_uses_retry_policy_and_latches_on_fourth() {
+        let scripts = (0..4).map(|_| ChildScript::start_write_error()).collect();
+        let (mut supervisor, state, clock, support_dir) =
+            fake_supervisor(scripts, "start-broken-pipe");
+        let (sender, _receiver) = mpsc::channel(16);
+
+        let outcome = runtime()
+            .block_on(supervisor.supervise_until_terminal(sender))
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            SupervisionOutcome::Terminal(RuntimeFailure::UnexpectedExit)
+        );
+        assert_eq!(state.lock().unwrap().launches, 4);
+        assert_eq!(state.lock().unwrap().kills, 4);
+        assert_eq!(
+            clock.inner.lock().unwrap().sleeps,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4)
+            ]
+        );
+        if support_dir.exists() {
+            std::fs::remove_dir_all(support_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn nested_launch_permission_error_is_terminal_permission_failure() {
+        let error = ProcessError::Launch(LaunchError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "path denied",
+        )));
+
+        assert_eq!(
+            classify_process_error(&error),
+            RuntimeFailure::PermissionDenied
+        );
     }
 
     #[test]

@@ -64,6 +64,9 @@ pub trait RuntimeChild: Send {
     /// The future is cancellation-safe and later `write_stdin` calls remain valid.
     fn wait_for_exit_preserving_stdin<'a>(&'a mut self) -> ChildFuture<'a>;
     fn kill_owned<'a>(&'a mut self) -> ChildFuture<'a>;
+    /// Best-effort synchronous cleanup used only when the async owner is cancelled.
+    /// Implementations must target only the child or process group captured at launch.
+    fn signal_owned_on_drop(&mut self);
 }
 
 #[derive(Debug, Error)]
@@ -96,6 +99,11 @@ pub enum ProcessError {
     Launch(#[from] LaunchError),
     #[error("runtime process I/O failed")]
     Io(#[source] io::Error),
+    #[error("runtime exited before accepting its start command")]
+    StartCommandWrite {
+        kind: io::ErrorKind,
+        cleanup_failed: bool,
+    },
     #[error("runtime event exceeded 64 KiB")]
     EventLineTooLong,
     #[error("runtime event stream ended mid-line")]
@@ -110,6 +118,8 @@ pub enum ProcessError {
     ShutdownFailed {
         stage: ShutdownStage,
         cleanup_failed: bool,
+        #[source]
+        source: ShutdownIoError,
     },
 }
 
@@ -117,6 +127,49 @@ pub enum ProcessError {
 pub enum ShutdownStage {
     WriteCommand,
     Wait,
+}
+
+pub struct ShutdownIoError {
+    source: io::Error,
+}
+
+impl ShutdownIoError {
+    pub fn kind(&self) -> io::ErrorKind {
+        self.source.kind()
+    }
+}
+
+impl fmt::Debug for ShutdownIoError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ShutdownIoError")
+            .field("kind", &self.source.kind())
+            .finish()
+    }
+}
+
+impl fmt::Display for ShutdownIoError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("runtime process I/O failed")
+    }
+}
+
+impl std::error::Error for ShutdownIoError {}
+
+impl ProcessError {
+    pub const fn shutdown_stage(&self) -> Option<ShutdownStage> {
+        match self {
+            Self::ShutdownFailed { stage, .. } => Some(*stage),
+            _ => None,
+        }
+    }
+
+    pub fn shutdown_source_kind(&self) -> Option<io::ErrorKind> {
+        match self {
+            Self::ShutdownFailed { source, .. } => Some(source.kind()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -159,7 +212,6 @@ pub async fn launch_runtime<L: RuntimeLauncher>(
 
     let launch_token = generate_launch_token()?;
     let request = LaunchRequest::new(data_dir.to_path_buf(), runtime_dir.to_path_buf());
-    let mut child = launcher.launch(request)?;
     let line = command_line(&StartCommand {
         version: PROTOCOL_VERSION,
         command: "start",
@@ -167,9 +219,21 @@ pub async fn launch_runtime<L: RuntimeLauncher>(
         runtime_dir,
         launch_token: &launch_token,
     })?;
-    child.write_stdin(&line).await.map_err(ProcessError::Io)?;
+    let child = launcher.launch(request)?;
+    let mut running = RunningRuntime {
+        child,
+        cleanup_armed: true,
+    };
+    if let Err(source) = running.child.write_stdin(&line).await {
+        let kind = source.kind();
+        let cleanup_failed = running.force_owned_cleanup().await.is_err();
+        return Err(ProcessError::StartCommandWrite {
+            kind,
+            cleanup_failed,
+        });
+    }
 
-    Ok(RunningRuntime { child })
+    Ok(running)
 }
 
 fn validate_absolute_directory(path: &Path) -> Result<(), ProcessError> {
@@ -182,6 +246,15 @@ fn validate_absolute_directory(path: &Path) -> Result<(), ProcessError> {
 
 pub struct RunningRuntime {
     child: Box<dyn RuntimeChild>,
+    cleanup_armed: bool,
+}
+
+impl Drop for RunningRuntime {
+    fn drop(&mut self) {
+        if self.cleanup_armed {
+            self.child.signal_owned_on_drop();
+        }
+    }
 }
 
 impl fmt::Debug for RunningRuntime {
@@ -217,10 +290,15 @@ impl RunningRuntime {
     }
 
     pub async fn force_owned_cleanup(&mut self) -> Result<(), ProcessError> {
-        self.child
+        let result = self
+            .child
             .kill_owned()
             .await
-            .map_err(ProcessError::ForcedCleanup)
+            .map_err(ProcessError::ForcedCleanup);
+        if result.is_ok() {
+            self.cleanup_armed = false;
+        }
+        result
     }
 
     pub async fn shutdown_with_timeout(&mut self, timeout: Duration) -> Result<(), ProcessError> {
@@ -228,11 +306,17 @@ impl RunningRuntime {
             version: PROTOCOL_VERSION,
             command: "shutdown",
         })?;
-        if self.child.write_stdin(&line).await.is_err() {
-            let cleanup_failed = self.child.kill_owned().await.is_err();
+        if let Err(source) = self.child.write_stdin(&line).await {
+            let cleanup_failed = if self.child.kill_owned().await.is_err() {
+                true
+            } else {
+                self.cleanup_armed = false;
+                false
+            };
             return Err(ProcessError::ShutdownFailed {
                 stage: ShutdownStage::WriteCommand,
                 cleanup_failed,
+                source: ShutdownIoError { source },
             });
         }
 
@@ -240,21 +324,37 @@ impl RunningRuntime {
             if let Ok(result) =
                 tokio::time::timeout(timeout, self.child.wait_for_exit_preserving_stdin()).await
             {
-                if result.is_ok() {
-                    return Ok(());
+                match result {
+                    Ok(()) => {
+                        self.cleanup_armed = false;
+                        return Ok(());
+                    }
+                    Err(source) => {
+                        let cleanup_failed = if self.child.kill_owned().await.is_err() {
+                            true
+                        } else {
+                            self.cleanup_armed = false;
+                            false
+                        };
+                        return Err(ProcessError::ShutdownFailed {
+                            stage: ShutdownStage::Wait,
+                            cleanup_failed,
+                            source: ShutdownIoError { source },
+                        });
+                    }
                 }
-                let cleanup_failed = self.child.kill_owned().await.is_err();
-                return Err(ProcessError::ShutdownFailed {
-                    stage: ShutdownStage::Wait,
-                    cleanup_failed,
-                });
             }
         }
 
-        self.child
+        let result = self
+            .child
             .kill_owned()
             .await
-            .map_err(ProcessError::ForcedCleanup)
+            .map_err(ProcessError::ForcedCleanup);
+        if result.is_ok() {
+            self.cleanup_armed = false;
+        }
+        result
     }
 }
 
@@ -486,6 +586,30 @@ impl RuntimeChild for ProductionChild {
             self.child.wait().await.map(|_| ())
         })
     }
+
+    fn signal_owned_on_drop(&mut self) {
+        signal_owned_process_group(self);
+    }
+}
+
+#[cfg(unix)]
+fn signal_owned_process_group(child: &mut ProductionChild) {
+    const SIGKILL: i32 = 9;
+    extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+
+    if let Some(group) = child.process_group {
+        // The group id was captured from this exact child after it became group leader.
+        let _ = unsafe { kill(-group, SIGKILL) };
+    } else {
+        let _ = child.child.start_kill();
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_owned_process_group(child: &mut ProductionChild) {
+    let _ = child.child.start_kill();
 }
 
 #[cfg(unix)]
@@ -652,9 +776,28 @@ pub fn redact_diagnostic_line(line: &str) -> String {
         "authorization",
         "cookie",
         "private_key",
+        "private-key",
+        "privatekey",
         "secret",
         "signature",
         "token",
+        "api_key",
+        "api-key",
+        "apikey",
+        "api_token",
+        "api-token",
+        "apitoken",
+        "api_secret",
+        "api-secret",
+        "apisecret",
+        "password",
+        "passphrase",
+        "client_secret",
+        "client-secret",
+        "clientsecret",
+        "access_token",
+        "access-token",
+        "accesstoken",
     ];
 
     let (content, line_ending) = if let Some(content) = line.strip_suffix("\r\n") {
@@ -804,6 +947,7 @@ mod tests {
         requests: Vec<LaunchRequest>,
         writes: Vec<Vec<u8>>,
         write_results: VecDeque<io::Result<()>>,
+        write_pending: bool,
         waits: VecDeque<io::Result<()>>,
         killed: usize,
     }
@@ -842,9 +986,19 @@ mod tests {
         fn write_stdin<'a>(&'a mut self, bytes: &'a [u8]) -> IoFuture<'a> {
             let state = Arc::clone(&self.0);
             Box::pin(async move {
-                let mut state = state.lock().unwrap();
-                state.writes.push(bytes.to_vec());
-                state.write_results.pop_front().unwrap_or(Ok(()))
+                let (write_pending, result) = {
+                    let mut state = state.lock().unwrap();
+                    state.writes.push(bytes.to_vec());
+                    let write_pending = state.write_pending;
+                    let result =
+                        (!write_pending).then(|| state.write_results.pop_front().unwrap_or(Ok(())));
+                    (write_pending, result)
+                };
+                if write_pending {
+                    std::future::pending().await
+                } else {
+                    result.expect("non-pending write has a result")
+                }
             })
         }
 
@@ -867,6 +1021,10 @@ mod tests {
                 state.lock().unwrap().killed += 1;
                 Ok(())
             })
+        }
+
+        fn signal_owned_on_drop(&mut self) {
+            self.0.lock().unwrap().killed += 1;
         }
     }
 
@@ -1081,6 +1239,7 @@ mod tests {
         let result = runtime().block_on(running.shutdown_with_timeout(Duration::from_secs(1)));
 
         assert!(result.is_err());
+        drop(running);
         assert_eq!(state.lock().unwrap().killed, 1);
     }
 
@@ -1101,6 +1260,7 @@ mod tests {
         let result = runtime().block_on(running.shutdown_with_timeout(Duration::from_secs(1)));
 
         assert!(result.is_err());
+        drop(running);
         assert_eq!(state.lock().unwrap().killed, 1);
     }
 
@@ -1229,6 +1389,12 @@ mod tests {
                 Ok(())
             })
         }
+
+        fn signal_owned_on_drop(&mut self) {
+            let mut state = self.0.lock().unwrap();
+            state.kills += 1;
+            state.lease_open = false;
+        }
     }
 
     #[test]
@@ -1260,5 +1426,110 @@ mod tests {
             b"{\"version\":1,\"command\":\"shutdown\"}\n"
         );
         assert_eq!(state.kills, 1);
+    }
+
+    #[test]
+    fn failed_initial_start_write_cleans_up_the_exact_owned_child() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        state
+            .lock()
+            .unwrap()
+            .write_results
+            .push_back(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "token=start-secret",
+            )));
+        let launcher = FakeLauncher(Arc::clone(&state));
+        let (data_dir, runtime_dir) = absolute_test_dirs();
+
+        let result = runtime().block_on(launch_runtime(&launcher, &data_dir, &runtime_dir));
+
+        assert!(result.is_err());
+        assert_eq!(state.lock().unwrap().killed, 1);
+    }
+
+    #[test]
+    fn cancelling_a_pending_start_write_signals_the_exact_owned_child() {
+        let state = Arc::new(Mutex::new(FakeState {
+            write_pending: true,
+            ..FakeState::default()
+        }));
+        let launcher = FakeLauncher(Arc::clone(&state));
+        let (data_dir, runtime_dir) = absolute_test_dirs();
+        let executor = runtime();
+
+        let result = executor.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                launch_runtime(&launcher, &data_dir, &runtime_dir),
+            )
+            .await
+        });
+
+        assert!(result.is_err());
+        assert_eq!(state.lock().unwrap().killed, 1);
+    }
+
+    #[test]
+    fn shutdown_error_preserves_typed_source_without_exposing_child_text() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let launcher = FakeLauncher(Arc::clone(&state));
+        let (data_dir, runtime_dir) = absolute_test_dirs();
+        let mut running = runtime()
+            .block_on(launch_runtime(&launcher, &data_dir, &runtime_dir))
+            .unwrap();
+        state
+            .lock()
+            .unwrap()
+            .write_results
+            .push_back(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "token=shutdown-secret",
+            )));
+
+        let error = runtime()
+            .block_on(running.shutdown_with_timeout(Duration::from_secs(1)))
+            .unwrap_err();
+
+        assert_eq!(error.shutdown_stage(), Some(ShutdownStage::WriteCommand));
+        assert_eq!(
+            error.shutdown_source_kind(),
+            Some(io::ErrorKind::BrokenPipe)
+        );
+        assert!(std::error::Error::source(&error).is_some());
+        for exposed in [format!("{error}"), format!("{error:?}")] {
+            assert!(!exposed.contains("shutdown-secret"), "leaked: {exposed}");
+        }
+    }
+
+    #[test]
+    fn expanded_sensitive_key_vocabulary_never_persists_values() {
+        for key in [
+            "privateKey",
+            "private-key",
+            "api_key",
+            "api-key",
+            "apiKey",
+            "api_token",
+            "apiToken",
+            "api-secret",
+            "apiSecret",
+            "password",
+            "passphrase",
+            "client_secret",
+            "client-secret",
+            "clientSecret",
+            "access_token",
+            "accessToken",
+        ] {
+            let secret = format!("value-for-{key}");
+            for line in [
+                format!("INFO {key} = {secret}"),
+                format!(r#"{{"{key}":"{secret}","safe":"visible"}}"#),
+            ] {
+                let redacted = redact_diagnostic_line(&line);
+                assert!(!redacted.contains(&secret), "leaked {key}: {redacted}");
+            }
+        }
     }
 }
