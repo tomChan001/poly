@@ -781,7 +781,8 @@ mod tests {
         PHASE_TERMINAL,
     };
     use crate::app_lifecycle::{
-        cleanup_rejected_runtime, RuntimeShutdown, RuntimeShutdownRegistry, ShutdownFuture,
+        cleanup_rejected_runtime, AppLifecycle, CloseDecision, LifecycleApplication,
+        LifecycleWindow, RuntimeShutdown, RuntimeShutdownRegistry, ShutdownFuture,
         APPLICATION_QUIT_REASON,
     };
     use crate::runtime::protocol::RuntimeEvent;
@@ -839,6 +840,37 @@ mod tests {
     impl DesktopDiagnosticReporter for RecordingReporter {
         fn report(&self, event: DesktopDiagnosticEvent) {
             self.events.lock().unwrap().push(event);
+        }
+    }
+
+    #[derive(Default)]
+    struct LifecycleTestWindow;
+
+    impl LifecycleWindow for LifecycleTestWindow {
+        fn show(&self) {}
+        fn unminimize(&self) {}
+        fn focus(&self) {}
+        fn navigate(&self, _url: Url) {}
+    }
+
+    #[derive(Default)]
+    struct LifecycleTestApplication {
+        exits: AtomicUsize,
+        reports: AtomicUsize,
+    }
+
+    impl LifecycleApplication for LifecycleTestApplication {
+        fn main_window(&self) -> Option<Box<dyn LifecycleWindow>> {
+            Some(Box::new(LifecycleTestWindow))
+        }
+
+        fn exit(&self, code: i32) {
+            assert_eq!(code, 0);
+            self.exits.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn report_shutdown_failure(&self) {
+            self.reports.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -1549,6 +1581,122 @@ mod tests {
                 *reporter.events.lock().unwrap(),
                 vec![DesktopDiagnosticEvent::ShutdownFailed]
             );
+        });
+    }
+
+    #[test]
+    fn close_during_setup_waits_for_rejected_runtime_cleanup_before_exit() {
+        tauri::async_runtime::block_on(async {
+            let registry = Arc::new(RuntimeShutdownRegistry::default());
+            let setup_guard = registry
+                .begin_setup()
+                .expect("setup must begin while the registry is active");
+            let (notices, _) = watch::channel(None);
+            let entered = Arc::new(Notify::new());
+            let cancellations = Arc::new(AtomicUsize::new(0));
+            let confirmation_started = Arc::new(Notify::new());
+            let release_confirmation = Arc::new(Notify::new());
+            let cleanup = Arc::new(BlockingCleanupConfirmation {
+                cleanup_calls: AtomicUsize::new(0),
+                confirmation_calls: AtomicUsize::new(0),
+                confirmation_started: Arc::clone(&confirmation_started),
+                release_confirmation: Arc::clone(&release_confirmation),
+            });
+            let reporter = Arc::new(RecordingReporter::default());
+            let service = Arc::new(DesktopRuntimeService::with_reporter_and_shutdown(
+                CancellationRuntime {
+                    notices,
+                    entered: Arc::clone(&entered),
+                    cancellations: Arc::clone(&cancellations),
+                },
+                FakeNavigator::default(),
+                Arc::clone(&reporter) as Arc<dyn DesktopDiagnosticReporter>,
+                Arc::clone(&cleanup) as Arc<dyn RuntimeShutdown>,
+            ));
+            assert!(service.start_supervision());
+            entered.notified().await;
+
+            let lifecycle = Arc::new(AppLifecycle::new());
+            let app = Arc::new(LifecycleTestApplication::default());
+            assert_eq!(
+                lifecycle.close_requested(&LifecycleTestWindow),
+                CloseDecision::PreventAndShutdown
+            );
+            let shutdown_task =
+                tauri::async_runtime::spawn(Arc::clone(&lifecycle).shutdown_and_exit(
+                    Arc::clone(&app) as Arc<dyn LifecycleApplication>,
+                    Arc::clone(&registry) as Arc<dyn RuntimeShutdown>,
+                ));
+            while let Some(guard) = registry.begin_setup() {
+                drop(guard);
+                tokio::task::yield_now().await;
+            }
+
+            assert!(!registry.install(Arc::clone(&service) as Arc<dyn RuntimeShutdown>));
+            let setup_task = tauri::async_runtime::spawn(async move {
+                cleanup_rejected_runtime(
+                    service as Arc<dyn RuntimeShutdown>,
+                    reporter as Arc<dyn DesktopDiagnosticReporter>,
+                )
+                .await;
+                drop(setup_guard);
+            });
+
+            confirmation_started.notified().await;
+            assert_eq!(app.exits.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                lifecycle.close_requested(&LifecycleTestWindow),
+                CloseDecision::PreventAlreadyShuttingDown
+            );
+            release_confirmation.notify_one();
+            setup_task.await.unwrap();
+            shutdown_task.await.unwrap();
+
+            assert_eq!(app.exits.load(Ordering::SeqCst), 1);
+            assert_eq!(app.reports.load(Ordering::SeqCst), 0);
+            assert_eq!(cancellations.load(Ordering::SeqCst), 1);
+            assert_eq!(cleanup.cleanup_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(cleanup.confirmation_calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn hanging_setup_times_out_reports_once_and_allows_exit() {
+        tauri::async_runtime::block_on(async {
+            let registry = Arc::new(RuntimeShutdownRegistry::with_setup_wait_timeout(
+                Duration::from_millis(20),
+            ));
+            let setup_guard = registry
+                .begin_setup()
+                .expect("setup must begin while the registry is active");
+            let lifecycle = Arc::new(AppLifecycle::new());
+            let app = Arc::new(LifecycleTestApplication::default());
+
+            assert_eq!(
+                lifecycle.close_requested(&LifecycleTestWindow),
+                CloseDecision::PreventAndShutdown
+            );
+            assert_eq!(
+                lifecycle.close_requested(&LifecycleTestWindow),
+                CloseDecision::PreventAlreadyShuttingDown
+            );
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                Arc::clone(&lifecycle).shutdown_and_exit(
+                    Arc::clone(&app) as Arc<dyn LifecycleApplication>,
+                    registry as Arc<dyn RuntimeShutdown>,
+                ),
+            )
+            .await
+            .expect("setup shutdown barrier must be bounded");
+
+            assert_eq!(app.exits.load(Ordering::SeqCst), 1);
+            assert_eq!(app.reports.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                lifecycle.close_requested(&LifecycleTestWindow),
+                CloseDecision::Allow
+            );
+            drop(setup_guard);
         });
     }
 

@@ -3,7 +3,11 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 #[cfg(any(target_os = "macos", test))]
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
+#[cfg(any(target_os = "macos", test))]
+use std::time::Duration;
+#[cfg(any(target_os = "macos", test))]
+use tokio::sync::watch;
 
 use url::Url;
 
@@ -134,24 +138,132 @@ impl AppLifecycle {
 }
 
 #[cfg(any(target_os = "macos", test))]
-#[derive(Default)]
 pub(crate) struct RuntimeShutdownRegistry {
     current: RwLock<Option<Arc<dyn RuntimeShutdown>>>,
-    closing: AtomicBool,
+    setup: Arc<SetupBarrier>,
+    setup_wait_timeout: Duration,
+}
+
+#[cfg(any(target_os = "macos", test))]
+struct SetupBarrier {
+    state: Mutex<SetupBarrierState>,
+    changed: watch::Sender<usize>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+struct SetupBarrierState {
+    in_flight: usize,
+    closing: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) struct RuntimeSetupGuard {
+    setup: Arc<SetupBarrier>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+const SETUP_WAIT_TIMEOUT: Duration = Duration::from_secs(4);
+
+#[cfg(any(target_os = "macos", test))]
+impl Default for RuntimeShutdownRegistry {
+    fn default() -> Self {
+        Self::with_setup_wait_timeout(SETUP_WAIT_TIMEOUT)
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Drop for RuntimeSetupGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .setup
+            .state
+            .lock()
+            .expect("setup barrier lock poisoned");
+        state.in_flight = state
+            .in_flight
+            .checked_sub(1)
+            .expect("setup guard count underflow");
+        self.setup.changed.send_replace(state.in_flight);
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
 impl RuntimeShutdownRegistry {
+    pub(crate) fn with_setup_wait_timeout(setup_wait_timeout: Duration) -> Self {
+        Self {
+            current: RwLock::new(None),
+            setup: Arc::new(SetupBarrier {
+                state: Mutex::new(SetupBarrierState::default()),
+                changed: watch::channel(0).0,
+            }),
+            setup_wait_timeout,
+        }
+    }
+
+    pub(crate) fn begin_setup(&self) -> Option<RuntimeSetupGuard> {
+        let mut state = self
+            .setup
+            .state
+            .lock()
+            .expect("setup barrier lock poisoned");
+        if state.closing {
+            return None;
+        }
+        state.in_flight += 1;
+        Some(RuntimeSetupGuard {
+            setup: Arc::clone(&self.setup),
+        })
+    }
+
     pub(crate) fn install(&self, shutdown: Arc<dyn RuntimeShutdown>) -> bool {
+        let setup_state = self
+            .setup
+            .state
+            .lock()
+            .expect("setup barrier lock poisoned");
+        if setup_state.closing {
+            return false;
+        }
         let mut current = self
             .current
             .write()
             .expect("runtime shutdown lock poisoned");
-        if self.closing.load(Ordering::Acquire) {
-            return false;
-        }
         *current = Some(shutdown);
         true
+    }
+
+    fn close_and_current(&self) -> Option<Arc<dyn RuntimeShutdown>> {
+        self.setup
+            .state
+            .lock()
+            .expect("setup barrier lock poisoned")
+            .closing = true;
+        self.current
+            .read()
+            .expect("runtime shutdown lock poisoned")
+            .clone()
+    }
+
+    async fn wait_for_setup(&self) -> Result<(), ()> {
+        let mut changed = self.setup.changed.subscribe();
+        tokio::time::timeout(self.setup_wait_timeout, async {
+            loop {
+                if self
+                    .setup
+                    .state
+                    .lock()
+                    .expect("setup barrier lock poisoned")
+                    .in_flight
+                    == 0
+                {
+                    return Ok(());
+                }
+                changed.changed().await.map_err(|_| ())?;
+            }
+        })
+        .await
+        .map_err(|_| ())?
     }
 }
 
@@ -169,40 +281,31 @@ pub(crate) async fn cleanup_rejected_runtime(
 #[cfg(any(target_os = "macos", test))]
 impl RuntimeShutdown for RuntimeShutdownRegistry {
     fn shutdown(&self, reason: &'static str) -> ShutdownFuture<'_> {
-        self.closing.store(true, Ordering::Release);
-        let current = self
-            .current
-            .read()
-            .expect("runtime shutdown lock poisoned")
-            .clone();
+        let current = self.close_and_current();
         Box::pin(async move {
-            if let Some(current) = current {
+            let shutdown_result = if let Some(current) = current {
                 current.shutdown(reason).await
             } else {
                 Ok(())
-            }
+            };
+            shutdown_result.and(self.wait_for_setup().await)
         })
     }
 
     fn cleanup_owned(&self) {
-        self.closing.store(true, Ordering::Release);
-        if let Some(current) = self
-            .current
-            .read()
-            .expect("runtime shutdown lock poisoned")
-            .as_ref()
-        {
+        if let Some(current) = self.close_and_current() {
             current.cleanup_owned();
         }
     }
 
     fn wait_for_cleanup(&self) -> ShutdownFuture<'_> {
-        let current = self
-            .current
-            .read()
-            .expect("runtime shutdown lock poisoned")
-            .clone();
         Box::pin(async move {
+            self.wait_for_setup().await?;
+            let current = self
+                .current
+                .read()
+                .expect("runtime shutdown lock poisoned")
+                .clone();
             if let Some(current) = current {
                 current.wait_for_cleanup().await
             } else {

@@ -232,6 +232,10 @@ impl Drop for DesktopAppState {
 #[cfg(any(target_os = "macos", test))]
 #[tauri::command]
 async fn retry_desktop_runtime(state: tauri::State<'_, DesktopAppState>) -> Result<(), String> {
+    let _setup_guard = state
+        .runtime_shutdown
+        .begin_setup()
+        .ok_or_else(|| "runtime retry is unavailable".to_owned())?;
     state
         .setup
         .retry()
@@ -283,6 +287,9 @@ fn setup_desktop_runtime(app: &mut tauri::App) -> Result<(), Box<dyn std::error:
         navigator,
         reporter,
     ));
+    let Some(setup_guard) = runtime_shutdown.begin_setup() else {
+        return Ok(());
+    };
     if !app.manage(DesktopAppState {
         setup: Arc::clone(&setup),
         lifecycle: Arc::new(app_lifecycle::AppLifecycle::new()),
@@ -291,6 +298,7 @@ fn setup_desktop_runtime(app: &mut tauri::App) -> Result<(), Box<dyn std::error:
         return Ok(());
     }
     tauri::async_runtime::spawn(async move {
+        let _setup_guard = setup_guard;
         setup.initialize().await;
     });
     Ok(())
