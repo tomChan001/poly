@@ -194,6 +194,8 @@ pub enum SupervisionOutcome {
 pub enum RuntimeSupervisorError {
     #[error(transparent)]
     State(#[from] TransitionError),
+    #[error("owned runtime cleanup is not confirmed")]
+    CleanupUnconfirmed,
 }
 
 #[derive(Clone)]
@@ -489,6 +491,9 @@ where
     }
 
     pub fn explicit_operator_retry(&mut self) -> Result<(), RuntimeSupervisorError> {
+        if self.terminal_failure == Some(RuntimeFailure::CleanupFailed) {
+            return Err(RuntimeSupervisorError::CleanupUnconfirmed);
+        }
         self.state.reset_for_operator_retry()?;
         self.policy.explicit_retry();
         self.terminal_failure = None;
@@ -1848,6 +1853,54 @@ mod tests {
             other => panic!("unexpected state: {other:?}"),
         }
         drop(state);
+        std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
+    fn cleanup_failure_rejects_operator_retry_and_retains_exact_cleanup_handle() {
+        let scripts = vec![
+            ChildScript::wait_and_kill_error(),
+            ChildScript::crash(
+                "{\"version\":1,\"state\":\"initializing\"}\n",
+                Duration::ZERO,
+            ),
+        ];
+        let (mut supervisor, state, _clock, support_dir) =
+            fake_supervisor(scripts, "cleanup-failure-operator-retry");
+        let cleanup = supervisor.shutdown_control();
+        let (sender, _receiver) = mpsc::channel(8);
+
+        assert_eq!(
+            runtime()
+                .block_on(supervisor.supervise_until_terminal(sender))
+                .unwrap(),
+            SupervisionOutcome::Terminal(RuntimeFailure::CleanupFailed)
+        );
+        let retained_before = RuntimeShutdown::owned_cleanup_handle(&cleanup)
+            .expect("cleanup failure must retain its exact owned cleanup handle");
+
+        let error = supervisor
+            .explicit_operator_retry()
+            .expect_err("cleanup-unconfirmed failure must reject operator retry");
+
+        assert!(matches!(&error, RuntimeSupervisorError::CleanupUnconfirmed));
+        assert_eq!(error.to_string(), "owned runtime cleanup is not confirmed");
+        assert_eq!(state.lock().unwrap().launches, 1);
+        assert_eq!(
+            supervisor.terminal_failure,
+            Some(RuntimeFailure::CleanupFailed)
+        );
+        assert!(matches!(
+            supervisor.state(),
+            SupervisorState::Failed {
+                code: FailureCode::ShutdownFailed,
+                ..
+            }
+        ));
+        let retained_after = RuntimeShutdown::owned_cleanup_handle(&cleanup)
+            .expect("rejected retry must not clear the owned cleanup handle");
+        assert!(Arc::ptr_eq(&retained_before, &retained_after));
+
         std::fs::remove_dir_all(support_dir).unwrap();
     }
 

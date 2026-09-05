@@ -13,7 +13,8 @@ use crate::app_lifecycle::{RuntimeShutdown, ShutdownFuture};
 use crate::runtime::process::RuntimeLauncher;
 use crate::runtime::state::SupervisorState;
 use crate::runtime::supervisor::{
-    RuntimeFailure, RuntimeSupervisor, RuntimeSupervisorNotice, SupervisionOutcome, SupervisorClock,
+    RuntimeFailure, RuntimeSupervisor, RuntimeSupervisorError, RuntimeSupervisorNotice,
+    SupervisionOutcome, SupervisorClock,
 };
 use crate::webview::{status_url, status_url_with_logs, DesktopUiState};
 use crate::DesktopNavigationController;
@@ -280,7 +281,10 @@ where
     }
 
     fn explicit_operator_retry(&mut self) -> Result<(), DesktopServiceError> {
-        RuntimeSupervisor::explicit_operator_retry(self).map_err(|_| DesktopServiceError::Runtime)
+        RuntimeSupervisor::explicit_operator_retry(self).map_err(|error| match error {
+            RuntimeSupervisorError::CleanupUnconfirmed => DesktopServiceError::CleanupUnconfirmed,
+            RuntimeSupervisorError::State(_) => DesktopServiceError::Runtime,
+        })
     }
 
     fn supervise_until_terminal(&mut self) -> DesktopRuntimeFuture<'_> {
@@ -312,6 +316,7 @@ pub struct DesktopRuntimeService<R, N> {
     start_permit: Arc<dyn RuntimeStartPermit>,
     supervision_task: SyncMutex<Option<SupervisionTask>>,
     cleanup_requested: AtomicBool,
+    cleanup_unconfirmed: AtomicBool,
     shutdown_completion_timeout: std::time::Duration,
     task_cancellation_timeout: std::time::Duration,
     owned_cleanup_confirmation_timeout: std::time::Duration,
@@ -390,6 +395,7 @@ where
             start_permit,
             supervision_task: SyncMutex::new(None),
             cleanup_requested: AtomicBool::new(false),
+            cleanup_unconfirmed: AtomicBool::new(false),
             shutdown_completion_timeout: SHUTDOWN_COMPLETION_TIMEOUT,
             task_cancellation_timeout: TASK_CANCELLATION_TIMEOUT,
             owned_cleanup_confirmation_timeout: OWNED_CLEANUP_CONFIRMATION_TIMEOUT,
@@ -450,6 +456,10 @@ where
             let result = runtime.supervise_until_terminal().await;
             let terminal = runtime.is_terminal() || result.is_err();
             drop(runtime);
+            service.cleanup_unconfirmed.store(
+                matches!(&result, Err(DesktopServiceError::CleanupUnconfirmed)),
+                Ordering::Release,
+            );
             service.phase.store(
                 if terminal { PHASE_TERMINAL } else { PHASE_IDLE },
                 Ordering::Release,
@@ -493,6 +503,11 @@ where
                 return Err(DesktopServiceError::AlreadyRunning);
             }
             Err(_) => return Err(DesktopServiceError::RetryNotTerminal),
+        }
+
+        if self.cleanup_unconfirmed.load(Ordering::Acquire) {
+            self.phase.store(PHASE_TERMINAL, Ordering::Release);
+            return Err(DesktopServiceError::CleanupUnconfirmed);
         }
 
         let mut runtime = match self.runtime.try_lock() {
@@ -1006,6 +1021,12 @@ mod tests {
         notices: watch::Sender<Option<RuntimeSupervisorNotice>>,
     }
 
+    struct CleanupFailedRuntime {
+        notices: watch::Sender<Option<RuntimeSupervisorNotice>>,
+        supervise_calls: Arc<AtomicUsize>,
+        retry_calls: Arc<AtomicUsize>,
+    }
+
     impl DesktopRuntime for FailedRuntime {
         fn subscribe_notices(&self) -> watch::Receiver<Option<RuntimeSupervisorNotice>> {
             self.notices.subscribe()
@@ -1043,6 +1064,43 @@ mod tests {
                     FailureCode::MigrationFailed,
                 )))
             })
+        }
+    }
+
+    impl DesktopRuntime for CleanupFailedRuntime {
+        fn subscribe_notices(&self) -> watch::Receiver<Option<RuntimeSupervisorNotice>> {
+            self.notices.subscribe()
+        }
+
+        fn is_terminal(&self) -> bool {
+            true
+        }
+
+        fn explicit_operator_retry(&mut self) -> Result<(), DesktopServiceError> {
+            self.retry_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn supervise_until_terminal(&mut self) -> RuntimeFuture<'_> {
+            self.supervise_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(DesktopServiceError::CleanupUnconfirmed) })
+        }
+    }
+
+    #[derive(Default)]
+    struct GenerationCountingShutdown {
+        generations: AtomicUsize,
+    }
+
+    impl RuntimeShutdown for GenerationCountingShutdown {
+        fn shutdown(&self, _reason: &'static str) -> ShutdownFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn cleanup_owned(&self) {}
+
+        fn begin_supervision_generation(&self) -> u64 {
+            self.generations.fetch_add(1, Ordering::SeqCst) as u64 + 1
         }
     }
 
@@ -2499,6 +2557,37 @@ mod tests {
             assert!(fixture.service.retry().await.is_err());
             assert_eq!(fixture.retry_calls.load(Ordering::SeqCst), 0);
             assert_eq!(fixture.supervise_calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn cleanup_unconfirmed_retry_does_not_start_a_new_generation_or_runtime() {
+        tauri::async_runtime::block_on(async {
+            let (notices, _) = watch::channel(None);
+            let supervise_calls = Arc::new(AtomicUsize::new(0));
+            let retry_calls = Arc::new(AtomicUsize::new(0));
+            let shutdown = Arc::new(GenerationCountingShutdown::default());
+            let service = Arc::new(DesktopRuntimeService::with_reporter_and_shutdown(
+                CleanupFailedRuntime {
+                    notices,
+                    supervise_calls: Arc::clone(&supervise_calls),
+                    retry_calls: Arc::clone(&retry_calls),
+                },
+                FakeNavigator::default(),
+                Arc::new(RecordingReporter::default()),
+                Arc::clone(&shutdown) as Arc<dyn RuntimeShutdown>,
+            ));
+            assert!(service.start_supervision());
+            wait_for(|| service.phase.load(Ordering::Acquire) == PHASE_TERMINAL).await;
+
+            assert!(matches!(
+                service.retry().await,
+                Err(DesktopServiceError::CleanupUnconfirmed)
+            ));
+            assert_eq!(shutdown.generations.load(Ordering::SeqCst), 1);
+            assert_eq!(supervise_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(retry_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(service.phase.load(Ordering::Acquire), PHASE_TERMINAL);
         });
     }
 
