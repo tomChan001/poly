@@ -312,15 +312,20 @@ impl RunningRuntime {
     }
 
     pub async fn force_owned_cleanup(&mut self) -> Result<(), ProcessError> {
-        let result = self
-            .child
-            .kill_owned()
-            .await
-            .map_err(ProcessError::ForcedCleanup);
-        if result.is_ok() {
-            self.cleanup_armed.store(false, Ordering::Release);
+        if self
+            .cleanup_armed
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
         }
-        result
+        match self.child.kill_owned().await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.cleanup_armed.store(true, Ordering::Release);
+                Err(ProcessError::ForcedCleanup(error))
+            }
+        }
     }
 
     pub async fn shutdown_with_timeout(&mut self, timeout: Duration) -> Result<(), ProcessError> {
@@ -329,12 +334,7 @@ impl RunningRuntime {
             command: "shutdown",
         })?;
         if let Err(source) = self.child.write_stdin(&line).await {
-            let cleanup_failed = if self.child.kill_owned().await.is_err() {
-                true
-            } else {
-                self.cleanup_armed.store(false, Ordering::Release);
-                false
-            };
+            let cleanup_failed = self.force_owned_cleanup().await.is_err();
             return Err(ProcessError::ShutdownFailed {
                 stage: ShutdownStage::WriteCommand,
                 cleanup_failed,
@@ -349,12 +349,7 @@ impl RunningRuntime {
                 match result {
                     Ok(()) => return self.force_owned_cleanup().await,
                     Err(source) => {
-                        let cleanup_failed = if self.child.kill_owned().await.is_err() {
-                            true
-                        } else {
-                            self.cleanup_armed.store(false, Ordering::Release);
-                            false
-                        };
+                        let cleanup_failed = self.force_owned_cleanup().await.is_err();
                         return Err(ProcessError::ShutdownFailed {
                             stage: ShutdownStage::Wait,
                             cleanup_failed,
@@ -365,15 +360,7 @@ impl RunningRuntime {
             }
         }
 
-        let result = self
-            .child
-            .kill_owned()
-            .await
-            .map_err(ProcessError::ForcedCleanup);
-        if result.is_ok() {
-            self.cleanup_armed.store(false, Ordering::Release);
-        }
-        result
+        self.force_owned_cleanup().await
     }
 }
 
@@ -384,9 +371,20 @@ struct DisarmingOwnedCleanup {
 
 impl OwnedRuntimeCleanup for DisarmingOwnedCleanup {
     fn signal(&self) -> io::Result<()> {
-        self.cleanup.signal()?;
-        self.armed.store(false, Ordering::Release);
-        Ok(())
+        if self
+            .armed
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        match self.cleanup.signal() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.armed.store(true, Ordering::Release);
+                Err(error)
+            }
+        }
     }
 
     fn confirm(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {

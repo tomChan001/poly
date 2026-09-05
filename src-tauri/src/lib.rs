@@ -181,10 +181,6 @@ impl DesktopInstaller for ProductionDesktopInstaller {
                 self.reporter.clone(),
                 shutdown,
             ));
-            let observer = Arc::clone(&service);
-            tauri::async_runtime::spawn(async move {
-                let _ = observer.observe_notices(notices).await;
-            });
             if !service.start_supervision() {
                 return Err(DesktopSetupFailure::RuntimeUnavailable {
                     logs_dir: paths.revealable_logs_dir(),
@@ -194,11 +190,19 @@ impl DesktopInstaller for ProductionDesktopInstaller {
                 .runtime_shutdown
                 .install(Arc::clone(&service) as Arc<dyn app_lifecycle::RuntimeShutdown>)
             {
-                app_lifecycle::RuntimeShutdown::cleanup_owned(service.as_ref());
+                app_lifecycle::cleanup_rejected_runtime(
+                    Arc::clone(&service) as Arc<dyn app_lifecycle::RuntimeShutdown>,
+                    Arc::clone(&self.reporter) as Arc<dyn DesktopDiagnosticReporter>,
+                )
+                .await;
                 return Err(DesktopSetupFailure::RuntimeUnavailable {
                     logs_dir: paths.revealable_logs_dir(),
                 });
             }
+            let observer = Arc::clone(&service);
+            tauri::async_runtime::spawn(async move {
+                let _ = observer.observe_notices(notices).await;
+            });
             Ok(InstalledDesktopRuntime::new(
                 Arc::new(service),
                 Some(paths.logs_dir().to_path_buf()),

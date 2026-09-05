@@ -780,7 +780,10 @@ mod tests {
         DesktopServiceError, DesktopSetupFailure, InstalledDesktopRuntime, RecoverableDesktopSetup,
         PHASE_TERMINAL,
     };
-    use crate::app_lifecycle::{RuntimeShutdown, ShutdownFuture};
+    use crate::app_lifecycle::{
+        cleanup_rejected_runtime, RuntimeShutdown, RuntimeShutdownRegistry, ShutdownFuture,
+        APPLICATION_QUIT_REASON,
+    };
     use crate::runtime::protocol::RuntimeEvent;
     use crate::runtime::supervisor::{RuntimeFailure, RuntimeSupervisorNotice};
 
@@ -903,7 +906,7 @@ mod tests {
         fn supervise_until_terminal(&mut self) -> RuntimeFuture<'_> {
             Box::pin(async move {
                 let _guard = CancellationGuard(Arc::clone(&self.cancellations));
-                self.entered.notify_waiters();
+                self.entered.notify_one();
                 std::future::pending().await
             })
         }
@@ -914,6 +917,34 @@ mod tests {
         cleanup_calls: AtomicUsize,
         confirmation_calls: AtomicUsize,
         fail_confirmation: AtomicBool,
+    }
+
+    struct BlockingCleanupConfirmation {
+        cleanup_calls: AtomicUsize,
+        confirmation_calls: AtomicUsize,
+        confirmation_started: Arc<Notify>,
+        release_confirmation: Arc<Notify>,
+    }
+
+    impl RuntimeShutdown for BlockingCleanupConfirmation {
+        fn shutdown(&self, _reason: &'static str) -> ShutdownFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn cleanup_owned(&self) {
+            self.cleanup_calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wait_for_cleanup(&self) -> ShutdownFuture<'_> {
+            self.confirmation_calls.fetch_add(1, Ordering::SeqCst);
+            let confirmation_started = Arc::clone(&self.confirmation_started);
+            let release_confirmation = Arc::clone(&self.release_confirmation);
+            Box::pin(async move {
+                confirmation_started.notify_one();
+                release_confirmation.notified().await;
+                Ok(())
+            })
+        }
     }
 
     impl RuntimeShutdown for ConfirmingCleanup {
@@ -1426,6 +1457,98 @@ mod tests {
             assert_eq!(cancellations.load(Ordering::SeqCst), 1);
             assert_eq!(cleanup.cleanup_calls.load(Ordering::SeqCst), 1);
             assert_eq!(cleanup.confirmation_calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn rejected_install_awaits_owned_cleanup_confirmation_before_returning() {
+        tauri::async_runtime::block_on(async {
+            let (notices, _) = watch::channel(None);
+            let entered = Arc::new(Notify::new());
+            let cancellations = Arc::new(AtomicUsize::new(0));
+            let confirmation_started = Arc::new(Notify::new());
+            let release_confirmation = Arc::new(Notify::new());
+            let cleanup = Arc::new(BlockingCleanupConfirmation {
+                cleanup_calls: AtomicUsize::new(0),
+                confirmation_calls: AtomicUsize::new(0),
+                confirmation_started: Arc::clone(&confirmation_started),
+                release_confirmation: Arc::clone(&release_confirmation),
+            });
+            let reporter = Arc::new(RecordingReporter::default());
+            let service = Arc::new(DesktopRuntimeService::with_reporter_and_shutdown(
+                CancellationRuntime {
+                    notices,
+                    entered: Arc::clone(&entered),
+                    cancellations: Arc::clone(&cancellations),
+                },
+                FakeNavigator::default(),
+                Arc::clone(&reporter) as Arc<dyn DesktopDiagnosticReporter>,
+                Arc::clone(&cleanup) as Arc<dyn RuntimeShutdown>,
+            ));
+            assert!(service.start_supervision());
+            entered.notified().await;
+
+            let registry = RuntimeShutdownRegistry::default();
+            registry.shutdown(APPLICATION_QUIT_REASON).await.unwrap();
+            assert!(!registry.install(Arc::clone(&service) as Arc<dyn RuntimeShutdown>));
+
+            let completed = Arc::new(AtomicBool::new(false));
+            let completed_after_cleanup = Arc::clone(&completed);
+            let service_for_cleanup = Arc::clone(&service);
+            let reporter_for_cleanup = Arc::clone(&reporter);
+            let cleanup_task = tauri::async_runtime::spawn(async move {
+                cleanup_rejected_runtime(
+                    service_for_cleanup as Arc<dyn RuntimeShutdown>,
+                    reporter_for_cleanup as Arc<dyn DesktopDiagnosticReporter>,
+                )
+                .await;
+                completed_after_cleanup.store(true, Ordering::SeqCst);
+            });
+
+            confirmation_started.notified().await;
+            assert!(!completed.load(Ordering::SeqCst));
+            assert_eq!(cancellations.load(Ordering::SeqCst), 1);
+            release_confirmation.notify_waiters();
+            cleanup_task.await.unwrap();
+
+            assert!(completed.load(Ordering::SeqCst));
+            assert!(service.supervision_task.lock().unwrap().is_none());
+            assert_eq!(cleanup.cleanup_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(cleanup.confirmation_calls.load(Ordering::SeqCst), 1);
+            assert!(reporter.events.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn rejected_install_reports_only_a_sanitized_cleanup_failure() {
+        tauri::async_runtime::block_on(async {
+            let (notices, _) = watch::channel(None);
+            let cleanup = Arc::new(ConfirmingCleanup::default());
+            cleanup.fail_confirmation.store(true, Ordering::SeqCst);
+            let reporter = Arc::new(RecordingReporter::default());
+            let service = Arc::new(DesktopRuntimeService::with_reporter_and_shutdown(
+                CompletedRuntime {
+                    notices,
+                    terminal: false,
+                },
+                FakeNavigator::default(),
+                Arc::clone(&reporter) as Arc<dyn DesktopDiagnosticReporter>,
+                Arc::clone(&cleanup) as Arc<dyn RuntimeShutdown>,
+            ));
+            let registry = RuntimeShutdownRegistry::default();
+            registry.shutdown(APPLICATION_QUIT_REASON).await.unwrap();
+            assert!(!registry.install(Arc::clone(&service) as Arc<dyn RuntimeShutdown>));
+
+            cleanup_rejected_runtime(
+                service as Arc<dyn RuntimeShutdown>,
+                Arc::clone(&reporter) as Arc<dyn DesktopDiagnosticReporter>,
+            )
+            .await;
+
+            assert_eq!(
+                *reporter.events.lock().unwrap(),
+                vec![DesktopDiagnosticEvent::ShutdownFailed]
+            );
         });
     }
 

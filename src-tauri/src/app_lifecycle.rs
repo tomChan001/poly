@@ -156,6 +156,17 @@ impl RuntimeShutdownRegistry {
 }
 
 #[cfg(any(target_os = "macos", test))]
+pub(crate) async fn cleanup_rejected_runtime(
+    runtime: Arc<dyn RuntimeShutdown>,
+    reporter: Arc<dyn crate::desktop_service::DesktopDiagnosticReporter>,
+) {
+    runtime.cleanup_owned();
+    if runtime.wait_for_cleanup().await.is_err() {
+        reporter.report(crate::desktop_service::DesktopDiagnosticEvent::ShutdownFailed);
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
 impl RuntimeShutdown for RuntimeShutdownRegistry {
     fn shutdown(&self, reason: &'static str) -> ShutdownFuture<'_> {
         self.closing.store(true, Ordering::Release);

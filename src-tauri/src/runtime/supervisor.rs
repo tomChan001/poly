@@ -2171,6 +2171,47 @@ mod tests {
     }
 
     #[test]
+    fn consumed_cleanup_message_does_not_signal_the_owned_group_twice() {
+        let script = ChildScript {
+            stdout_pending: true,
+            wait_pending: true,
+            stderr_pending: true,
+            ..ChildScript::crash("", Duration::ZERO)
+        };
+        let (mut supervisor, state, _clock, support_dir) =
+            fake_supervisor(vec![script], "single-authoritative-cleanup");
+        let cleanup = supervisor.shutdown_control();
+        let observed_state = Arc::clone(&state);
+        let (sender, _receiver) = mpsc::channel(16);
+
+        let outcome = runtime().block_on(async {
+            let supervision =
+                tokio::spawn(async move { supervisor.supervise_until_terminal(sender).await });
+            while observed_state.lock().unwrap().launches == 0 {
+                tokio::task::yield_now().await;
+            }
+            RuntimeShutdown::cleanup_owned(&cleanup);
+            let outcome = supervision
+                .await
+                .expect("supervision task must finish")
+                .expect("cleanup control must stop supervision");
+            RuntimeShutdown::wait_for_cleanup(&cleanup).await.unwrap();
+            RuntimeShutdown::cleanup_owned(&cleanup);
+            RuntimeShutdown::wait_for_cleanup(&cleanup).await.unwrap();
+            outcome
+        });
+
+        assert_eq!(outcome, SupervisionOutcome::Stopped);
+        let state = state.lock().unwrap();
+        assert_eq!(state.exact_signals, 1);
+        assert_eq!(state.exact_confirmations, 1);
+        assert_eq!(state.kills, 0);
+        assert_eq!(state.drop_signals, 0);
+        drop(state);
+        std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
     fn broken_pipe_start_write_uses_retry_policy_and_latches_on_fourth() {
         let scripts = (0..4).map(|_| ChildScript::start_write_error()).collect();
         let (mut supervisor, state, clock, support_dir) =
