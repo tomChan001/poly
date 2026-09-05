@@ -1,4 +1,12 @@
+import os
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+DESKTOP_MODE_ENV = "POLY_DESKTOP_MODE"
+
+
+def desktop_mode_enabled() -> bool:
+    return os.environ.get(DESKTOP_MODE_ENV) == "1"
 
 
 class Settings(BaseSettings):
@@ -12,4 +20,4 @@ class Settings(BaseSettings):
     polymarket_gamma_url: str = "https://gamma-api.polymarket.com"
 
 
-settings = Settings()
+settings = Settings(_env_file=None if desktop_mode_enabled() else ".env")  # type: ignore[call-arg]

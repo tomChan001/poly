@@ -17,7 +17,7 @@ from backend.app.api.routes.runtime import router as runtime_router
 from backend.app.api.routes.settings import router as settings_router
 from backend.app.api.routes.system_control import router as system_control_router
 from backend.app.container import ApplicationContainer
-from backend.app.core.config import Settings, settings
+from backend.app.core.config import Settings, desktop_mode_enabled, settings
 from backend.app.core.security import is_local_setup_request, is_loopback_request
 from backend.app.desktop.session import COOKIE_NAME, DesktopSession
 from backend.app.services.system_control import OpeningControlPersistenceError
@@ -181,4 +181,6 @@ def create_app(
     return application
 
 
-app = create_app()
+# Uvicorn's normal ``backend.app.main:app`` target retains its eager application,
+# while the desktop runtime imports only ``create_app`` with explicit settings.
+app = None if desktop_mode_enabled() else create_app()

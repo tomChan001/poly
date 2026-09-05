@@ -66,11 +66,25 @@ def test_workflow_separates_validation_from_protected_release_signing() -> None:
 
 def test_workflow_has_the_required_ordered_locked_pipeline() -> None:
     workflow = read(WORKFLOW)
+    action_pins = {
+        "actions/checkout": ("11d5960a326750d5838078e36cf38b85af677262", "v4"),
+        "actions/setup-node": ("49933ea5288caeca8642d1e84afbd3f7d6820020", "v4"),
+        "astral-sh/setup-uv": ("d0d8abe699bfb85fec6de9f7adb5ae17292296ff", "v6"),
+        "dtolnay/rust-toolchain": (
+            "688313b0823df1393bcebb1b4add0438a6d36884",
+            "1.88.0",
+        ),
+        "Swatinem/rust-cache": ("49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c", "v2"),
+        "actions/upload-artifact": (
+            "ea165f8d65b6e75b540449e92b4886f43607fa02",
+            "v4",
+        ),
+    }
     ordered_markers = (
-        "actions/checkout@v",
-        "actions/setup-node@v",
+        f"actions/checkout@{action_pins['actions/checkout'][0]}",
+        f"actions/setup-node@{action_pins['actions/setup-node'][0]}",
         "npm ci",
-        "astral-sh/setup-uv@v",
+        f"astral-sh/setup-uv@{action_pins['astral-sh/setup-uv'][0]}",
         "uv sync --frozen",
         "uv run --frozen pytest backend/tests/unit backend/tests/security",
         "npm run lint",
@@ -86,13 +100,28 @@ def test_workflow_has_the_required_ordered_locked_pipeline() -> None:
         "cargo tauri build --target",
         "xcrun stapler",
         "packaging/macos/verify-bundle.sh",
-        "actions/upload-artifact@v",
+        f"actions/upload-artifact@{action_pins['actions/upload-artifact'][0]}",
     )
     positions = [workflow.index(marker) for marker in ordered_markers]
     assert positions == sorted(positions)
-    for uses in re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s]+)", workflow):
-        assert "@" in uses
-        assert not uses.endswith(("@main", "@master"))
+    uses_entries = re.findall(
+        r"(?m)^\s*-?\s*uses:\s*([^\s#]+)\s*(?:#\s*(\S+))?\s*$", workflow
+    )
+    assert uses_entries
+    observed_counts: dict[str, int] = {}
+    for uses, version_comment in uses_entries:
+        owner, separator, revision = uses.partition("@")
+        assert separator == "@"
+        assert re.fullmatch(r"[0-9a-f]{40}", revision)
+        assert owner in action_pins
+        expected_revision, expected_version = action_pins[owner]
+        assert revision == expected_revision
+        assert version_comment == expected_version
+        observed_counts[owner] = observed_counts.get(owner, 0) + 1
+    assert observed_counts == {
+        **{owner: 1 for owner in action_pins if owner != "actions/upload-artifact"},
+        "actions/upload-artifact": 2,
+    }
 
 
 def test_smoke_uses_an_isolated_home_installed_dmg_and_command_guards() -> None:
@@ -259,7 +288,7 @@ def test_non_release_diagnostics_are_collected_and_uploaded_even_on_failure() ->
     assert "Upload validation diagnostics" in workflow
     assert re.search(
         r"Upload validation diagnostics.*?if:\s*\$\{\{\s*always\(\).*?"
-        r"actions/upload-artifact@v4",
+        r"actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
         workflow,
         re.DOTALL,
     )

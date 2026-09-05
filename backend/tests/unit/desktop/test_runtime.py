@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import stat
+import subprocess
 import sys
 import threading
 import types
@@ -34,6 +35,8 @@ from backend.app.services.live_runtime import LiveRuntimeService
 from backend.app.services.settings import RiskPolicyStore
 from backend.app.services.system_control import SystemControl
 
+ROOT = Path(__file__).resolve().parents[4]
+
 
 def populate_self_test_layout(root: Path) -> dict[str, Path]:
     paths = {
@@ -54,6 +57,125 @@ def populate_self_test_layout(root: Path) -> dict[str, Path]:
         executable = paths[name]
         executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
     return paths
+
+
+@pytest.mark.parametrize(
+    ("runtime_args", "expected_returncode", "expected_fields"),
+    [
+        (["--self-test"], 0, {"state": "stopped", "self_test": "ok"}),
+        (
+            ["--keychain-smoke", "delete", "--account", "invalid"],
+            1,
+            {"state": "failed", "code": "keychain_smoke_failed"},
+        ),
+    ],
+)
+def test_desktop_entrypoint_ignores_hostile_inherited_cwd_dotenv(
+    tmp_path: Path,
+    runtime_args: list[str],
+    expected_returncode: int,
+    expected_fields: dict[str, str],
+) -> None:
+    packaged_root = tmp_path / "packaged-runtime"
+    populate_self_test_layout(packaged_root)
+    hostile_cwd = tmp_path / "hostile-cwd"
+    hostile_cwd.mkdir()
+    sentinel = "malicious-dotenv-sentinel"
+    (hostile_cwd / ".env").write_text(
+        f"RUNTIME_POLL_SECONDS={sentinel}\n", encoding="utf-8"
+    )
+    probe = """
+import runpy
+import sys
+
+sys._MEIPASS = sys.argv[1]
+runtime_args = sys.argv[2:]
+sys.argv = ["poly-runtime", *runtime_args]
+runpy.run_module("backend.app.desktop", run_name="__main__")
+"""
+    environment = os.environ.copy()
+    environment.pop("POLY_DESKTOP_MODE", None)
+    environment["PYTHONPATH"] = str(ROOT)
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(packaged_root), *runtime_args],
+        cwd=hostile_cwd,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == expected_returncode, result.stderr
+    assert sentinel not in result.stdout
+    assert sentinel not in result.stderr
+    event = json.loads(result.stdout)
+    for key, value in expected_fields.items():
+        assert event[key] == value
+
+
+def test_desktop_mode_import_of_main_skips_unused_default_container(
+    tmp_path: Path,
+) -> None:
+    hostile_cwd = tmp_path / "hostile-cwd"
+    hostile_cwd.mkdir()
+    (hostile_cwd / ".env").write_text(
+        "RUNTIME_POLL_SECONDS=malicious-dotenv-sentinel\n", encoding="utf-8"
+    )
+    probe = """
+import importlib
+import os
+
+os.environ["POLY_DESKTOP_MODE"] = "1"
+container_module = importlib.import_module("backend.app.container")
+
+def reject_unused_container(cls, *args, **kwargs):
+    raise AssertionError("desktop import constructed an unused default container")
+
+container_module.ApplicationContainer.runtime = classmethod(reject_unused_container)
+main_module = importlib.import_module("backend.app.main")
+assert main_module.app is None
+"""
+    environment = os.environ.copy()
+    environment.pop("POLY_DESKTOP_MODE", None)
+    environment["PYTHONPATH"] = str(ROOT)
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=hostile_cwd,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_normal_server_module_still_exports_default_fastapi_app(tmp_path: Path) -> None:
+    probe = """
+from fastapi import FastAPI
+from backend.app.main import app
+
+assert isinstance(app, FastAPI)
+"""
+    environment = os.environ.copy()
+    environment.pop("POLY_DESKTOP_MODE", None)
+    environment["PYTHONPATH"] = str(ROOT)
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 class FakePostgres:

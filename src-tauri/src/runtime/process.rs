@@ -468,20 +468,30 @@ impl RuntimeLauncher for ProductionLauncher {
         if !request.args.is_empty() {
             return Err(LaunchError::UnexpectedArguments);
         }
-        let executable = resolve_runtime_executable(&self.resource_dir)?;
-        let mut command = Command::new(executable);
-        command
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        copy_allowlisted_environment(&mut command);
-        configure_process_group(&mut command);
+        let mut command = build_production_command(&self.resource_dir)?;
         let child = command.spawn().map_err(LaunchError::Io)?;
         Ok(Box::new(ProductionChild::new(child)))
     }
+}
+
+fn build_production_command(resource_dir: &Path) -> Result<Command, LaunchError> {
+    let executable = resolve_runtime_executable(resource_dir)?;
+    let runtime_dir = executable
+        .parent()
+        .ok_or(LaunchError::InvalidResourceDirectory)?;
+    let mut command = Command::new(&executable);
+    command
+        .current_dir(runtime_dir)
+        .env_clear()
+        .env("POLY_DESKTOP_MODE", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    copy_allowlisted_environment(&mut command);
+    configure_process_group(&mut command);
+    Ok(command)
 }
 
 fn copy_allowlisted_environment(command: &mut Command) {
@@ -1173,6 +1183,36 @@ mod tests {
     fn absolute_test_dirs() -> (PathBuf, PathBuf) {
         let root = std::env::current_dir().unwrap();
         (root.join("data"), root.join("runtime"))
+    }
+
+    #[test]
+    fn production_command_uses_canonical_bundle_cwd_and_explicit_desktop_mode() {
+        let root = std::env::temp_dir().join(format!(
+            "poly-runtime-command-test-{}",
+            generate_launch_token().unwrap()
+        ));
+        let bundle = root.join("poly-runtime");
+        fs::create_dir_all(&bundle).unwrap();
+        let executable = bundle.join("poly-runtime");
+        fs::write(&executable, b"runtime").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let command = build_production_command(&root).unwrap();
+        let command = command.as_std();
+        assert_eq!(
+            command.get_current_dir(),
+            Some(bundle.canonicalize().unwrap().as_path())
+        );
+        assert!(command.get_envs().any(|(name, value)| {
+            name == std::ffi::OsStr::new("POLY_DESKTOP_MODE")
+                && value == Some(std::ffi::OsStr::new("1"))
+        }));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

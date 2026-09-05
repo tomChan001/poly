@@ -14,6 +14,11 @@ from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Protocol
 
+# The frozen entry point must declare desktop mode before any application import
+# can construct global settings from the inherited working directory.
+if __name__ == "__main__" or getattr(sys, "frozen", False):
+    os.environ["POLY_DESKTOP_MODE"] = "1"
+
 from backend.app.core.secrets import KeyringSecretStore, SecretStore
 from backend.app.desktop.protocol import (
     RuntimeEvent,

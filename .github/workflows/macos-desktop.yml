@@ -40,10 +40,10 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
           cache: npm
@@ -54,7 +54,7 @@ jobs:
         run: npm ci
 
       - name: Set up uv and Python
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
         with:
           version: '0.8.15'
           python-version: '3.12'
@@ -82,13 +82,13 @@ jobs:
         run: npm run build
 
       - name: Set up Rust 1.88
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@688313b0823df1393bcebb1b4add0438a6d36884 # 1.88.0
         with:
           targets: ${{ matrix.rust_target }}
           components: rustfmt, clippy
 
       - name: Cache Rust build inputs
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: src-tauri
           key: ${{ matrix.rust_target }}
@@ -563,7 +563,7 @@ jobs:
 
       - name: Upload validation diagnostics
         if: ${{ always() && env.IS_RELEASE != 'true' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}-diagnostics-${{ github.run_attempt }}
           path: ${{ runner.temp }}/poly-diagnostics
@@ -571,7 +571,7 @@ jobs:
           retention-days: 7
 
       - name: Upload architecture-specific DMG
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}
           path: src-tauri/target/${{ matrix.rust_target }}/release/bundle/dmg/*.dmg
