@@ -104,6 +104,17 @@ pub enum ProcessError {
     MissingPipe(&'static str),
     #[error("runtime shutdown timed out and owned process cleanup failed")]
     ForcedCleanup(#[source] io::Error),
+    #[error("runtime shutdown failed during {stage:?}; owned cleanup failed: {cleanup_failed}")]
+    ShutdownFailed {
+        stage: ShutdownStage,
+        cleanup_failed: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShutdownStage {
+    WriteCommand,
+    Wait,
 }
 
 #[derive(Serialize)]
@@ -196,19 +207,33 @@ impl RunningRuntime {
         self.shutdown_with_timeout(DEFAULT_SHUTDOWN_TIMEOUT).await
     }
 
+    pub async fn wait(&mut self) -> Result<(), ProcessError> {
+        self.child.wait().await.map_err(ProcessError::Io)
+    }
+
     pub async fn shutdown_with_timeout(&mut self, timeout: Duration) -> Result<(), ProcessError> {
         let line = command_line(&ShutdownCommand {
             version: PROTOCOL_VERSION,
             command: "shutdown",
         })?;
-        self.child
-            .write_stdin(&line)
-            .await
-            .map_err(ProcessError::Io)?;
+        if self.child.write_stdin(&line).await.is_err() {
+            let cleanup_failed = self.child.kill_owned().await.is_err();
+            return Err(ProcessError::ShutdownFailed {
+                stage: ShutdownStage::WriteCommand,
+                cleanup_failed,
+            });
+        }
 
         if !timeout.is_zero() {
             if let Ok(result) = tokio::time::timeout(timeout, self.child.wait()).await {
-                return result.map_err(ProcessError::Io);
+                if result.is_ok() {
+                    return Ok(());
+                }
+                let cleanup_failed = self.child.kill_owned().await.is_err();
+                return Err(ProcessError::ShutdownFailed {
+                    stage: ShutdownStage::Wait,
+                    cleanup_failed,
+                });
             }
         }
 
@@ -242,7 +267,8 @@ where
 
         let newline = buffer.iter().position(|&byte| byte == b'\n');
         let content_length = newline.unwrap_or(buffer.len());
-        if line.len() + content_length > MAX_EVENT_LINE_BYTES {
+        let framing_length = usize::from(newline.is_some());
+        if line.len() + content_length + framing_length > MAX_EVENT_LINE_BYTES {
             return Err(ProcessError::EventLineTooLong);
         }
         line.extend_from_slice(&buffer[..content_length]);
@@ -487,6 +513,8 @@ impl DiagnosticLog {
         fs::create_dir_all(&directory)?;
         let path = directory.join("runtime.stderr.log");
         let rotated_path = directory.join("runtime.stderr.log.1");
+        bound_existing_file(&path)?;
+        bound_existing_file(&rotated_path)?;
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let length = file.metadata()?.len();
         Ok(Self {
@@ -533,6 +561,19 @@ impl DiagnosticLog {
             .open(&self.path)?;
         self.length = 0;
         Ok(())
+    }
+}
+
+fn bound_existing_file(path: &Path) -> io::Result<()> {
+    match OpenOptions::new().write(true).open(path) {
+        Ok(file) => {
+            if file.metadata()?.len() > MAX_DIAGNOSTIC_FILE_BYTES {
+                file.set_len(MAX_DIAGNOSTIC_FILE_BYTES)?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -624,6 +665,11 @@ pub fn redact_diagnostic_line(line: &str) -> String {
                 .iter()
                 .any(|candidate| key.eq_ignore_ascii_case(candidate))
             {
+                if value.is_empty() {
+                    let mut redacted = "[REDACTED]".to_owned();
+                    redacted.push_str(line_ending);
+                    return redacted;
+                }
                 result.push(format!("{key}{delimiter}[REDACTED]"));
                 suppress_value = value.is_empty() || key.eq_ignore_ascii_case("authorization");
             } else {
@@ -697,6 +743,7 @@ mod tests {
     struct FakeState {
         requests: Vec<LaunchRequest>,
         writes: Vec<Vec<u8>>,
+        write_results: VecDeque<io::Result<()>>,
         waits: VecDeque<io::Result<()>>,
         killed: usize,
     }
@@ -735,8 +782,9 @@ mod tests {
         fn write_stdin<'a>(&'a mut self, bytes: &'a [u8]) -> IoFuture<'a> {
             let state = Arc::clone(&self.0);
             Box::pin(async move {
-                state.lock().unwrap().writes.push(bytes.to_vec());
-                Ok(())
+                let mut state = state.lock().unwrap();
+                state.writes.push(bytes.to_vec());
+                state.write_results.pop_front().unwrap_or(Ok(()))
             })
         }
 
@@ -859,11 +907,30 @@ mod tests {
             runtime().block_on(read_runtime_event(&mut reader)),
             Err(ProcessError::EventLineTooLong)
         ));
+
+        let base = b"{\"version\":1,\"state\":\"initializing\"}";
+        let mut exactly_maximum = base.to_vec();
+        exactly_maximum.resize(MAX_EVENT_LINE_BYTES - 1, b' ');
+        exactly_maximum.push(b'\n');
+        let mut reader = BufReader::new(exactly_maximum.as_slice());
+        assert!(matches!(
+            runtime().block_on(read_runtime_event(&mut reader)),
+            Ok(RuntimeStreamItem::Event(RuntimeEvent::Initializing))
+        ));
+
+        let mut over_framing_limit = base.to_vec();
+        over_framing_limit.resize(MAX_EVENT_LINE_BYTES, b' ');
+        over_framing_limit.push(b'\n');
+        let mut reader = BufReader::new(over_framing_limit.as_slice());
+        assert!(matches!(
+            runtime().block_on(read_runtime_event(&mut reader)),
+            Err(ProcessError::EventLineTooLong)
+        ));
     }
 
     #[test]
     fn diagnostic_redaction_hides_all_sensitive_key_values_case_insensitively() {
-        let line = "Authorization: Bearer abc cookie=session PRIVATE_KEY=pem secret: hush Signature=sig ToKeN=tok safe=value";
+        let line = "Authorization=abc cookie=session PRIVATE_KEY=pem secret=hush Signature=sig ToKeN=tok safe=value";
         let redacted = redact_diagnostic_line(line);
 
         for value in ["abc", "session", "pem", "hush", "sig", "tok"] {
@@ -871,6 +938,15 @@ mod tests {
         }
         assert!(redacted.contains("safe=value"));
         assert_eq!(redacted.matches("[REDACTED]").count(), 6);
+
+        for ambiguous in [
+            "cookie: session=abc safe=value",
+            "Authorization: Bearer abc next=x",
+        ] {
+            let redacted = redact_diagnostic_line(ambiguous);
+            assert!(!redacted.contains("session=abc"), "leaked: {redacted}");
+            assert!(!redacted.contains("Bearer abc"), "leaked: {redacted}");
+        }
 
         let json = redact_diagnostic_line(
             r#"{"TOKEN":"json-secret","nested":{"private_key":"pem-secret"},"safe":"visible"}"#,
@@ -913,6 +989,46 @@ mod tests {
             .unwrap();
 
         assert_eq!(state.lock().unwrap().killed, 0);
+    }
+
+    #[test]
+    fn shutdown_write_failure_still_kills_the_owned_child() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let launcher = FakeLauncher(Arc::clone(&state));
+        let (data_dir, runtime_dir) = absolute_test_dirs();
+        let mut running = runtime()
+            .block_on(launch_runtime(&launcher, &data_dir, &runtime_dir))
+            .unwrap();
+        state
+            .lock()
+            .unwrap()
+            .write_results
+            .push_back(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")));
+
+        let result = runtime().block_on(running.shutdown_with_timeout(Duration::from_secs(1)));
+
+        assert!(result.is_err());
+        assert_eq!(state.lock().unwrap().killed, 1);
+    }
+
+    #[test]
+    fn shutdown_wait_failure_still_kills_the_owned_child() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let launcher = FakeLauncher(Arc::clone(&state));
+        let (data_dir, runtime_dir) = absolute_test_dirs();
+        let mut running = runtime()
+            .block_on(launch_runtime(&launcher, &data_dir, &runtime_dir))
+            .unwrap();
+        state
+            .lock()
+            .unwrap()
+            .waits
+            .push_back(Err(io::Error::other("wait failed")));
+
+        let result = runtime().block_on(running.shutdown_with_timeout(Duration::from_secs(1)));
+
+        assert!(result.is_err());
+        assert_eq!(state.lock().unwrap().killed, 1);
     }
 
     #[test]
@@ -962,6 +1078,30 @@ mod tests {
         assert!(!contents.contains("split-secret"));
         assert!(contents.contains("[REDACTED]"));
         assert!(contents.contains("visible"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opening_an_oversized_existing_log_restores_the_one_mib_bound() {
+        let root = std::env::temp_dir().join(format!(
+            "poly-runtime-existing-log-test-{}",
+            generate_launch_token().unwrap()
+        ));
+        let log_dir = root.join("Poly").join("logs");
+        fs::create_dir_all(&log_dir).unwrap();
+        fs::write(
+            log_dir.join("runtime.stderr.log"),
+            vec![b'x'; MAX_DIAGNOSTIC_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        let _log = DiagnosticLog::under_application_support(&root).unwrap();
+
+        for name in ["runtime.stderr.log", "runtime.stderr.log.1"] {
+            if let Ok(metadata) = fs::metadata(log_dir.join(name)) {
+                assert!(metadata.len() <= MAX_DIAGNOSTIC_FILE_BYTES, "{name}");
+            }
+        }
         fs::remove_dir_all(root).unwrap();
     }
 }

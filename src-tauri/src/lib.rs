@@ -1,6 +1,9 @@
 pub mod runtime;
 
 pub use runtime::process::{launch_runtime, ProductionLauncher, RunningRuntime};
+pub use runtime::supervisor::{
+    RuntimeSupervisor, RuntimeSupervisorNotice, SupervisionOutcome, SystemClock,
+};
 
 #[cfg(target_os = "macos")]
 pub fn run() {
@@ -128,7 +131,7 @@ mod tests {
 
     #[test]
     fn supervisor_follows_ordered_runtime_transitions() {
-        let mut supervisor = Supervisor::new(2);
+        let mut supervisor = Supervisor::new();
         let events = [
             parse(r#"{"version":1,"state":"initializing"}"#),
             parse(r#"{"version":1,"state":"preparing_database"}"#),
@@ -149,7 +152,7 @@ mod tests {
 
     #[test]
     fn supervisor_rejects_out_of_order_events() {
-        let mut supervisor = Supervisor::new(2);
+        let mut supervisor = Supervisor::new();
         let ready = parse(
             r#"{"version":1,"state":"ready","port":49152,"bootstrap_path":"/desktop/bootstrap/safe"}"#,
         );
@@ -160,7 +163,7 @@ mod tests {
 
     #[test]
     fn deterministic_failures_are_terminal() {
-        let mut supervisor = Supervisor::new(2);
+        let mut supervisor = Supervisor::new();
         supervisor
             .apply(parse(r#"{"version":1,"state":"initializing"}"#))
             .unwrap();
@@ -176,32 +179,8 @@ mod tests {
     }
 
     #[test]
-    fn retryable_failures_retry_until_the_bound_then_become_terminal() {
-        let mut supervisor = Supervisor::new(2);
-
-        for expected_attempt in 1..=2 {
-            supervisor
-                .apply(parse(r#"{"version":1,"state":"initializing"}"#))
-                .unwrap();
-            let action = supervisor
-                .apply(parse(
-                    r#"{"version":1,"state":"failed","code":"runtime_unavailable","detail":"runtime exited"}"#,
-                ))
-                .unwrap();
-            assert_eq!(
-                action,
-                SupervisorAction::Retry {
-                    attempt: expected_attempt
-                }
-            );
-            assert_eq!(
-                supervisor.state(),
-                &SupervisorState::Restarting {
-                    attempt: expected_attempt
-                }
-            );
-        }
-
+    fn state_machine_has_no_competing_retry_counter() {
+        let mut supervisor = Supervisor::new();
         supervisor
             .apply(parse(r#"{"version":1,"state":"initializing"}"#))
             .unwrap();
@@ -213,5 +192,44 @@ mod tests {
 
         assert_eq!(action, SupervisorAction::Terminal);
         assert!(matches!(supervisor.state(), SupervisorState::Failed { .. }));
+
+        supervisor.begin_restart(2).unwrap();
+        assert_eq!(
+            supervisor.state(),
+            &SupervisorState::Restarting { attempt: 2 }
+        );
+        supervisor
+            .apply(parse(r#"{"version":1,"state":"initializing"}"#))
+            .unwrap();
+    }
+
+    #[test]
+    fn explicit_operator_retry_resets_terminal_state_to_idle() {
+        let mut supervisor = Supervisor::new();
+        supervisor
+            .apply(parse(r#"{"version":1,"state":"initializing"}"#))
+            .unwrap();
+        supervisor
+            .apply(parse(
+                r#"{"version":1,"state":"failed","code":"migration_failed","detail":"database migration failed"}"#,
+            ))
+            .unwrap();
+
+        supervisor.reset_for_operator_retry().unwrap();
+
+        assert_eq!(supervisor.state(), &SupervisorState::Idle);
+        supervisor
+            .apply(parse(r#"{"version":1,"state":"initializing"}"#))
+            .unwrap();
+    }
+
+    #[test]
+    fn explicit_operator_retry_can_cancel_a_pending_restart() {
+        let mut supervisor = Supervisor::new();
+        supervisor.begin_restart(1).unwrap();
+
+        supervisor.reset_for_operator_retry().unwrap();
+
+        assert_eq!(supervisor.state(), &SupervisorState::Idle);
     }
 }

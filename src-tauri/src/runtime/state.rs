@@ -29,28 +29,69 @@ pub enum SupervisorState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SupervisorAction {
     None,
-    Retry { attempt: u8 },
     Terminal,
 }
 
 #[derive(Debug)]
 pub struct Supervisor {
     state: SupervisorState,
-    retry_attempts: u8,
-    max_retries: u8,
 }
 
 impl Supervisor {
-    pub const fn new(max_retries: u8) -> Self {
+    pub const fn new() -> Self {
         Self {
             state: SupervisorState::Idle,
-            retry_attempts: 0,
-            max_retries,
         }
     }
 
     pub const fn state(&self) -> &SupervisorState {
         &self.state
+    }
+
+    pub fn begin_restart(&mut self, attempt: u8) -> Result<(), TransitionError> {
+        if attempt == 0
+            || matches!(
+                self.state,
+                SupervisorState::ShuttingDown | SupervisorState::Stopped
+            )
+        {
+            return Err(TransitionError::RetryFrom {
+                from: self.state.clone(),
+                attempt,
+            });
+        }
+        self.state = SupervisorState::Restarting { attempt };
+        Ok(())
+    }
+
+    pub fn reset_for_operator_retry(&mut self) -> Result<(), TransitionError> {
+        if !matches!(
+            self.state,
+            SupervisorState::Failed { .. } | SupervisorState::Restarting { .. }
+        ) {
+            return Err(TransitionError::ResetFrom {
+                from: self.state.clone(),
+            });
+        }
+        self.state = SupervisorState::Idle;
+        Ok(())
+    }
+
+    pub fn mark_terminal_failure(
+        &mut self,
+        code: FailureCode,
+        detail: String,
+    ) -> Result<(), TransitionError> {
+        if matches!(
+            self.state,
+            SupervisorState::ShuttingDown | SupervisorState::Stopped
+        ) {
+            return Err(TransitionError::TerminalFrom {
+                from: self.state.clone(),
+            });
+        }
+        self.state = SupervisorState::Failed { code, detail };
+        Ok(())
     }
 
     pub fn apply(&mut self, event: RuntimeEvent) -> Result<SupervisorAction, TransitionError> {
@@ -133,23 +174,15 @@ impl Supervisor {
             });
         }
 
-        if is_retryable_failure(code) && self.retry_attempts < self.max_retries {
-            self.retry_attempts += 1;
-            self.state = SupervisorState::Restarting {
-                attempt: self.retry_attempts,
-            };
-            return Ok(SupervisorAction::Retry {
-                attempt: self.retry_attempts,
-            });
-        }
-
         self.state = SupervisorState::Failed { code, detail };
         Ok(SupervisorAction::Terminal)
     }
 }
 
-fn is_retryable_failure(code: FailureCode) -> bool {
-    code == FailureCode::RuntimeUnavailable
+impl Default for Supervisor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -159,4 +192,10 @@ pub enum TransitionError {
         from: SupervisorState,
         event: RuntimeState,
     },
+    #[error("cannot begin retry attempt {attempt} from {from:?}")]
+    RetryFrom { from: SupervisorState, attempt: u8 },
+    #[error("cannot reset runtime supervisor from {from:?}")]
+    ResetFrom { from: SupervisorState },
+    #[error("cannot record terminal runtime failure from {from:?}")]
+    TerminalFrom { from: SupervisorState },
 }
