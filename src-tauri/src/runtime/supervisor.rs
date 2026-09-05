@@ -3,7 +3,7 @@ use std::future::{poll_fn, Future};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rand::Rng as _;
@@ -199,10 +199,17 @@ pub enum RuntimeSupervisorError {
 #[derive(Clone)]
 pub struct RuntimeShutdownControl {
     requests: mpsc::UnboundedSender<RuntimeControlMessage>,
-    retained_cleanup: Arc<RwLock<Option<Arc<dyn OwnedRuntimeCleanup>>>>,
+    owned_cleanup: Arc<Mutex<OwnedCleanupState>>,
     pending_cleanup: Arc<Mutex<Option<PendingOwnedCleanup>>>,
     supervision_active: watch::Sender<bool>,
     cleanup_requested: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct OwnedCleanupState {
+    next_generation: u64,
+    active_generation: u64,
+    retained: Option<(u64, Arc<dyn OwnedRuntimeCleanup>)>,
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -249,6 +256,15 @@ impl RuntimeShutdownControl {
         .await
         .map_err(|_| RuntimeShutdownError::Unavailable)?
     }
+
+    fn register_owned_cleanup(&self, cleanup: Option<Arc<dyn OwnedRuntimeCleanup>>) {
+        let mut owned = self
+            .owned_cleanup
+            .lock()
+            .expect("owned cleanup lock poisoned");
+        let generation = owned.active_generation;
+        owned.retained = cleanup.map(|cleanup| (generation, cleanup));
+    }
 }
 
 impl RuntimeShutdown for RuntimeShutdownControl {
@@ -264,12 +280,14 @@ impl RuntimeShutdown for RuntimeShutdownControl {
         if self.cleanup_requested.swap(true, Ordering::AcqRel) {
             return;
         }
-        if let Some(cleanup) = self
-            .retained_cleanup
-            .read()
+        let cleanup = self
+            .owned_cleanup
+            .lock()
             .expect("owned cleanup lock poisoned")
-            .clone()
-        {
+            .retained
+            .take()
+            .map(|(_, cleanup)| cleanup);
+        if let Some(cleanup) = cleanup {
             let signal_failed = cleanup.signal().is_err();
             *self
                 .pending_cleanup
@@ -282,11 +300,54 @@ impl RuntimeShutdown for RuntimeShutdownControl {
         let _ = self.requests.send(RuntimeControlMessage::CleanupOwned);
     }
 
+    fn begin_supervision_generation(&self) -> u64 {
+        let mut owned = self
+            .owned_cleanup
+            .lock()
+            .expect("owned cleanup lock poisoned");
+        owned.next_generation = owned.next_generation.wrapping_add(1).max(1);
+        owned.active_generation = owned.next_generation;
+        owned.retained = None;
+        self.cleanup_requested.store(false, Ordering::Release);
+        owned.active_generation
+    }
+
     fn owned_cleanup_handle(&self) -> Option<Arc<dyn OwnedRuntimeCleanup>> {
-        self.retained_cleanup
-            .read()
+        self.owned_cleanup
+            .lock()
             .expect("owned cleanup lock poisoned")
-            .clone()
+            .retained
+            .as_ref()
+            .map(|(_, cleanup)| Arc::clone(cleanup))
+    }
+
+    fn take_owned_cleanup_handle(&self, generation: u64) -> Option<Arc<dyn OwnedRuntimeCleanup>> {
+        let mut owned = self
+            .owned_cleanup
+            .lock()
+            .expect("owned cleanup lock poisoned");
+        if owned
+            .retained
+            .as_ref()
+            .is_some_and(|(retained_generation, _)| *retained_generation == generation)
+        {
+            return owned.retained.take().map(|(_, cleanup)| cleanup);
+        }
+        None
+    }
+
+    fn finish_supervision_generation(&self, generation: u64) {
+        let mut owned = self
+            .owned_cleanup
+            .lock()
+            .expect("owned cleanup lock poisoned");
+        if owned
+            .retained
+            .as_ref()
+            .is_some_and(|(retained_generation, _)| *retained_generation == generation)
+        {
+            owned.retained = None;
+        }
     }
 
     fn wait_for_cleanup(&self) -> ShutdownFuture<'_> {
@@ -392,7 +453,7 @@ where
     ) -> Self {
         let (latest_notice, _) = watch::channel(None);
         let (requests, shutdown_requests) = mpsc::unbounded_channel();
-        let retained_cleanup = Arc::new(RwLock::new(None));
+        let owned_cleanup = Arc::new(Mutex::new(OwnedCleanupState::default()));
         let (supervision_active, _) = watch::channel(false);
         Self {
             launcher,
@@ -407,7 +468,7 @@ where
             shutdown_requests,
             shutdown_control: RuntimeShutdownControl {
                 requests,
-                retained_cleanup,
+                owned_cleanup,
                 pending_cleanup: Arc::new(Mutex::new(None)),
                 supervision_active,
                 cleanup_requested: Arc::new(AtomicBool::new(false)),
@@ -479,11 +540,8 @@ where
                         }
                     }
                 };
-            *self
-                .shutdown_control
-                .retained_cleanup
-                .write()
-                .expect("owned cleanup lock poisoned") = running.owned_cleanup_handle();
+            self.shutdown_control
+                .register_owned_cleanup(running.owned_cleanup_handle());
 
             let mut stdout = match running.take_stdout() {
                 Ok(stdout) => stdout,
@@ -2167,6 +2225,41 @@ mod tests {
         assert_eq!(state.drop_signals, 1);
         drop(state);
         std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
+    fn cleanup_registration_is_consumed_only_by_its_supervision_generation() {
+        let (supervisor, state, _clock, support_dir) =
+            fake_supervisor(Vec::new(), "generation-owned-cleanup");
+        let cleanup = supervisor.shutdown_control();
+        let first_generation = RuntimeShutdown::begin_supervision_generation(&cleanup);
+        cleanup.register_owned_cleanup(Some(Arc::new(FakeOwnedCleanup(Arc::clone(&state)))));
+
+        let retry_generation = RuntimeShutdown::begin_supervision_generation(&cleanup);
+        cleanup.register_owned_cleanup(Some(Arc::new(FakeOwnedCleanup(Arc::clone(&state)))));
+
+        assert_ne!(first_generation, retry_generation);
+        assert!(RuntimeShutdown::take_owned_cleanup_handle(&cleanup, first_generation).is_none());
+        let retry_cleanup = RuntimeShutdown::take_owned_cleanup_handle(&cleanup, retry_generation)
+            .expect("retry generation must retain its exact cleanup handle");
+        assert!(RuntimeShutdown::take_owned_cleanup_handle(&cleanup, retry_generation).is_none());
+        runtime().block_on(async {
+            retry_cleanup.signal().unwrap();
+            retry_cleanup.confirm().await.unwrap();
+        });
+
+        let normal_generation = RuntimeShutdown::begin_supervision_generation(&cleanup);
+        cleanup.register_owned_cleanup(Some(Arc::new(FakeOwnedCleanup(Arc::clone(&state)))));
+        RuntimeShutdown::finish_supervision_generation(&cleanup, normal_generation);
+        assert!(RuntimeShutdown::take_owned_cleanup_handle(&cleanup, normal_generation).is_none());
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.exact_signals, 1);
+        assert_eq!(state.exact_confirmations, 1);
+        drop(state);
+        if support_dir.exists() {
+            std::fs::remove_dir_all(support_dir).unwrap();
+        }
     }
 
     #[test]

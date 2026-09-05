@@ -297,11 +297,23 @@ pub struct DesktopRuntimeService<R, N> {
     reporter: Arc<dyn DesktopDiagnosticReporter>,
     shutdown: Arc<dyn RuntimeShutdown>,
     start_permit: Arc<dyn RuntimeStartPermit>,
-    supervision_task: SyncMutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    supervision_task: SyncMutex<Option<SupervisionTask>>,
     cleanup_requested: AtomicBool,
     shutdown_completion_timeout: std::time::Duration,
     task_cancellation_timeout: std::time::Duration,
     owned_cleanup_confirmation_timeout: std::time::Duration,
+}
+
+struct SupervisionTask {
+    generation: u64,
+    task: tauri::async_runtime::JoinHandle<()>,
+}
+
+#[cfg(test)]
+impl SupervisionTask {
+    fn inner(&self) -> &tokio::task::JoinHandle<()> {
+        self.task.inner()
+    }
 }
 
 const PHASE_IDLE: u8 = 0;
@@ -418,6 +430,7 @@ where
             return false;
         }
 
+        let generation = self.shutdown.begin_supervision_generation();
         let service = Arc::clone(self);
         let task = tauri::async_runtime::spawn(async move {
             let mut runtime = service.runtime.lock().await;
@@ -449,7 +462,8 @@ where
         *self
             .supervision_task
             .lock()
-            .expect("desktop supervision task lock poisoned") = Some(task);
+            .expect("desktop supervision task lock poisoned") =
+            Some(SupervisionTask { generation, task });
         true
     }
 
@@ -543,19 +557,22 @@ where
 {
     fn shutdown(&self, reason: &'static str) -> ShutdownFuture<'_> {
         Box::pin(async move {
-            let retained_cleanup = self.shutdown.owned_cleanup_handle();
-            let task = self
+            let supervision = self
                 .supervision_task
                 .lock()
                 .expect("desktop supervision task lock poisoned")
                 .take();
-            let Some(task) = task else {
+            let Some(SupervisionTask { generation, task }) = supervision else {
                 return Ok(());
             };
             if task.inner().is_finished() {
                 return match task.await {
-                    Ok(()) => Ok(()),
+                    Ok(()) => {
+                        self.shutdown.finish_supervision_generation(generation);
+                        Ok(())
+                    }
                     Err(_) => {
+                        let retained_cleanup = self.shutdown.take_owned_cleanup_handle(generation);
                         let _ = self.confirm_retained_cleanup(retained_cleanup).await;
                         Err(())
                     }
@@ -586,8 +603,10 @@ where
                 }
             };
             let cleanup_result = if aborted || joined.is_err() {
+                let retained_cleanup = self.shutdown.take_owned_cleanup_handle(generation);
                 self.confirm_retained_cleanup(retained_cleanup).await
             } else {
+                self.shutdown.finish_supervision_generation(generation);
                 Ok(())
             };
             result.and(joined).and(cleanup_result)
@@ -605,7 +624,7 @@ where
             .expect("desktop supervision task lock poisoned")
             .as_ref()
         {
-            task.abort();
+            task.task.abort();
         }
     }
 
@@ -618,7 +637,7 @@ where
         let shutdown = Arc::clone(&self.shutdown);
         Box::pin(async move {
             let task_result = if let Some(task) = task {
-                match tokio::time::timeout(self.task_cancellation_timeout, task).await {
+                match tokio::time::timeout(self.task_cancellation_timeout, task.task).await {
                     Ok(Ok(())) => Ok(()),
                     Ok(Err(tauri::Error::JoinError(error))) if error.is_cancelled() => Ok(()),
                     Ok(Err(_)) | Err(_) => Err(()),
@@ -841,8 +860,8 @@ mod tests {
     use std::num::NonZeroU16;
     use std::path::PathBuf;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, RwLock};
     use std::time::Duration;
 
     use tokio::sync::{watch, Barrier, Notify};
@@ -867,6 +886,7 @@ mod tests {
 
     type RuntimeFuture<'a> =
         Pin<Box<dyn Future<Output = Result<(), DesktopServiceError>> + Send + 'a>>;
+    type GenerationCleanupSlot = Arc<RwLock<Option<(u64, Arc<dyn OwnedRuntimeCleanup>)>>>;
 
     #[derive(Clone, Default)]
     struct FakeNavigator {
@@ -1118,6 +1138,138 @@ mod tests {
     struct RetainingShutdown {
         cleanup: Arc<TestOwnedCleanup>,
         pending: bool,
+    }
+
+    struct LateCleanupShutdown {
+        cleanup: GenerationCleanupSlot,
+        generation: Arc<AtomicU64>,
+        shutdown_entered: Arc<Notify>,
+    }
+
+    impl RuntimeShutdown for LateCleanupShutdown {
+        fn shutdown(&self, _reason: &'static str) -> ShutdownFuture<'_> {
+            self.shutdown_entered.notify_one();
+            Box::pin(std::future::pending())
+        }
+
+        fn cleanup_owned(&self) {}
+
+        fn begin_supervision_generation(&self) -> u64 {
+            let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+            *self.cleanup.write().unwrap() = None;
+            generation
+        }
+
+        fn owned_cleanup_handle(&self) -> Option<Arc<dyn OwnedRuntimeCleanup>> {
+            self.cleanup
+                .read()
+                .unwrap()
+                .as_ref()
+                .map(|(_, cleanup)| Arc::clone(cleanup))
+        }
+
+        fn take_owned_cleanup_handle(
+            &self,
+            generation: u64,
+        ) -> Option<Arc<dyn OwnedRuntimeCleanup>> {
+            let mut cleanup = self.cleanup.write().unwrap();
+            if cleanup
+                .as_ref()
+                .is_some_and(|(registered_generation, _)| *registered_generation == generation)
+            {
+                return cleanup.take().map(|(_, cleanup)| cleanup);
+            }
+            None
+        }
+
+        fn finish_supervision_generation(&self, generation: u64) {
+            let _ = self.take_owned_cleanup_handle(generation);
+        }
+    }
+
+    struct LateRegistrationRuntime {
+        notices: watch::Sender<Option<RuntimeSupervisorNotice>>,
+        cleanup: GenerationCleanupSlot,
+        generation: Arc<AtomicU64>,
+        registered_cleanup: Arc<TestOwnedCleanup>,
+        launch_entered: Arc<Notify>,
+        release_launch: Arc<Notify>,
+        registration_complete: Arc<Notify>,
+    }
+
+    impl DesktopRuntime for LateRegistrationRuntime {
+        fn subscribe_notices(&self) -> watch::Receiver<Option<RuntimeSupervisorNotice>> {
+            self.notices.subscribe()
+        }
+
+        fn is_terminal(&self) -> bool {
+            false
+        }
+
+        fn explicit_operator_retry(&mut self) -> Result<(), DesktopServiceError> {
+            Ok(())
+        }
+
+        fn supervise_until_terminal(&mut self) -> RuntimeFuture<'_> {
+            Box::pin(async move {
+                self.launch_entered.notify_one();
+                self.release_launch.notified().await;
+                *self.cleanup.write().unwrap() = Some((
+                    self.generation.load(Ordering::Acquire),
+                    Arc::clone(&self.registered_cleanup) as Arc<dyn OwnedRuntimeCleanup>,
+                ));
+                self.registration_complete.notify_one();
+                std::future::pending().await
+            })
+        }
+    }
+
+    struct RetryLateRegistrationRuntime {
+        notices: watch::Sender<Option<RuntimeSupervisorNotice>>,
+        cleanup: GenerationCleanupSlot,
+        cleanup_generation: Arc<AtomicU64>,
+        prior_cleanup: Arc<TestOwnedCleanup>,
+        retry_cleanup: Arc<TestOwnedCleanup>,
+        generation: usize,
+        retry_launch_entered: Arc<Notify>,
+        release_retry_launch: Arc<Notify>,
+        retry_registration_complete: Arc<Notify>,
+    }
+
+    impl DesktopRuntime for RetryLateRegistrationRuntime {
+        fn subscribe_notices(&self) -> watch::Receiver<Option<RuntimeSupervisorNotice>> {
+            self.notices.subscribe()
+        }
+
+        fn is_terminal(&self) -> bool {
+            true
+        }
+
+        fn explicit_operator_retry(&mut self) -> Result<(), DesktopServiceError> {
+            Ok(())
+        }
+
+        fn supervise_until_terminal(&mut self) -> RuntimeFuture<'_> {
+            let generation = self.generation;
+            self.generation += 1;
+            Box::pin(async move {
+                if generation == 0 {
+                    *self.cleanup.write().unwrap() = Some((
+                        self.cleanup_generation.load(Ordering::Acquire),
+                        Arc::clone(&self.prior_cleanup) as Arc<dyn OwnedRuntimeCleanup>,
+                    ));
+                    return Err(DesktopServiceError::Runtime);
+                }
+                self.retry_launch_entered.notify_one();
+                self.release_retry_launch.notified().await;
+                *self.cleanup.write().unwrap() = Some((
+                    self.cleanup_generation.load(Ordering::Acquire),
+                    Arc::clone(&self.retry_cleanup) as Arc<dyn OwnedRuntimeCleanup>,
+                ));
+                self.retry_registration_complete.notify_one();
+                std::future::pending().await
+            })
+        }
     }
 
     impl RuntimeShutdown for RetainingShutdown {
@@ -1645,6 +1797,123 @@ mod tests {
             assert_eq!(cancellations.load(Ordering::SeqCst), 1);
             assert_eq!(cleanup.signals.load(Ordering::SeqCst), 1);
             assert_eq!(cleanup.confirmations.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn shutdown_uses_cleanup_registered_after_its_initial_snapshot() {
+        tauri::async_runtime::block_on(async {
+            let (notices, _) = watch::channel(None);
+            let cleanup_slot = Arc::new(RwLock::new(None));
+            let registered_cleanup = Arc::new(TestOwnedCleanup::default());
+            let launch_entered = Arc::new(Notify::new());
+            let release_launch = Arc::new(Notify::new());
+            let registration_complete = Arc::new(Notify::new());
+            let shutdown_entered = Arc::new(Notify::new());
+            let generation = Arc::new(AtomicU64::new(0));
+            let shutdown = Arc::new(LateCleanupShutdown {
+                cleanup: Arc::clone(&cleanup_slot),
+                generation: Arc::clone(&generation),
+                shutdown_entered: Arc::clone(&shutdown_entered),
+            });
+            let mut service = DesktopRuntimeService::with_reporter_and_shutdown(
+                LateRegistrationRuntime {
+                    notices,
+                    cleanup: Arc::clone(&cleanup_slot),
+                    generation,
+                    registered_cleanup: Arc::clone(&registered_cleanup),
+                    launch_entered: Arc::clone(&launch_entered),
+                    release_launch: Arc::clone(&release_launch),
+                    registration_complete: Arc::clone(&registration_complete),
+                },
+                FakeNavigator::default(),
+                Arc::new(RecordingReporter::default()),
+                shutdown as Arc<dyn RuntimeShutdown>,
+            );
+            service.shutdown_completion_timeout = Duration::from_millis(40);
+            service.task_cancellation_timeout = Duration::from_millis(20);
+            service.owned_cleanup_confirmation_timeout = Duration::from_millis(20);
+            let service = Arc::new(service);
+            assert!(service.start_supervision());
+            launch_entered.notified().await;
+
+            let service_for_shutdown = Arc::clone(&service);
+            let shutdown_task = tauri::async_runtime::spawn(async move {
+                service_for_shutdown.shutdown(APPLICATION_QUIT_REASON).await
+            });
+            shutdown_entered.notified().await;
+            release_launch.notify_one();
+            registration_complete.notified().await;
+
+            assert!(shutdown_task.await.unwrap().is_err());
+            assert_eq!(registered_cleanup.signals.load(Ordering::SeqCst), 1);
+            assert_eq!(registered_cleanup.confirmations.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn retry_shutdown_never_confirms_the_prior_generation_cleanup() {
+        tauri::async_runtime::block_on(async {
+            let (notices, _) = watch::channel(None);
+            let cleanup_slot = Arc::new(RwLock::new(None));
+            let prior_cleanup = Arc::new(TestOwnedCleanup::default());
+            let retry_cleanup = Arc::new(TestOwnedCleanup::default());
+            let retry_launch_entered = Arc::new(Notify::new());
+            let release_retry_launch = Arc::new(Notify::new());
+            let retry_registration_complete = Arc::new(Notify::new());
+            let shutdown_entered = Arc::new(Notify::new());
+            let cleanup_generation = Arc::new(AtomicU64::new(0));
+            let shutdown = Arc::new(LateCleanupShutdown {
+                cleanup: Arc::clone(&cleanup_slot),
+                generation: Arc::clone(&cleanup_generation),
+                shutdown_entered: Arc::clone(&shutdown_entered),
+            });
+            let mut service = DesktopRuntimeService::with_reporter_and_shutdown(
+                RetryLateRegistrationRuntime {
+                    notices,
+                    cleanup: Arc::clone(&cleanup_slot),
+                    cleanup_generation,
+                    prior_cleanup: Arc::clone(&prior_cleanup),
+                    retry_cleanup: Arc::clone(&retry_cleanup),
+                    generation: 0,
+                    retry_launch_entered: Arc::clone(&retry_launch_entered),
+                    release_retry_launch: Arc::clone(&release_retry_launch),
+                    retry_registration_complete: Arc::clone(&retry_registration_complete),
+                },
+                FakeNavigator::default(),
+                Arc::new(RecordingReporter::default()),
+                shutdown as Arc<dyn RuntimeShutdown>,
+            );
+            service.shutdown_completion_timeout = Duration::from_millis(40);
+            service.task_cancellation_timeout = Duration::from_millis(20);
+            service.owned_cleanup_confirmation_timeout = Duration::from_millis(20);
+            let service = Arc::new(service);
+            assert!(service.start_supervision());
+            wait_for(|| {
+                service
+                    .supervision_task
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|task| task.inner().is_finished())
+            })
+            .await;
+            service.retry().await.unwrap();
+            retry_launch_entered.notified().await;
+
+            let service_for_shutdown = Arc::clone(&service);
+            let shutdown_task = tauri::async_runtime::spawn(async move {
+                service_for_shutdown.shutdown(APPLICATION_QUIT_REASON).await
+            });
+            shutdown_entered.notified().await;
+            release_retry_launch.notify_one();
+            retry_registration_complete.notified().await;
+
+            assert!(shutdown_task.await.unwrap().is_err());
+            assert_eq!(prior_cleanup.signals.load(Ordering::SeqCst), 0);
+            assert_eq!(prior_cleanup.confirmations.load(Ordering::SeqCst), 0);
+            assert_eq!(retry_cleanup.signals.load(Ordering::SeqCst), 1);
+            assert_eq!(retry_cleanup.confirmations.load(Ordering::SeqCst), 1);
         });
     }
 

@@ -44,11 +44,21 @@ pub type ShutdownFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ()>> + Send
 pub trait RuntimeShutdown: Send + Sync {
     fn shutdown(&self, reason: &'static str) -> ShutdownFuture<'_>;
     fn cleanup_owned(&self);
+    fn begin_supervision_generation(&self) -> u64 {
+        0
+    }
     fn owned_cleanup_handle(
         &self,
     ) -> Option<Arc<dyn crate::runtime::process::OwnedRuntimeCleanup>> {
         None
     }
+    fn take_owned_cleanup_handle(
+        &self,
+        _generation: u64,
+    ) -> Option<Arc<dyn crate::runtime::process::OwnedRuntimeCleanup>> {
+        self.owned_cleanup_handle()
+    }
+    fn finish_supervision_generation(&self, _generation: u64) {}
     fn wait_for_cleanup(&self) -> ShutdownFuture<'_> {
         Box::pin(async { Ok(()) })
     }
