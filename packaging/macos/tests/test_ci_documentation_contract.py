@@ -202,6 +202,9 @@ def test_exec_trace_unexpected_exit_is_a_hard_failure() -> None:
     assert "fs_usage exited before intentional stop" in workflow
     assert workflow.count("assert_exec_trace_alive") >= 4
     assert "trace_stop_requested=1" in workflow
+    assert "! /bin/kill -0" not in workflow
+    assert "if /bin/kill -0" not in workflow
+    assert workflow.count("/usr/bin/sudo -n /bin/kill -0") >= 3
     assert re.search(
         r"stop_exec_trace\(\).*?trace_stop_requested=1.*?kill -INT.*?"
         r"wait.*?\|\| true",

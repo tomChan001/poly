@@ -248,7 +248,7 @@ jobs:
           trace_stop_requested=0
           assert_exec_trace_alive() {
             if [[ -z "${trace_pid}" || "${trace_stop_requested}" -ne 0 ]] \
-              || ! /bin/kill -0 "${trace_pid}" 2>/dev/null; then
+              || ! /usr/bin/sudo -n /bin/kill -0 "${trace_pid}" 2>/dev/null; then
               printf 'fs_usage exited before intentional stop\n' >>"${TRACE_FAILURE}"
               if [[ -n "${trace_pid}" ]]; then
                 wait "${trace_pid}" || true
@@ -284,10 +284,10 @@ jobs:
               return 1
             fi
             for ((trace_wait = 1; trace_wait <= 50; trace_wait++)); do
-              /bin/kill -0 "${trace_pid}" 2>/dev/null || break
+              /usr/bin/sudo -n /bin/kill -0 "${trace_pid}" 2>/dev/null || break
               /bin/sleep 0.1
             done
-            if /bin/kill -0 "${trace_pid}" 2>/dev/null; then
+            if /usr/bin/sudo -n /bin/kill -0 "${trace_pid}" 2>/dev/null; then
               printf 'fs_usage did not stop after SIGINT\n' >>"${TRACE_FAILURE}"
               /usr/bin/sudo -n /bin/kill -TERM "${trace_pid}" 2>/dev/null || true
               wait "${trace_pid}" || true
