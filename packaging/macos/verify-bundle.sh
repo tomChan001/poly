@@ -6,10 +6,17 @@ die() {
   exit 1
 }
 
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PS_BIN="ps"
 LSOF_BIN="lsof"
 VERIFY_TEMP=""
 PROCESS_EXECUTABLE=""
+MACHO_AUDIT_FIND_BIN="find"
+MACHO_AUDIT_FILE_BIN="file"
+MACHO_AUDIT_OTOOL_BIN="otool"
+MACHO_AUDIT_CODESIGN=0
+# shellcheck source=packaging/macos/macho-audit.sh
+source "${SCRIPT_DIR}/macho-audit.sh"
 
 cleanup_temp() {
   [[ -n "${VERIFY_TEMP:-}" && -d "${VERIFY_TEMP}" ]] && rm -rf -- "${VERIFY_TEMP}"
@@ -119,6 +126,51 @@ pids_under_path() {
   done <"${scan_file}"
 }
 
+PID_LOOPBACK_READY=0
+audit_runtime_listeners() {
+  local pid="$1"
+  local lsof_output record listener is_postgres
+  PID_LOOPBACK_READY=0
+  if ! process_executable "${pid}"; then
+    return 1
+  fi
+  case "${PROCESS_EXECUTABLE}" in
+    "${RUNTIME_ROOT}/"*) ;;
+    *) die "PID ${pid} executable is outside the exact runtime root: ${PROCESS_EXECUTABLE}" ;;
+  esac
+  is_postgres=0
+  case "${PROCESS_EXECUTABLE}" in
+    "${RUNTIME_ROOT}/postgres/bin/postgres"|"${RUNTIME_ROOT}/_internal/postgres/bin/postgres")
+      is_postgres=1
+      ;;
+  esac
+  : >"${VERIFY_TEMP}/listener-error"
+  if ! lsof_output="$("${LSOF_BIN}" -nP -a -p "${pid}" -iTCP -sTCP:LISTEN -Fn 2>"${VERIFY_TEMP}/listener-error")"; then
+    if [[ -n "${lsof_output}" || -s "${VERIFY_TEMP}/listener-error" ]]; then
+      die "listener enumeration failed for owned PID ${pid}: $(<"${VERIFY_TEMP}/listener-error")"
+    fi
+    process_executable "${pid}" || return 1
+    return 0
+  fi
+  [[ ! -s "${VERIFY_TEMP}/listener-error" ]] ||
+    die "listener enumeration was incomplete for owned PID ${pid}: $(<"${VERIFY_TEMP}/listener-error")"
+  while IFS= read -r record; do
+    case "${record}" in
+      n*)
+        listener="${record#n}"
+        listener="${listener#TCP }"
+        if [[ "${is_postgres}" -eq 1 ]]; then
+          die "PostgreSQL process exposed a TCP listener: PID ${pid} ${listener}"
+        fi
+        case "${listener}" in
+          127.0.0.1:*|\[::1\]:*) PID_LOOPBACK_READY=1 ;;
+          *) die "non-loopback TCP listener for owned runtime PID ${pid}: ${listener}" ;;
+        esac
+        ;;
+    esac
+  done <<<"${lsof_output}"
+}
+
 if [[ "${1:-}" == "--check" ]]; then
   [[ "$#" -eq 1 ]] || die "usage: $0 --check | --enumerate-runtime /absolute/runtime/ | /absolute/path/to/Poly.app"
   printf 'Bundle verifier static contract is available; signed launch verification requires macOS.\n'
@@ -133,6 +185,37 @@ if [[ "${1:-}" == "--enumerate-runtime" ]]; then
   VERIFY_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/poly-bundle-processes.XXXXXXXX")"
   trap cleanup_temp EXIT INT TERM
   pids_under_path "$2"
+  exit 0
+fi
+
+if [[ "${1:-}" == "--audit-tree" ]]; then
+  [[ "$#" -eq 2 && -d "$2" ]] || die "usage: $0 --audit-tree /absolute/tree"
+  # Fault-injection overrides are accepted only by this non-signing test mode.
+  MACHO_AUDIT_FIND_BIN="${POLY_TEST_FIND:-find}"
+  MACHO_AUDIT_FILE_BIN="${POLY_TEST_FILE:-file}"
+  MACHO_AUDIT_OTOOL_BIN="${POLY_TEST_OTOOL:-otool}"
+  for command_name in awk realpath "${MACHO_AUDIT_FILE_BIN}" "${MACHO_AUDIT_FIND_BIN}" "${MACHO_AUDIT_OTOOL_BIN}"; do
+    command -v "${command_name}" >/dev/null 2>&1 || die "required command not found: ${command_name}"
+  done
+  VERIFY_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/poly-bundle-audit.XXXXXXXX")"
+  trap cleanup_temp EXIT INT TERM
+  macho_audit_tree "$2" "${VERIFY_TEMP}"
+  printf 'Mach-O dependency audit passed: %s\n' "$2"
+  exit 0
+fi
+
+if [[ "${1:-}" == "--audit-listeners" ]]; then
+  [[ "$#" -eq 3 && "$2" == /*/ && "$3" =~ ^[0-9]+$ ]] ||
+    die "usage: $0 --audit-listeners /absolute/runtime/ PID"
+  # Fault-injection is accepted only by this non-launching diagnostic mode.
+  LSOF_BIN="${POLY_TEST_LSOF:-lsof}"
+  VERIFY_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/poly-bundle-listeners.XXXXXXXX")"
+  trap cleanup_temp EXIT INT TERM
+  if ! RUNTIME_ROOT="$(realpath "${2%/}")"; then
+    die "could not canonicalize runtime root: $2"
+  fi
+  audit_runtime_listeners "$3" || die "owned runtime PID vanished during listener audit: $3"
+  printf 'Owned runtime listeners are loopback-only and PostgreSQL uses no TCP: %s\n' "$3"
   exit 0
 fi
 
@@ -163,80 +246,8 @@ codesign --verify --deep --strict --verbose=2 "${APP_PATH}"
 spctl --assess --type execute --verbose=4 "${APP_PATH}"
 xcrun stapler validate "${APP_PATH}"
 
-is_macho() {
-  local description
-  if ! description="$(file -b -- "$1")"; then
-    die "file inspection failed for $1"
-  fi
-  case "${description}" in
-    *Mach-O*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-check_dependency() {
-  local owner="$1"
-  local dependency="$2"
-  case "${dependency}" in
-    @rpath/*|@loader_path/*|@executable_path/*|/usr/lib/*|/System/Library/*|/Library/Apple/System/Library/*|"${APP_PATH}"/*)
-      return 0
-      ;;
-    /opt/homebrew/*|/opt/local/*|/usr/local/*|/Users/*|/runner/*|/home/*|/private/var/folders/*|/Volumes/*)
-      die "unsafe dependency in ${owner}: ${dependency}"
-      ;;
-    /*)
-      die "unexpected absolute dependency in ${owner}: ${dependency}"
-      ;;
-    *)
-      die "unexpected dependency or rpath in ${owner}: ${dependency}"
-      ;;
-  esac
-}
-
-otool_dependencies() {
-  local owner="$1"
-  local output
-  if ! output="$(otool -L "${owner}")"; then
-    die "otool -L failed for ${owner}"
-  fi
-  if ! printf '%s\n' "${output}" | awk 'NR > 1 { print $1 }'; then
-    die "could not parse otool -L output for ${owner}"
-  fi
-}
-
-otool_rpaths() {
-  local owner="$1"
-  local output
-  if ! output="$(otool -l "${owner}")"; then
-    die "otool -l failed for ${owner}"
-  fi
-  if ! printf '%s\n' "${output}" |
-    awk '$1 == "cmd" && $2 == "LC_RPATH" { getline; getline; if ($1 == "path") print $2 }'; then
-    die "could not parse LC_RPATH entries for ${owner}"
-  fi
-}
-
-if ! find "${APP_PATH}/Contents" -type f -print0 >"${VERIFY_TEMP}/bundle-files"; then
-  die "find failed while auditing nested bundle files"
-fi
-while IFS= read -r -d '' candidate; do
-  is_macho "${candidate}" || continue
-  codesign --verify --strict --verbose=2 "${candidate}"
-  if ! otool_dependencies "${candidate}" >"${VERIFY_TEMP}/dependencies"; then
-    die "dependency inspection failed for ${candidate}"
-  fi
-  while IFS= read -r dependency; do
-    [[ -n "${dependency}" ]] || continue
-    check_dependency "${candidate}" "${dependency}"
-  done <"${VERIFY_TEMP}/dependencies"
-  if ! otool_rpaths "${candidate}" >"${VERIFY_TEMP}/rpaths"; then
-    die "rpath inspection failed for ${candidate}"
-  fi
-  while IFS= read -r rpath; do
-    [[ -n "${rpath}" ]] || continue
-    check_dependency "${candidate} LC_RPATH" "${rpath}"
-  done <"${VERIFY_TEMP}/rpaths"
-done <"${VERIFY_TEMP}/bundle-files"
+MACHO_AUDIT_CODESIGN=1
+macho_audit_tree "${APP_PATH}/Contents" "${VERIFY_TEMP}"
 
 COLLECTED_PIDS=()
 collect_pids() {
@@ -285,20 +296,18 @@ for ((attempt = 0; attempt < 60; attempt++)); do
       OWNED_PIDS[${#OWNED_PIDS[@]}]="${pid}"
     fi
   done
+  attempt_ready=0
   for pid in "${runtime_pids[@]}"; do
-    : >"${VERIFY_TEMP}/listener-error"
-    if "${LSOF_BIN}" -nP -a -p "${pid}" -iTCP -sTCP:LISTEN \
-      >"${VERIFY_TEMP}/listeners" 2>"${VERIFY_TEMP}/listener-error"; then
-      if grep -q 'TCP 127.0.0.1:' "${VERIFY_TEMP}/listeners"; then
-        ready=1
-        break 2
+    if audit_runtime_listeners "${pid}"; then
+      if [[ "${PID_LOOPBACK_READY}" -eq 1 ]]; then
+        attempt_ready=1
       fi
-    elif [[ -s "${VERIFY_TEMP}/listener-error" ]]; then
-      die "listener enumeration failed for owned PID ${pid}: $(<"${VERIFY_TEMP}/listener-error")"
-    elif ! process_executable "${pid}"; then
-      continue
     fi
   done
+  if [[ "${attempt_ready}" -eq 1 ]]; then
+    ready=1
+    break
+  fi
   sleep 1
 done
 [[ "${ready}" -eq 1 ]] || die "application did not expose an owned loopback listener within 60 seconds"

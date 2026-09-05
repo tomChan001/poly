@@ -6,6 +6,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -44,6 +45,20 @@ def git_bash_path(path: Path) -> str:
     drive = resolved.drive.rstrip(":").lower()
     tail = resolved.as_posix().split(":", 1)[1]
     return f"/{drive}{tail}"
+
+
+def load_macos_module(name: str):
+    module_path = MACOS / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(MACOS))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
+    return module
 
 
 class DistributionContractTests(unittest.TestCase):
@@ -120,21 +135,30 @@ class DistributionContractTests(unittest.TestCase):
         self.assertNotIn("signingIdentity", bundle["macOS"])
 
     def test_dependency_checks_reject_unsafe_and_unknown_absolute_paths(self) -> None:
+        audit = self.read("macho-audit.sh")
         for name in ("fetch-postgres.sh", "verify-bundle.sh"):
             script = self.read(name)
-            for unsafe in ("/opt/homebrew", "/opt/local", "/Users/", "/runner/", "/home/"):
-                self.assertIn(unsafe, script, name)
-            self.assertIn("unexpected absolute dependency", script, name)
-            self.assertIn("unexpected dependency or rpath", script, name)
-            self.assertIn("otool -L", script, name)
-            self.assertIn("otool -l", script, name)
-            self.assertIn("LC_RPATH", script, name)
-            self.assertNotIn("< <(", script, name)
+            self.assertIn('source "${SCRIPT_DIR}/macho-audit.sh"', script)
+            self.assertNotIn("< <(", script + audit, name)
+        for unsafe in ("/opt/homebrew", "/opt/local", "/Users/", "/runner/", "/home/"):
+            self.assertIn(unsafe, audit)
+        self.assertIn("nonrelocatable absolute dependency", audit)
+        self.assertIn("unexpected dependency or rpath", audit)
+        self.assertIn("otool -L", audit)
+        self.assertIn("otool -l", audit)
+        self.assertIn("LC_RPATH", audit)
+        self.assertIn("realpath", audit)
+        self.assertRegex(
+            audit,
+            r'\\\( -type f -o -type l \\\) -print0',
+            "the real audit inventory must include symlinks so their targets are checked",
+        )
 
     def test_macho_audit_propagates_find_and_otool_failures(self) -> None:
         bash = bash_executable()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            (root / "fake").write_bytes(b"Mach-O fixture")
             stubs = root / "stubs"
             stubs.mkdir()
             env = os.environ.copy()
@@ -146,7 +170,12 @@ class DistributionContractTests(unittest.TestCase):
             write_stub(stubs, "otool", "exit 0")
             write_stub(stubs, "find", "exit 17")
             failed_find = subprocess.run(
-                [bash, str(MACOS / "fetch-postgres.sh"), "--audit-tree", str(root)],
+                [
+                    bash,
+                    str(MACOS / "fetch-postgres.sh"),
+                    "--audit-tree",
+                    git_bash_path(root),
+                ],
                 capture_output=True,
                 text=True,
                 env=env,
@@ -159,7 +188,12 @@ class DistributionContractTests(unittest.TestCase):
             write_stub(stubs, "file", "printf 'Mach-O 64-bit executable\\n'")
             write_stub(stubs, "otool", "exit 19")
             failed_otool = subprocess.run(
-                [bash, str(MACOS / "fetch-postgres.sh"), "--audit-tree", str(root)],
+                [
+                    bash,
+                    str(MACOS / "fetch-postgres.sh"),
+                    "--audit-tree",
+                    git_bash_path(root),
+                ],
                 capture_output=True,
                 text=True,
                 env=env,
@@ -167,6 +201,96 @@ class DistributionContractTests(unittest.TestCase):
             )
             self.assertNotEqual(failed_otool.returncode, 0)
             self.assertIn("otool -L failed", failed_otool.stderr)
+
+    def test_macho_audit_resolves_install_names_and_rejects_escape_or_missing(self) -> None:
+        bash = bash_executable()
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary)
+            tree = fixture / "tree"
+            owner = tree / "bin" / "owner"
+            library = tree / "lib" / "libok.dylib"
+            escaped = fixture / "escape.dylib"
+            for path in (owner, library, escaped):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"Mach-O fixture")
+            stubs = fixture / "stubs"
+            stubs.mkdir()
+            write_stub(stubs, "find", "printf '%s\\0' \"$1/bin/owner\"")
+            write_stub(stubs, "file", "printf 'Mach-O 64-bit executable\\n'")
+            env = os.environ.copy()
+            env["PATH"] = f"{git_bash_path(stubs)}:/usr/bin:/bin"
+            env.update(
+                POLY_TEST_FIND=git_bash_path(stubs / "find"),
+                POLY_TEST_FILE=git_bash_path(stubs / "file"),
+                POLY_TEST_OTOOL=git_bash_path(stubs / "otool"),
+            )
+
+            cases = [
+                (
+                    "@loader_path/../../escape.dylib",
+                    "",
+                    "escapes packaged root",
+                ),
+                (
+                    "@rpath/missing.dylib",
+                    "@loader_path/../lib",
+                    "unresolved @rpath dependency",
+                ),
+                (
+                    git_bash_path(library),
+                    "",
+                    "nonrelocatable absolute dependency",
+                ),
+            ]
+            for dependency, rpath, expected_error in cases:
+                with self.subTest(dependency=dependency):
+                    rpath_output = (
+                        "printf '          cmd LC_RPATH\\n"
+                        "      cmdsize 48\\n"
+                        f"         path {rpath} (offset 12)\\n'"
+                        if rpath
+                        else ":"
+                    )
+                    write_stub(
+                        stubs,
+                        "otool",
+                        "if [[ \"$1\" == '-L' ]]; then "
+                        f"printf '%s:\\n\\t{dependency} (compatibility version 1.0.0)\\n' \"$2\"; "
+                        f"else {rpath_output}; fi",
+                    )
+                    for script_name in ("fetch-postgres.sh", "verify-bundle.sh"):
+                        result = subprocess.run(
+                            [
+                                bash,
+                                str(MACOS / script_name),
+                                "--audit-tree",
+                                str(tree),
+                            ],
+                            capture_output=True,
+                            text=True,
+                            env=env,
+                            check=False,
+                        )
+                        self.assertNotEqual(result.returncode, 0, script_name)
+                        self.assertIn(expected_error, result.stderr, script_name)
+
+            write_stub(
+                stubs,
+                "otool",
+                "if [[ \"$1\" == '-L' ]]; then "
+                "printf '%s:\\n\\t@rpath/libok.dylib (compatibility version 1.0.0)\\n' \"$2\"; "
+                "else printf '          cmd LC_RPATH\\n      cmdsize 48\\n"
+                "         path @loader_path/../lib (offset 12)\\n'; fi",
+            )
+            for script_name in ("fetch-postgres.sh", "verify-bundle.sh"):
+                result = subprocess.run(
+                    [bash, str(MACOS / script_name), "--audit-tree", str(tree)],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_process_enumeration_failure_is_fatal(self) -> None:
         bash = bash_executable()
@@ -220,12 +344,7 @@ class DistributionContractTests(unittest.TestCase):
             )
 
     def test_runtime_license_classifier_handles_pyinstaller_internal_layout(self) -> None:
-        module_path = MACOS / "license_inventory.py"
-        spec = importlib.util.spec_from_file_location("license_inventory", module_path)
-        self.assertIsNotNone(spec)
-        module = importlib.util.module_from_spec(spec)
-        assert spec and spec.loader
-        spec.loader.exec_module(module)
+        module = load_macos_module("license_inventory")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             native = root / "native-licenses"
@@ -261,6 +380,183 @@ class DistributionContractTests(unittest.TestCase):
                     stdlib_modules=set(),
                     native_license_root=native,
                 )
+
+    def test_runtime_file_inventory_fails_unknown_wasm_script_and_blob(self) -> None:
+        module = load_macos_module("license_inventory")
+        production = {"certifi": {"license": "MPL-2.0"}}
+        known = module.classify_runtime_paths(
+            [
+                "alembic.ini",
+                "frontend/dist/index.html",
+                "_internal/base_library.zip",
+                "_internal/certifi/cacert.pem",
+            ],
+            macho_classifications={},
+            production_distributions=production,
+            package_distributions={"certifi": ["certifi"]},
+            stdlib_modules=set(),
+        )
+        self.assertEqual(known["alembic.ini"], "Poly application asset")
+        self.assertIn("certifi (MPL-2.0)", known["_internal/certifi/cacert.pem"])
+        for unknown in ("_internal/mystery.wasm", "hooks/start.sh", "blob.bin"):
+            with self.subTest(unknown=unknown), self.assertRaisesRegex(
+                ValueError, "packaged file lacks license inventory"
+            ):
+                module.classify_runtime_paths(
+                    [unknown],
+                    macho_classifications={},
+                    production_distributions=production,
+                    package_distributions={"certifi": ["certifi"]},
+                    stdlib_modules=set(),
+                )
+
+    def test_listener_audit_rejects_mixed_wildcard_and_postgres_tcp(self) -> None:
+        bash = bash_executable()
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary)
+            runtime = fixture / "runtime"
+            runtime_executable = runtime / "poly-runtime"
+            postgres_executable = runtime / "_internal/postgres/bin/postgres"
+            for path in (runtime_executable, postgres_executable):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"executable")
+            stubs = fixture / "stubs"
+            stubs.mkdir()
+            lsof_path = stubs / "lsof"
+            env = os.environ.copy()
+            env["PATH"] = f"{git_bash_path(stubs)}:/usr/bin:/bin"
+            env["POLY_TEST_LSOF"] = git_bash_path(lsof_path)
+            runtime_argument = git_bash_path(runtime) + "/"
+
+            write_stub(
+                stubs,
+                "lsof",
+                "if [[ \"$*\" == *'-d txt'* ]]; then "
+                f"printf 'n{git_bash_path(runtime_executable)}\\n'; "
+                "else printf 'n127.0.0.1:43123\\nn*:43123\\n'; fi",
+            )
+            mixed = subprocess.run(
+                [
+                    bash,
+                    str(MACOS / "verify-bundle.sh"),
+                    "--audit-listeners",
+                    runtime_argument,
+                    "4242",
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+            self.assertNotEqual(mixed.returncode, 0)
+            self.assertIn("non-loopback TCP listener", mixed.stderr)
+
+            write_stub(
+                stubs,
+                "lsof",
+                "if [[ \"$*\" == *'-d txt'* ]]; then "
+                f"printf 'n{git_bash_path(postgres_executable)}\\n'; "
+                "else printf 'n127.0.0.1:5432\\n'; fi",
+            )
+            postgres = subprocess.run(
+                [
+                    bash,
+                    str(MACOS / "verify-bundle.sh"),
+                    "--audit-listeners",
+                    runtime_argument,
+                    "4343",
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+            self.assertNotEqual(postgres.returncode, 0)
+            self.assertIn("PostgreSQL process exposed a TCP listener", postgres.stderr)
+
+            write_stub(
+                stubs,
+                "lsof",
+                "if [[ \"$*\" == *'-d txt'* ]]; then "
+                f"printf 'n{git_bash_path(runtime_executable)}\\n'; "
+                "else printf 'n127.0.0.1:43123\\nn[::1]:43123\\n'; fi",
+            )
+            loopback_only = subprocess.run(
+                [
+                    bash,
+                    str(MACOS / "verify-bundle.sh"),
+                    "--audit-listeners",
+                    runtime_argument,
+                    "4444",
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+            self.assertEqual(loopback_only.returncode, 0, loopback_only.stderr)
+
+    def test_external_license_inventory_rejects_conflicting_expression(self) -> None:
+        module = load_macos_module("notice_generator")
+        expected = [
+            {
+                "name": "example-package",
+                "version": "1.0.0",
+                "license": "MIT OR Apache-2.0",
+                "source": "locked",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "licenses.json"
+            report.write_text(
+                json.dumps(
+                    [
+                        {
+                            "Name": "example-package",
+                            "Version": "1.0.0",
+                            "License": "GPL-3.0-only",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "license mismatch"):
+                module.validate_external_inventory(
+                    report, expected, ecosystem="Python"
+                )
+
+            expected[0]["license"] = "BSD-2-Clause"
+            report.write_text(
+                json.dumps(
+                    [
+                        {
+                            "Name": "example-package",
+                            "Version": "1.0.0",
+                            "License": "BSD-3-Clause",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "license mismatch"):
+                module.validate_external_inventory(
+                    report, expected, ecosystem="Python"
+                )
+
+            expected[0]["license"] = "MIT OR Apache-2.0"
+            report.write_text(
+                json.dumps(
+                    [
+                        {
+                            "Name": "example-package",
+                            "Version": "1.0.0",
+                            "License": "Apache Software License; MIT License",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            module.validate_external_inventory(report, expected, ecosystem="Python")
 
     def test_verify_bundle_is_path_scoped_and_never_kills_by_name(self) -> None:
         script = self.read("verify-bundle.sh")
@@ -298,7 +594,7 @@ class DistributionContractTests(unittest.TestCase):
         self.assertIn("uv export --frozen --no-dev", script)
         self.assertIn("--no-emit-project", script)
         self.assertIn('cd -- "${REPO_ROOT}"', script)
-        self.assertIn('normalized.startswith("postgres/")', helper)
+        self.assertIn('bundled_path.startswith("postgres/")', helper)
         self.assertIn('endswith(".so")', helper)
         self.assertIn("npm_inventory", helper)
         self.assertIn("differs from lock inventory", helper)

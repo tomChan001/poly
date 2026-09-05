@@ -12,7 +12,11 @@ import tomllib
 from packaging.markers import default_environment
 from packaging.requirements import Requirement
 
-from license_inventory import classify_macho_paths, normalize_name
+from license_inventory import (
+    classify_macho_paths,
+    classify_runtime_paths,
+    normalize_name,
+)
 
 
 POSTGRESQL_LICENSE = """PostgreSQL Database Management System
@@ -226,6 +230,38 @@ def npm_inventory(lock_path: Path) -> list[dict[str, str]]:
     return sorted(packages, key=lambda package: (package["name"].casefold(), package["version"]))
 
 
+LICENSE_ALIASES = {
+    "apache 2.0": "apache-2.0",
+    "apache software license": "apache-2.0",
+    "bsd": "bsd-unspecified",
+    "bsd license": "bsd-unspecified",
+    "mit license": "mit",
+    "mozilla public license 2.0 (mpl 2.0)": "mpl-2.0",
+    "public domain": "public-domain",
+    "the mit license (mit)": "mit",
+}
+
+
+def normalized_license_terms(expression: str) -> frozenset[str]:
+    """Normalize common tool labels while preserving substantive license terms."""
+
+    normalized = " ".join(expression.strip().split()).casefold()
+    if not normalized or normalized in {"none", "unknown", "n/a"}:
+        raise ValueError(f"unknown license expression: {expression!r}")
+    if normalized in LICENSE_ALIASES:
+        return frozenset({LICENSE_ALIASES[normalized]})
+    terms: set[str] = set()
+    for raw_term in re.split(r"\s+(?:and|or)\s+|[/;,]", normalized):
+        term = raw_term.strip().strip("() ")
+        term = re.sub(r"^osi approved\s*::\s*", "", term)
+        term = LICENSE_ALIASES.get(term, term)
+        if term:
+            terms.add(term)
+    if not terms:
+        raise ValueError(f"unknown license expression: {expression!r}")
+    return frozenset(terms)
+
+
 def validate_external_inventory(
     path: Path,
     expected: list[dict[str, str]],
@@ -253,6 +289,18 @@ def validate_external_inventory(
             missing.append(label)
         elif not external_license:
             mismatched.append(f"{label} (empty external license)")
+        else:
+            try:
+                expected_terms = normalized_license_terms(package["license"])
+                external_terms = normalized_license_terms(external_license)
+            except ValueError as error:
+                mismatched.append(f"{label} ({error})")
+            else:
+                if expected_terms != external_terms:
+                    mismatched.append(
+                        f"{label} ({external_license!r} conflicts with "
+                        f"{package['license']!r})"
+                    )
     if ecosystem == "Python":
         missing = [
             label
@@ -358,19 +406,26 @@ def main() -> int:
             stdlib_modules=sys.stdlib_module_names,
             native_license_root=args.native_license_root,
         )
+        runtime_paths = sorted(
+            (
+                path.relative_to(args.runtime).as_posix()
+                for path in args.runtime.rglob("*")
+                if path.is_file()
+            ),
+            key=str.casefold,
+        )
+        file_classifications = classify_runtime_paths(
+            runtime_paths,
+            macho_classifications=classifications,
+            production_distributions=production,
+            package_distributions=importlib.metadata.packages_distributions(),
+            stdlib_modules=sys.stdlib_module_names,
+        )
         parts.extend(["", "## Assembled native file inventory", "", "| Packaged file | License attribution |", "| --- | --- |"])
-        for path in sorted((path for path in args.runtime.rglob("*") if path.is_file()), key=lambda path: path.relative_to(args.runtime).as_posix()):
-            relative = path.relative_to(args.runtime).as_posix()
-            normalized = relative.removeprefix("_internal/")
-            attribution = classifications.get(relative)
-            if attribution is None:
-                if normalized.startswith("postgres/"):
-                    attribution = "PostgreSQL"
-                elif normalized == "base_library.zip":
-                    attribution = "CPython"
-                else:
-                    attribution = "Frozen Poly application or locked Python production dependency"
-            parts.append(f"| `poly-runtime/{relative}` | {attribution} |")
+        for relative in runtime_paths:
+            parts.append(
+                f"| `poly-runtime/{relative}` | {file_classifications[relative]} |"
+            )
         if args.native_license_root.is_dir():
             for license_path in sorted(args.native_license_root.rglob("*.LICENSE"), key=lambda path: path.relative_to(args.native_license_root).as_posix().casefold()):
                 relative = license_path.relative_to(args.native_license_root).as_posix()

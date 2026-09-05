@@ -12,89 +12,12 @@ die() {
   exit 1
 }
 
-AUDIT_ALLOWED_ROOT=""
-FIND_BIN="find"
-FILE_BIN="file"
-OTOOL_BIN="otool"
-
-is_macho() {
-  local description
-  if ! description="$("${FILE_BIN}" -b -- "$1")"; then
-    die "file inspection failed for $1"
-  fi
-  case "${description}" in
-    *Mach-O*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-otool_dependencies() {
-  local owner="$1"
-  local output
-  if ! output="$("${OTOOL_BIN}" -L "${owner}")"; then
-    die "otool -L failed for ${owner}"
-  fi
-  if ! printf '%s\n' "${output}" | awk 'NR > 1 { print $1 }'; then
-    die "could not parse otool -L output for ${owner}"
-  fi
-}
-
-otool_rpaths() {
-  local owner="$1"
-  local output
-  if ! output="$("${OTOOL_BIN}" -l "${owner}")"; then
-    die "otool -l failed for ${owner}"
-  fi
-  if ! printf '%s\n' "${output}" |
-    awk '$1 == "cmd" && $2 == "LC_RPATH" { getline; getline; if ($1 == "path") print $2 }'; then
-    die "could not parse LC_RPATH entries for ${owner}"
-  fi
-}
-
-check_dependency() {
-  local owner="$1"
-  local dependency="$2"
-  case "${dependency}" in
-    @rpath/*|@loader_path/*|@executable_path/*|/usr/lib/*|/System/Library/*|/Library/Apple/System/Library/*|"${AUDIT_ALLOWED_ROOT}"/*)
-      return 0
-      ;;
-    /opt/homebrew/*|/opt/local/*|/usr/local/*|/Users/*|/runner/*|/home/*|/private/var/folders/*|/Volumes/*)
-      die "unsafe dependency in ${owner}: ${dependency}"
-      ;;
-    /*)
-      die "unexpected absolute dependency in ${owner}: ${dependency}"
-      ;;
-    *)
-      die "unexpected dependency or rpath in ${owner}: ${dependency}"
-      ;;
-  esac
-}
-
-audit_tree() {
-  local tree="$1"
-  local work_dir="$2"
-  local candidate dependency rpath
-  if ! "${FIND_BIN}" "${tree}" -type f -print0 >"${work_dir}/audit-files"; then
-    die "find failed while auditing ${tree}"
-  fi
-  while IFS= read -r -d '' candidate; do
-    is_macho "${candidate}" || continue
-    if ! otool_dependencies "${candidate}" >"${work_dir}/dependencies"; then
-      die "dependency inspection failed for ${candidate}"
-    fi
-    while IFS= read -r dependency; do
-      [[ -n "${dependency}" ]] || continue
-      check_dependency "${candidate}" "${dependency}"
-    done <"${work_dir}/dependencies"
-    if ! otool_rpaths "${candidate}" >"${work_dir}/rpaths"; then
-      die "rpath inspection failed for ${candidate}"
-    fi
-    while IFS= read -r rpath; do
-      [[ -n "${rpath}" ]] || continue
-      check_dependency "${candidate} LC_RPATH" "${rpath}"
-    done <"${work_dir}/rpaths"
-  done <"${work_dir}/audit-files"
-}
+MACHO_AUDIT_FIND_BIN="find"
+MACHO_AUDIT_FILE_BIN="file"
+MACHO_AUDIT_OTOOL_BIN="otool"
+MACHO_AUDIT_CODESIGN=0
+# shellcheck source=packaging/macos/macho-audit.sh
+source "${SCRIPT_DIR}/macho-audit.sh"
 
 if [[ "${1:-}" == "--check" ]]; then
   [[ "$#" -eq 1 ]] || die "--check accepts no other arguments"
@@ -107,10 +30,10 @@ fi
 if [[ "${1:-}" == "--audit-tree" ]]; then
   [[ "$#" -eq 2 && -d "$2" ]] || die "usage: $0 --audit-tree /absolute/tree"
   # Fault-injection overrides are accepted only by this non-building test mode.
-  FIND_BIN="${POLY_TEST_FIND:-find}"
-  FILE_BIN="${POLY_TEST_FILE:-file}"
-  OTOOL_BIN="${POLY_TEST_OTOOL:-otool}"
-  for command_name in awk "${FILE_BIN}" "${FIND_BIN}" "${OTOOL_BIN}"; do
+  MACHO_AUDIT_FIND_BIN="${POLY_TEST_FIND:-find}"
+  MACHO_AUDIT_FILE_BIN="${POLY_TEST_FILE:-file}"
+  MACHO_AUDIT_OTOOL_BIN="${POLY_TEST_OTOOL:-otool}"
+  for command_name in awk realpath "${MACHO_AUDIT_FILE_BIN}" "${MACHO_AUDIT_FIND_BIN}" "${MACHO_AUDIT_OTOOL_BIN}"; do
     command -v "${command_name}" >/dev/null 2>&1 || die "required command not found: ${command_name}"
   done
   AUDIT_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/poly-postgres-audit.XXXXXXXX")"
@@ -118,8 +41,7 @@ if [[ "${1:-}" == "--audit-tree" ]]; then
     [[ -n "${AUDIT_TEMP:-}" && -d "${AUDIT_TEMP}" ]] && rm -rf -- "${AUDIT_TEMP}"
   }
   trap cleanup_audit EXIT INT TERM
-  AUDIT_ALLOWED_ROOT="$2"
-  audit_tree "$2" "${AUDIT_TEMP}"
+  macho_audit_tree "$2" "${AUDIT_TEMP}"
   printf 'Mach-O dependency audit passed: %s\n' "$2"
   exit 0
 fi
@@ -140,7 +62,7 @@ case "${TARGET_TRIPLE}" in
     ;;
 esac
 
-for command_name in awk curl "${FILE_BIN}" "${FIND_BIN}" install_name_tool make "${OTOOL_BIN}" shasum tar; do
+for command_name in awk curl file find install_name_tool make otool realpath shasum tar; do
   command -v "${command_name}" >/dev/null 2>&1 || die "required command not found: ${command_name}"
 done
 
@@ -166,7 +88,6 @@ tar -xjf "${BUILD_TEMP}/${ARCHIVE}" -C "${BUILD_TEMP}"
 readonly SOURCE_DIR="${BUILD_TEMP}/postgresql-${POSTGRES_VERSION}"
 readonly INSTALL_PREFIX="${BUILD_TEMP}/install"
 readonly STAGED="${BUILD_TEMP}/staged"
-AUDIT_ALLOWED_ROOT="${STAGED}"
 (
   cd -- "${SOURCE_DIR}"
   ./configure \
@@ -184,7 +105,7 @@ for program in initdb postgres pg_isready psql createdb; do
   cp -- "${INSTALL_PREFIX}/bin/${program}" "${STAGED}/bin/${program}"
 done
 
-if ! "${FIND_BIN}" "${INSTALL_PREFIX}/lib" -maxdepth 1 \( -type f -o -type l \) \
+if ! find "${INSTALL_PREFIX}/lib" -maxdepth 1 \( -type f -o -type l \) \
   -name 'libpq*.dylib*' -print0 >"${BUILD_TEMP}/libpq-files"; then
   die "find failed while locating libpq dylibs"
 fi
@@ -197,15 +118,15 @@ cp -- "${INSTALL_PREFIX}/lib/postgresql/plpgsql.so" "${STAGED}/lib/postgresql/pl
 cp -R -- "${INSTALL_PREFIX}/share/." "${STAGED}/share/"
 cp -- "${SOURCE_DIR}/COPYRIGHT" "${STAGED}/COPYRIGHT"
 
-if ! "${FIND_BIN}" "${STAGED}" -type f -print0 >"${BUILD_TEMP}/staged-files"; then
+if ! find "${STAGED}" -type f -print0 >"${BUILD_TEMP}/staged-files"; then
   die "find failed while preparing staged Mach-O files"
 fi
 while IFS= read -r -d '' macho; do
-  is_macho "${macho}" || continue
+  macho_is_macho "${macho}" || continue
   if [[ "${macho}" == *.dylib || "${macho}" == *.dylib.* ]]; then
     install_name_tool -id "@rpath/$(basename -- "${macho}")" "${macho}"
   fi
-  if ! otool_dependencies "${macho}" >"${BUILD_TEMP}/dependencies"; then
+  if ! macho_otool_dependencies "${macho}" >"${BUILD_TEMP}/dependencies"; then
     die "dependency inspection failed for ${macho}"
   fi
   while IFS= read -r dependency; do
@@ -220,7 +141,7 @@ while IFS= read -r -d '' macho; do
     fi
     install_name_tool -change "${dependency}" "${replacement}" "${macho}"
   done <"${BUILD_TEMP}/dependencies"
-  if ! otool_rpaths "${macho}" >"${BUILD_TEMP}/rpaths"; then
+  if ! macho_otool_rpaths "${macho}" >"${BUILD_TEMP}/rpaths"; then
     die "rpath inspection failed for ${macho}"
   fi
   while IFS= read -r rpath; do
@@ -230,7 +151,7 @@ while IFS= read -r -d '' macho; do
   done <"${BUILD_TEMP}/rpaths"
 done <"${BUILD_TEMP}/staged-files"
 
-audit_tree "${STAGED}" "${BUILD_TEMP}"
+macho_audit_tree "${STAGED}" "${BUILD_TEMP}"
 
 mv -- "${STAGED}" "${DESTINATION}"
 printf 'PostgreSQL %s assembled at %s\n' "${POSTGRES_VERSION}" "${DESTINATION}"
