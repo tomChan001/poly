@@ -65,6 +65,21 @@ class DistributionContractTests(unittest.TestCase):
     def read(self, name: str) -> str:
         return (MACOS / name).read_text(encoding="utf-8")
 
+    def test_runtime_verifier_uses_pyinstaller_internal_postgres_layout(self) -> None:
+        verifier = self.read("verify-runtime.sh")
+
+        self.assertIn('RUNTIME_RESOURCE_ROOT="${BUNDLE_DIR}/_internal"', verifier)
+        self.assertIn(
+            'postgres_executable="${RUNTIME_RESOURCE_ROOT}/postgres/bin/${program}"',
+            verifier,
+        )
+        self.assertIn(
+            '"${RUNTIME_RESOURCE_ROOT}/postgres" '
+            '"${RUNTIME_RESOURCE_ROOT}/postgres/bin/postgres"',
+            verifier,
+        )
+        self.assertNotIn('"${BUNDLE_DIR}/postgres/bin/${program}"', verifier)
+
     def test_postgres_checksum_is_the_official_pin(self) -> None:
         self.assertEqual(
             self.read("postgres-SHA256SUMS"),

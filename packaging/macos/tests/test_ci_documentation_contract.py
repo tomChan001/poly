@@ -205,6 +205,12 @@ def test_smoke_uses_an_isolated_home_installed_dmg_and_command_guards() -> None:
 
 def test_smoke_uses_calibrated_kernel_exec_tracing() -> None:
     workflow = read(WORKFLOW)
+    assert (
+        'BUNDLED_POSTGRES="${RUNTIME_ROOT}/_internal/postgres/bin/postgres"'
+        in workflow
+    )
+    assert 'postgres_bin="${RUNTIME_ROOT}/_internal/postgres/bin/"' in workflow
+    assert 'BUNDLED_POSTGRES="${RUNTIME_ROOT}/postgres/bin/postgres"' not in workflow
     for marker in (
         "/usr/bin/sudo -n /usr/bin/fs_usage -w -f exec",
         '"/usr/bin/python3"',
@@ -216,7 +222,7 @@ def test_smoke_uses_calibrated_kernel_exec_tracing() -> None:
         "Poly poly-runtime",
         "audit_exec_trace",
         "exec-trace-failures.log",
-        "${RUNTIME_ROOT}/postgres/bin/",
+        "${RUNTIME_ROOT}/_internal/postgres/bin/",
     ):
         assert marker in workflow
     for forbidden_command in (

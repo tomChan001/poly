@@ -226,7 +226,7 @@ jobs:
           INSTALLED_APP="${SMOKE_APPLICATIONS}/Poly.app"
           RUNTIME_ROOT="${INSTALLED_APP}/Contents/Resources/poly-runtime"
           RUNTIME_EXECUTABLE="${RUNTIME_ROOT}/poly-runtime"
-          BUNDLED_POSTGRES="${RUNTIME_ROOT}/postgres/bin/postgres"
+          BUNDLED_POSTGRES="${RUNTIME_ROOT}/_internal/postgres/bin/postgres"
 
           trim_keychain_path() {
             /usr/bin/sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//'
@@ -364,7 +364,7 @@ jobs:
           audit_exec_trace() {
             local trace_input="$1"
             local failure_output="$2"
-            /usr/bin/awk -v postgres_bin="${RUNTIME_ROOT}/postgres/bin/" '
+            /usr/bin/awk -v postgres_bin="${RUNTIME_ROOT}/_internal/postgres/bin/" '
               {
                 lowered = tolower($0)
                 if (index(lowered, "exec") == 0 && index(lowered, "spawn") == 0) next

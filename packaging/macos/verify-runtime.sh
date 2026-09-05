@@ -10,6 +10,7 @@ readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 readonly BUNDLE_DIR="${REPO_ROOT}/dist/poly-runtime"
 readonly RUNTIME_EXECUTABLE="${BUNDLE_DIR}/poly-runtime"
+readonly RUNTIME_RESOURCE_ROOT="${BUNDLE_DIR}/_internal"
 readonly POLY_REQUIRED_MACOS_TARGET="12.0"
 
 : "${POLY_TARGET_ARCH:?POLY_TARGET_ARCH must be set to arm64 or x86_64}"
@@ -37,7 +38,7 @@ done
 [[ -x "${RUNTIME_EXECUTABLE}" ]] ||
   die "built runtime executable is missing or not executable: ${RUNTIME_EXECUTABLE}"
 for program in initdb postgres pg_isready psql createdb; do
-  postgres_executable="${BUNDLE_DIR}/postgres/bin/${program}"
+  postgres_executable="${RUNTIME_RESOURCE_ROOT}/postgres/bin/${program}"
   [[ -x "${postgres_executable}" ]] ||
     die "required PostgreSQL program is missing or not executable: ${postgres_executable}"
 done
@@ -65,7 +66,7 @@ MACHO_AUDIT_MAX_MIN_OS="${POLY_REQUIRED_MACOS_TARGET}"
 source "${SCRIPT_DIR}/macho-audit.sh"
 
 printf '%s\t%s\n' "${BUNDLE_DIR}" "${RUNTIME_EXECUTABLE}" >"${MACHO_AUDIT_CONTEXTS_FILE}"
-printf '%s\t%s\n' "${BUNDLE_DIR}/postgres" "${BUNDLE_DIR}/postgres/bin/postgres" >>"${MACHO_AUDIT_CONTEXTS_FILE}"
+printf '%s\t%s\n' "${RUNTIME_RESOURCE_ROOT}/postgres" "${RUNTIME_RESOURCE_ROOT}/postgres/bin/postgres" >>"${MACHO_AUDIT_CONTEXTS_FILE}"
 macho_audit_tree "${BUNDLE_DIR}" "${VERIFY_TEMP}"
 printf 'Runtime is thin %s and compatible with macOS %s: %s\n' \
   "${EXPECTED_ARCH}" "${POLY_REQUIRED_MACOS_TARGET}" "${BUNDLE_DIR}"
