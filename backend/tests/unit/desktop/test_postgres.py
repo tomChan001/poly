@@ -731,3 +731,23 @@ async def test_stop_does_not_signal_an_already_exited_child(tmp_path: Path) -> N
     assert child.terminate_calls == 0
     assert child.kill_calls == 0
     assert child.wait_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_wait_observes_an_unexpected_owned_child_exit(tmp_path: Path) -> None:
+    paths = PostgresPaths.for_test(tmp_path)
+    child = _Child()
+    runner = _successful_runner()
+    runner.child = child
+    subject = PostgresManager(paths, runner=runner)
+    await subject.start()
+
+    wait_task = asyncio.create_task(subject.wait())
+    await asyncio.sleep(0)
+    assert wait_task.done() is False
+    child.returncode = 9
+
+    await asyncio.wait_for(wait_task, timeout=1)
+    await subject.stop()
+    assert child.terminate_calls == 0
+    assert child.wait_calls == 1

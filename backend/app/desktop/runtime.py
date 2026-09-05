@@ -34,6 +34,8 @@ class PostgresLifecycle(Protocol):
 
     async def stop(self) -> None: ...
 
+    async def wait(self) -> None: ...
+
 
 class ApplicationLifecycle(Protocol):
     @property
@@ -53,6 +55,8 @@ class ServerLifecycle(Protocol):
     async def start(self) -> None: ...
 
     async def stop(self) -> None: ...
+
+    async def wait(self) -> None: ...
 
 
 class MarkerFileSystem(Protocol):
@@ -243,6 +247,41 @@ class DesktopRuntime:
         self._terminal_event = stopped
         await self._emit(stopped)
         return stopped
+
+    async def wait_for_failure(self) -> RuntimeEvent:
+        """Wait for an owned service to stop outside the normal shutdown path."""
+        if self._terminal_event is not None:
+            return self._terminal_event
+        if not self._ready or self.postgres is None or self.server is None:
+            return await self._failure(
+                "runtime_unavailable", "desktop runtime is not ready"
+            )
+
+        watchers = {
+            asyncio.create_task(self.postgres.wait()),
+            asyncio.create_task(self.server.wait()),
+        }
+        try:
+            done, _pending = await asyncio.wait(
+                watchers, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                await task
+        except asyncio.CancelledError:
+            raise
+        except Exception as service_error:  # noqa: BLE001 - sanitize failures
+            del service_error
+        finally:
+            for task in watchers:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*watchers, return_exceptions=True)
+
+        self._ready = False
+        await self._finish_cleanup(clean=False, disable_reason=None)
+        return await self._failure(
+            "runtime_unavailable", "desktop service stopped unexpectedly"
+        )
 
     async def _finish_cleanup(self, *, clean: bool, disable_reason: str | None) -> bool:
         cleanup_task = self._cleanup_task

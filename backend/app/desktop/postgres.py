@@ -13,6 +13,7 @@ STARTUP_TIMEOUT_SECONDS = 10.0
 READINESS_BACKOFF_SECONDS = 0.1
 COMMAND_TIMEOUT_SECONDS = 30.0
 SHUTDOWN_TIMEOUT_SECONDS = 10.0
+EXIT_POLL_SECONDS = 0.1
 
 _DATABASE_EXISTS_SQL = "SELECT 1 FROM pg_database WHERE datname='poly'"
 _NOT_READY_EXIT_CODES = frozenset({1, 2})
@@ -334,6 +335,13 @@ class PostgresManager:
             raise
         else:
             self._finish_cleanup(child, cleanup_task, succeeded=True)
+
+    async def wait(self) -> None:
+        child = self._child
+        if child is None:
+            raise PostgresRuntimeError("postgres is not running")
+        while child.returncode is None:
+            await asyncio.sleep(EXIT_POLL_SECONDS)
 
     async def _stop_child(self, child: OwnedChild) -> None:
         if child.returncode is not None:

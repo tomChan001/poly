@@ -182,12 +182,16 @@ class FakePostgres:
     def __init__(self, trace: list[str], database_url: str = "postgresql://local/%db"):
         self.trace = trace
         self.paths = type("Paths", (), {"database_url": database_url})()
+        self.exited = asyncio.Event()
 
     async def start(self) -> None:
         self.trace.append("postgres.start")
 
     async def stop(self) -> None:
         self.trace.append("postgres.stop")
+
+    async def wait(self) -> None:
+        await self.exited.wait()
 
 
 class FakeContainer:
@@ -209,6 +213,7 @@ class FakeServer:
         self.trace = trace
         self.container = container
         self.started = False
+        self.exited = asyncio.Event()
 
     async def start(self) -> None:
         self.trace.append("server.start")
@@ -219,6 +224,9 @@ class FakeServer:
         if self.started:
             self.trace.append("container.close")
             self.started = False
+
+    async def wait(self) -> None:
+        await self.exited.wait()
 
 
 def make_runtime(
@@ -346,6 +354,41 @@ async def test_shutdown_closes_opening_before_server_and_database(
         "postgres.stop",
     ]
     assert not (tmp_path / "data" / "unclean_shutdown").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_service", ["postgres", "server"])
+async def test_unexpected_service_exit_fails_closed_and_keeps_recovery_marker(
+    tmp_path: Path,
+    failed_service: str,
+) -> None:
+    trace: list[str] = []
+    events: list[RuntimeEvent] = []
+    postgres = FakePostgres(trace)
+    runtime = make_runtime(tmp_path, trace, events=events, postgres=postgres)
+    await runtime.start(
+        StartCommand(PurePosixPath("/data"), PurePosixPath("/run"), "x" * 43)
+    )
+    server = cast(FakeServer, runtime.server)
+
+    failure_task = asyncio.create_task(runtime.wait_for_failure())
+    if failed_service == "postgres":
+        postgres.exited.set()
+    else:
+        server.exited.set()
+    failed = await asyncio.wait_for(failure_task, timeout=1)
+
+    assert failed == RuntimeEvent(
+        RuntimeState.FAILED,
+        {
+            "code": "runtime_unavailable",
+            "detail": "desktop service stopped unexpectedly",
+        },
+    )
+    assert events[-1] == failed
+    assert trace[-3:] == ["server.stop", "container.close", "postgres.stop"]
+    assert (tmp_path / "data" / "unclean_shutdown").exists()
+    assert await runtime.stop("application quit") == failed
 
 
 @pytest.mark.asyncio
@@ -827,6 +870,10 @@ async def test_stdio_parent_eof_stops_runtime_without_leaking_token() -> None:
             output.append(event.to_json())
             return event
 
+        async def wait_for_failure(self) -> RuntimeEvent:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
     result = await desktop_main.run_stdio(
         runtime=cast(DesktopRuntime, Runtime()),
         line_reader=lambda: next(lines),
@@ -835,6 +882,57 @@ async def test_stdio_parent_eof_stops_runtime_without_leaking_token() -> None:
 
     assert result == 0
     assert all("launch_token" not in line for line in output)
+
+
+@pytest.mark.asyncio
+async def test_stdio_exits_when_an_owned_service_fails_after_ready() -> None:
+    start_line = (
+        b'{"version":1,"command":"start","data_dir":"/data",'
+        b'"runtime_dir":"/run","launch_token":"' + b"x" * 43 + b'"}\n'
+    )
+    read_count = 0
+    stop_reasons: list[str] = []
+
+    async def read_line() -> bytes:
+        nonlocal read_count
+        read_count += 1
+        if read_count == 1:
+            return start_line
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    class Runtime:
+        async def start(self, _command: StartCommand) -> RuntimeEvent:
+            return RuntimeEvent(
+                RuntimeState.READY,
+                {"port": 49152, "bootstrap_path": "/desktop/bootstrap/safe"},
+            )
+
+        async def wait_for_failure(self) -> RuntimeEvent:
+            await asyncio.sleep(0)
+            return RuntimeEvent(
+                RuntimeState.FAILED,
+                {
+                    "code": "runtime_unavailable",
+                    "detail": "desktop service stopped unexpectedly",
+                },
+            )
+
+        async def stop(self, reason: str) -> RuntimeEvent:
+            stop_reasons.append(reason)
+            return RuntimeEvent(RuntimeState.STOPPED, {})
+
+    result = await asyncio.wait_for(
+        desktop_main.run_stdio(
+            runtime=cast(DesktopRuntime, Runtime()),
+            line_reader=read_line,
+            event_writer=lambda _line: None,
+        ),
+        timeout=1,
+    )
+
+    assert result == 1
+    assert stop_reasons == []
 
 
 @pytest.mark.asyncio
@@ -933,6 +1031,10 @@ async def test_default_stdin_pipe_eof_stops_runtime(
         async def stop(self, reason: str) -> RuntimeEvent:
             stop_reasons.append(reason)
             return RuntimeEvent(RuntimeState.STOPPED, {})
+
+        async def wait_for_failure(self) -> RuntimeEvent:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
 
     try:
         result = await desktop_main.run_stdio(

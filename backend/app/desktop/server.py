@@ -86,6 +86,12 @@ class LoopbackServer:
         finally:
             self.socket.close()
 
+    async def wait(self) -> None:
+        task = self._task
+        if task is None:
+            raise RuntimeError("loopback server is not running")
+        await asyncio.shield(task)
+
     async def _abort_startup(self) -> None:
         self._stopped = True
         self.server.should_exit = True

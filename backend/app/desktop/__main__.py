@@ -148,7 +148,19 @@ async def run_stdio(
         return 1
 
     while True:
-        line = await _read_line(line_reader, stdin_reader)
+        line_task = asyncio.create_task(_read_line(line_reader, stdin_reader))
+        failure_task = asyncio.create_task(active_runtime.wait_for_failure())
+        done, _pending = await asyncio.wait(
+            {line_task, failure_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if failure_task in done:
+            line_task.cancel()
+            await asyncio.gather(line_task, return_exceptions=True)
+            await failure_task
+            return 1
+        failure_task.cancel()
+        await asyncio.gather(failure_task, return_exceptions=True)
+        line = await line_task
         if not line:
             stopped = await active_runtime.stop("parent process ended")
             return 0 if stopped.state is RuntimeState.STOPPED else 1
