@@ -247,7 +247,11 @@ def cpython_library_files() -> frozenset[str]:
     }
     if not names:
         raise ValueError("CPython build metadata lacks its macOS dynamic library name")
-    return frozenset(names)
+    return frozenset(
+        bundled_path
+        for name in names
+        for bundled_path in (name, f"_internal/{name}")
+    )
 
 
 def pyinstaller_runtime_files(

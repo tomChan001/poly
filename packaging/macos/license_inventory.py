@@ -105,7 +105,7 @@ def classify_macho_paths(
         path.replace("\\", "/") for path in stdlib_files
     )
     normalized_cpython_libraries = frozenset(
-        Path(path).name for path in cpython_library_files
+        path.replace("\\", "/") for path in cpython_library_files
     )
     for relative in relative_paths:
         _validate_relative(relative)
@@ -116,8 +116,7 @@ def classify_macho_paths(
         if bundled_path.startswith("postgres/"):
             classifications[relative] = "PostgreSQL"
             continue
-        filename = Path(bundled_path).name
-        if filename in normalized_cpython_libraries or (
+        if relative in normalized_cpython_libraries or (
             relative.endswith(".so")
             and _is_cpython_file(
                 bundled_path, stdlib_files=normalized_stdlib_files

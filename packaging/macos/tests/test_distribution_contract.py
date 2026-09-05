@@ -456,7 +456,10 @@ class DistributionContractTests(unittest.TestCase):
                 package_distributions={},
                 distribution_files={},
                 stdlib_files=set(),
-                cpython_library_files={"libpython3.12.dylib"},
+                cpython_library_files={
+                    "libpython3.12.dylib",
+                    "_internal/libpython3.12.dylib",
+                },
                 native_license_root=native,
             )
             self.assertEqual(classifications[paths[1]], "PostgreSQL")
@@ -469,7 +472,10 @@ class DistributionContractTests(unittest.TestCase):
                     package_distributions={},
                     distribution_files={},
                     stdlib_files=set(),
-                    cpython_library_files={"libpython3.12.dylib"},
+                    cpython_library_files={
+                        "libpython3.12.dylib",
+                        "_internal/libpython3.12.dylib",
+                    },
                     native_license_root=native,
                 )
             with self.assertRaisesRegex(ValueError, "packaged native file lacks inventory"):
@@ -479,7 +485,23 @@ class DistributionContractTests(unittest.TestCase):
                     package_distributions={},
                     distribution_files={},
                     stdlib_files=set(),
-                    cpython_library_files={"libpython3.12.dylib"},
+                    cpython_library_files={
+                        "libpython3.12.dylib",
+                        "_internal/libpython3.12.dylib",
+                    },
+                    native_license_root=native,
+                )
+            with self.assertRaisesRegex(ValueError, "packaged native file lacks inventory"):
+                module.classify_macho_paths(
+                    ["_internal/spoof/libpython3.12.dylib"],
+                    production_distributions={},
+                    package_distributions={},
+                    distribution_files={},
+                    stdlib_files=set(),
+                    cpython_library_files={
+                        "libpython3.12.dylib",
+                        "_internal/libpython3.12.dylib",
+                    },
                     native_license_root=native,
                 )
 
