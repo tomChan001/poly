@@ -936,6 +936,67 @@ async def test_stdio_exits_when_an_owned_service_fails_after_ready() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancelling_stdio_reaps_both_active_wait_tasks() -> None:
+    start_line = (
+        b'{"version":1,"command":"start","data_dir":"/data",'
+        b'"runtime_dir":"/run","launch_token":"' + b"x" * 43 + b'"}\n'
+    )
+    read_count = 0
+    line_waiting = asyncio.Event()
+    line_cancelled = asyncio.Event()
+    failure_waiting = asyncio.Event()
+    failure_cancelled = asyncio.Event()
+
+    async def read_line() -> bytes:
+        nonlocal read_count
+        read_count += 1
+        if read_count == 1:
+            return start_line
+        line_waiting.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            line_cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+    class Runtime:
+        async def start(self, _command: StartCommand) -> RuntimeEvent:
+            return RuntimeEvent(
+                RuntimeState.READY,
+                {"port": 49152, "bootstrap_path": "/desktop/bootstrap/safe"},
+            )
+
+        async def wait_for_failure(self) -> RuntimeEvent:
+            failure_waiting.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                failure_cancelled.set()
+                raise
+            raise AssertionError("unreachable")
+
+        async def stop(self, _reason: str) -> RuntimeEvent:
+            raise AssertionError("cancelled stdio must not claim a clean stop")
+
+    task = asyncio.create_task(
+        desktop_main.run_stdio(
+            runtime=cast(DesktopRuntime, Runtime()),
+            line_reader=read_line,
+            event_writer=lambda _line: None,
+        )
+    )
+    await asyncio.wait_for(line_waiting.wait(), timeout=1)
+    await asyncio.wait_for(failure_waiting.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert line_cancelled.is_set()
+    assert failure_cancelled.is_set()
+
+
+@pytest.mark.asyncio
 async def test_stdio_malformed_command_emits_sanitized_failure() -> None:
     output: list[str] = []
     result = await desktop_main.run_stdio(

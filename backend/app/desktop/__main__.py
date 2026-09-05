@@ -150,30 +150,35 @@ async def run_stdio(
     while True:
         line_task = asyncio.create_task(_read_line(line_reader, stdin_reader))
         failure_task = asyncio.create_task(active_runtime.wait_for_failure())
-        done, _pending = await asyncio.wait(
-            {line_task, failure_task}, return_when=asyncio.FIRST_COMPLETED
-        )
-        if failure_task in done:
-            line_task.cancel()
-            await asyncio.gather(line_task, return_exceptions=True)
-            await failure_task
-            return 1
-        failure_task.cancel()
-        await asyncio.gather(failure_task, return_exceptions=True)
-        line = await line_task
-        if not line:
-            stopped = await active_runtime.stop("parent process ended")
-            return 0 if stopped.state is RuntimeState.STOPPED else 1
+        active_waits = (line_task, failure_task)
         try:
-            command = parse_command(line.decode("utf-8", errors="strict"))
-            if not isinstance(command, ShutdownCommand):
-                raise TypeError("runtime already started")
-        except (TypeError, UnicodeError, ValueError):
-            await active_runtime.stop("invalid parent command")
-            await emit(_failure("invalid_start_command", "invalid desktop command"))
-            return 2
-        stopped = await active_runtime.stop(command.reason)
-        return 0 if stopped.state is RuntimeState.STOPPED else 1
+            done, _pending = await asyncio.wait(
+                active_waits, return_when=asyncio.FIRST_COMPLETED
+            )
+            if failure_task in done:
+                await failure_task
+                return 1
+            line = await line_task
+            if not line:
+                stopped = await active_runtime.stop("parent process ended")
+                return 0 if stopped.state is RuntimeState.STOPPED else 1
+            try:
+                command = parse_command(line.decode("utf-8", errors="strict"))
+                if not isinstance(command, ShutdownCommand):
+                    raise TypeError("runtime already started")
+            except (TypeError, UnicodeError, ValueError):
+                await active_runtime.stop("invalid parent command")
+                await emit(
+                    _failure("invalid_start_command", "invalid desktop command")
+                )
+                return 2
+            stopped = await active_runtime.stop(command.reason)
+            return 0 if stopped.state is RuntimeState.STOPPED else 1
+        finally:
+            for task in active_waits:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*active_waits, return_exceptions=True)
 
 
 def self_test(

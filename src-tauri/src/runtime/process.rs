@@ -867,7 +867,7 @@ fn open_private_log(path: &Path, append: bool, truncate: bool) -> io::Result<Fil
         .write(true)
         .create(append || truncate)
         .append(append)
-        .truncate(truncate);
+        .truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -877,17 +877,25 @@ fn open_private_log(path: &Path, append: bool, truncate: bool) -> io::Result<Fil
     let file = options.open(path)?;
     let opened = file.metadata()?;
     let named = fs::symlink_metadata(path)?;
-    if !opened.is_file() || named.file_type().is_symlink() || opened.nlink() != 1 {
+    if !opened.is_file()
+        || named.file_type().is_symlink()
+        || opened.nlink() != 1
+        || opened.identity() != named.identity()
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "unsafe diagnostic log file",
         ));
+    }
+    if truncate {
+        file.set_len(0)?;
     }
     Ok(file)
 }
 
 trait LinkCount {
     fn nlink(&self) -> u64;
+    fn identity(&self) -> Option<(u64, u64)>;
 }
 
 #[cfg(unix)]
@@ -895,12 +903,23 @@ impl LinkCount for fs::Metadata {
     fn nlink(&self) -> u64 {
         std::os::unix::fs::MetadataExt::nlink(self)
     }
+
+    fn identity(&self) -> Option<(u64, u64)> {
+        Some((
+            std::os::unix::fs::MetadataExt::dev(self),
+            std::os::unix::fs::MetadataExt::ino(self),
+        ))
+    }
 }
 
 #[cfg(not(unix))]
 impl LinkCount for fs::Metadata {
     fn nlink(&self) -> u64 {
         1
+    }
+
+    fn identity(&self) -> Option<(u64, u64)> {
+        None
     }
 }
 
@@ -1592,6 +1611,25 @@ mod tests {
             assert_eq!(fs::read(&target).unwrap(), original);
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_log_truncation_happens_only_after_link_validation() {
+        let root = std::env::temp_dir().join(format!(
+            "poly-runtime-truncate-log-test-{}",
+            generate_launch_token().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("outside.log");
+        let log_path = root.join("runtime.stderr.log");
+        let original = b"must-not-be-truncated";
+        fs::write(&target, original).unwrap();
+        fs::hard_link(&target, &log_path).unwrap();
+
+        assert!(open_private_log(&log_path, false, true).is_err());
+        assert_eq!(fs::read(&target).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
