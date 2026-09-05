@@ -24,7 +24,7 @@ describe('desktop session capability', () => {
       {
         getItem: (key: string) => storage.get(key) ?? null,
         setItem: (key: string, value: string) => storage.set(key, value),
-      } as Storage,
+      } as unknown as Storage,
     )
     await sessionFetch('/health')
 
