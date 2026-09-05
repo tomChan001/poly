@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence, Set as AbstractSet
+from collections.abc import Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from pathlib import Path
 
 
@@ -63,7 +64,7 @@ def _package_attribution(
     for name in sorted(owners, key=str.casefold):
         details = normalized_production[normalize_name(name)]
         if not isinstance(details, Mapping):
-            raise ValueError(f"Python package inventory lacks details: {name}")
+            raise TypeError(f"Python package inventory lacks details: {name}")
         license_id = details.get("license")
         if not license_id:
             raise ValueError(f"Python package inventory lacks license evidence: {name}")

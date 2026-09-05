@@ -37,6 +37,11 @@ def test_workflow_is_read_only_and_uses_the_exact_native_matrix() -> None:
         r"(?im)^\s*(?:run:\s*)?aws\s+(?:cloudformation|s3|deploy)", workflow
     )
     assert not re.search(r"(?im)\bdeploy(?:ment)?\b", workflow)
+    job_environment = workflow.split("    env:", 1)[1].split("    steps:", 1)[0]
+    assert re.search(
+        r"(?m)^\s+MACOSX_DEPLOYMENT_TARGET:\s*['\"]12\.0['\"]\s*$",
+        job_environment,
+    )
 
 
 def test_workflow_separates_validation_from_protected_release_signing() -> None:
@@ -86,7 +91,13 @@ def test_workflow_has_the_required_ordered_locked_pipeline() -> None:
         "npm ci",
         f"astral-sh/setup-uv@{action_pins['astral-sh/setup-uv'][0]}",
         "uv sync --frozen",
-        "uv run --frozen pytest backend/tests/unit backend/tests/security",
+        "uv run --frozen ruff check .",
+        "uv run --frozen pytest",
+        "backend/tests/unit",
+        "backend/tests/security",
+        "backend/tests/integration/api/test_desktop_session.py",
+        "packaging/macos/tests/test_distribution_contract.py",
+        "packaging/macos/tests/test_ci_documentation_contract.py",
         "npm run lint",
         "npm test",
         "npm run build",
@@ -122,6 +133,22 @@ def test_workflow_has_the_required_ordered_locked_pipeline() -> None:
         **{owner: 1 for owner in action_pins if owner != "actions/upload-artifact"},
         "actions/upload-artifact": 2,
     }
+
+
+def test_non_release_build_audits_the_real_bundle_with_controlled_architecture() -> None:
+    workflow = read(WORKFLOW)
+    verification = workflow.split(
+        "- name: Verify release bundle or ad-hoc contract", 1
+    )[1].split("- name: Install DMG into an isolated home and smoke test", 1)[0]
+    assert 'APP_PATH="${GITHUB_WORKSPACE}/' in verification
+    assert (
+        'packaging/macos/verify-bundle.sh --audit-bundle "${APP_PATH}"'
+        in verification
+    )
+    assert "packaging/macos/verify-bundle.sh --check" not in verification
+    assert "POLY_TARGET_ARCH" in workflow.split("    env:", 1)[1].split(
+        "    steps:", 1
+    )[0]
 
 
 def test_smoke_uses_an_isolated_home_installed_dmg_and_command_guards() -> None:
@@ -223,6 +250,34 @@ def test_smoke_uses_calibrated_kernel_exec_tracing() -> None:
         re.DOTALL,
     )
     assert '[[ ! -s "${TRACE_FAILURE}" ]]' in workflow
+    smoke = workflow.split(
+        "- name: Install DMG into an isolated home and smoke test", 1
+    )[1].split("- name: Remove temporary signing keychain", 1)[0]
+    trace_start = smoke.index(
+        'start_exec_trace "${APP_EXEC_TRACE}" Poly poly-runtime'
+    )
+    app_launch = smoke.index('/usr/bin/open -n "${INSTALLED_APP}"', trace_start)
+    trace_stop = smoke.index("stop_exec_trace", app_launch)
+    trace_audit = smoke.index(
+        'audit_exec_trace "${APP_EXEC_TRACE}" "${TRACE_FAILURE}"', trace_stop
+    )
+    positive_evidence = smoke.index(
+        'grep -Fq "${RUNTIME_EXECUTABLE}" "${APP_EXEC_TRACE}"', trace_audit
+    )
+    keychain_verify = smoke.index("--keychain-smoke verify", trace_start)
+    keychain_delete = smoke.index("--keychain-smoke delete", trace_start)
+    assert (
+        trace_start
+        < app_launch
+        < trace_stop
+        < trace_audit
+        < positive_evidence
+        < keychain_verify
+        < keychain_delete
+    )
+    trace_window = smoke[trace_start:trace_stop]
+    assert "--keychain-smoke verify" not in trace_window
+    assert "--keychain-smoke delete" not in trace_window
 
 
 def test_exec_trace_unexpected_exit_is_a_hard_failure() -> None:

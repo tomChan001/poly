@@ -445,7 +445,7 @@ def validate_external_inventory(
     """Compare an optional license tool report with the deterministic inventory."""
     report = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(report, list):
-        raise ValueError(f"{ecosystem} license report is not a JSON array")
+        raise TypeError(f"{ecosystem} license report is not a JSON array")
     actual: dict[tuple[str, str], str] = {}
     for entry in report:
         name = entry.get("name") or entry.get("Name")

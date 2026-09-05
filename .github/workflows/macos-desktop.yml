@@ -33,6 +33,7 @@ jobs:
             artifact: Poly-macos-x86_64
     env:
       CARGO_TERM_COLOR: always
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
       POLY_TARGET_ARCH: ${{ matrix.py_arch }}
       POLY_TARGET_TRIPLE: ${{ matrix.rust_target }}
       IS_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
@@ -63,11 +64,21 @@ jobs:
       - name: Install frozen Python environment
         run: uv sync --frozen
 
+      - name: Lint Python
+        run: uv run --frozen ruff check .
+
       - name: Run mocked Python tests
         env:
           OPENING_ENABLED: 'false'
           LOCAL_SETUP_ENABLED: 'false'
-        run: uv run --frozen pytest backend/tests/unit backend/tests/security packaging/macos/tests/test_ci_documentation_contract.py -q
+        run: |
+          uv run --frozen pytest \
+            backend/tests/unit \
+            backend/tests/security \
+            backend/tests/integration/api/test_desktop_session.py \
+            packaging/macos/tests/test_distribution_contract.py \
+            packaging/macos/tests/test_ci_documentation_contract.py \
+            -q
 
       - name: Lint frontend
         working-directory: frontend
@@ -185,8 +196,7 @@ jobs:
           if [[ "${IS_RELEASE}" == 'true' ]]; then
             packaging/macos/verify-bundle.sh "${APP_PATH}"
           else
-            codesign --verify --deep --strict --verbose=2 "${APP_PATH}"
-            packaging/macos/verify-bundle.sh --check
+            packaging/macos/verify-bundle.sh --audit-bundle "${APP_PATH}"
           fi
 
       - name: Install DMG into an isolated home and smoke test
@@ -491,6 +501,19 @@ jobs:
           done
           [[ -z "${remaining}" && "${app_count}" -eq 0 ]]
 
+          assert_exec_trace_alive
+          stop_exec_trace
+          audit_exec_trace "${APP_EXEC_TRACE}" "${TRACE_FAILURE}"
+          if [[ ! -s "${APP_EXEC_TRACE}" ]]; then
+            printf 'scoped fs_usage trace produced no events\n' >>"${TRACE_FAILURE}"
+          fi
+          if ! { /usr/bin/grep -Fq "${RUNTIME_EXECUTABLE}" "${APP_EXEC_TRACE}" \
+            || /usr/bin/grep -Fq "${BUNDLED_POSTGRES}" "${APP_EXEC_TRACE}"; }; then
+            printf 'scoped fs_usage trace lacks bundled child spawn evidence\n' >>"${TRACE_FAILURE}"
+          fi
+          [[ -s "${APP_EXEC_TRACE}" ]]
+          [[ ! -s "${TRACE_FAILURE}" ]]
+
           /usr/bin/open -n "${INSTALLED_APP}"
           /bin/sleep 2
           printf '%s' "${SMOKE_SECRET}" \
@@ -511,18 +534,7 @@ jobs:
           done
           [[ -z "${remaining}" && "${app_count}" -eq 0 ]]
           "${RUNTIME_EXECUTABLE}" --keychain-smoke delete --account "${SMOKE_ACCOUNT}" >/dev/null
-          assert_exec_trace_alive
-          stop_exec_trace
-          audit_exec_trace "${APP_EXEC_TRACE}" "${TRACE_FAILURE}"
-          if [[ ! -s "${APP_EXEC_TRACE}" ]]; then
-            printf 'scoped fs_usage trace produced no events\n' >>"${TRACE_FAILURE}"
-          fi
-          if ! { /usr/bin/grep -Fq "${RUNTIME_EXECUTABLE}" "${APP_EXEC_TRACE}" \
-            || /usr/bin/grep -Fq "${BUNDLED_POSTGRES}" "${APP_EXEC_TRACE}"; }; then
-            printf 'scoped fs_usage trace lacks bundled child spawn evidence\n' >>"${TRACE_FAILURE}"
-          fi
           copy_smoke_diagnostics
-          [[ -s "${APP_EXEC_TRACE}" ]]
           [[ ! -s "${GUARD_LOG}" ]]
           [[ ! -s "${TRACE_FAILURE}" ]]
 
