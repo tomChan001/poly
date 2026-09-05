@@ -46,6 +46,13 @@ pub struct DesktopPaths {
     logs_dir: PathBuf,
 }
 
+struct DirectorySecurityPlan<'a> {
+    shared_root: &'a Path,
+    shared_cache_root: &'a Path,
+    cache_root: &'a Path,
+    owned_directories: [&'a Path; 4],
+}
+
 impl DesktopPaths {
     pub fn from_resolved(
         resource_dir: PathBuf,
@@ -75,23 +82,42 @@ impl DesktopPaths {
     pub fn prepare_directories(&self) -> Result<(), DesktopServiceError> {
         reject_symlink_ancestors(&self.resource_dir)?;
         std::fs::canonicalize(&self.resource_dir).map_err(DesktopServiceError::Directory)?;
-        let cache_root = self
-            .runtime_dir
-            .parent()
-            .ok_or(DesktopServiceError::InvalidPath("app_cache_dir"))?;
-        for directory in [
-            self.application_support.as_path(),
-            cache_root,
-            &self.data_dir,
-            &self.runtime_dir,
-            &self.logs_dir,
-        ] {
+        let plan = self.directory_security_plan()?;
+        validate_shared_root(plan.shared_root, "application_support")?;
+        validate_shared_root(plan.shared_cache_root, "cache_root")?;
+        for directory in plan.owned_directories {
             secure_create_dir_all(directory)?;
         }
         ensure_canonical_child(&self.application_support, &self.data_dir)?;
         ensure_canonical_child(&self.data_dir, &self.logs_dir)?;
-        ensure_canonical_child(cache_root, &self.runtime_dir)?;
+        ensure_canonical_child(plan.shared_cache_root, plan.cache_root)?;
+        ensure_canonical_child(plan.cache_root, &self.runtime_dir)?;
         Ok(())
+    }
+
+    fn directory_security_plan(&self) -> Result<DirectorySecurityPlan<'_>, DesktopServiceError> {
+        let cache_root = self
+            .runtime_dir
+            .parent()
+            .ok_or(DesktopServiceError::InvalidPath("app_cache_dir"))?;
+        let shared_cache_root = cache_root
+            .parent()
+            .filter(|parent| parent.is_absolute())
+            .ok_or(DesktopServiceError::InvalidPath("app_cache_dir"))?;
+        if cache_root == self.application_support {
+            return Err(DesktopServiceError::InvalidPath("app_cache_dir"));
+        }
+        Ok(DirectorySecurityPlan {
+            shared_root: &self.application_support,
+            shared_cache_root,
+            cache_root,
+            owned_directories: [
+                &self.data_dir,
+                &self.logs_dir,
+                cache_root,
+                &self.runtime_dir,
+            ],
+        })
     }
 
     pub fn resource_dir(&self) -> &Path {
@@ -138,6 +164,13 @@ fn validate_absolute(path: &Path, field: &'static str) -> Result<(), DesktopServ
     } else {
         Err(DesktopServiceError::InvalidPath(field))
     }
+}
+
+fn validate_shared_root(path: &Path, field: &'static str) -> Result<(), DesktopServiceError> {
+    validate_absolute(path, field)?;
+    reject_symlink_ancestors(path)?;
+    std::fs::canonicalize(path).map_err(DesktopServiceError::Directory)?;
+    Ok(())
 }
 
 fn secure_create_dir_all(path: &Path) -> Result<(), DesktopServiceError> {
@@ -878,6 +911,100 @@ mod tests {
             root.join("Caches").join("..").join("outside"),
         )
         .is_err());
+    }
+
+    #[test]
+    fn directory_security_plan_never_treats_shared_support_as_owned() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("desktop-security-plan-test");
+        let application_support = root.join("Application Support");
+        let paths = DesktopPaths::from_resolved(
+            root.join("Resources"),
+            application_support.join("com.poly.desktop"),
+            root.join("Caches").join("com.poly.desktop"),
+        )
+        .unwrap();
+
+        let plan = paths.directory_security_plan().unwrap();
+
+        assert_eq!(plan.shared_root, application_support.as_path());
+        assert_eq!(plan.shared_cache_root, root.join("Caches"));
+        assert!(!plan
+            .owned_directories
+            .iter()
+            .any(|directory| *directory == application_support
+                || *directory == plan.shared_cache_root));
+        assert!(plan
+            .owned_directories
+            .iter()
+            .any(|directory| *directory == paths.data_dir()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_preparation_preserves_shared_support_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root =
+            std::env::temp_dir().join(format!("poly-desktop-shared-mode-{}", std::process::id()));
+        let resources = root.join("Resources");
+        let application_support = root.join("Application Support");
+        let app_data = application_support.join("com.poly.desktop");
+        let shared_cache_root = root.join("Caches");
+        let cache = shared_cache_root.join("com.poly.desktop");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::create_dir_all(&application_support).unwrap();
+        std::fs::create_dir_all(&shared_cache_root).unwrap();
+        std::fs::set_permissions(&application_support, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::set_permissions(&shared_cache_root, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let before = std::fs::metadata(&application_support)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let cache_before = std::fs::metadata(&shared_cache_root)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let paths = DesktopPaths::from_resolved(resources, app_data, cache).unwrap();
+
+        paths.prepare_directories().unwrap();
+
+        let after = std::fs::metadata(&application_support)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(after, before);
+        assert_eq!(
+            std::fs::metadata(&shared_cache_root)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            cache_before
+        );
+        assert_eq!(
+            std::fs::metadata(paths.data_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(paths.runtime_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
