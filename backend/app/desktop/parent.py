@@ -150,7 +150,7 @@ def _verified_running_signature(
         "--verbose=2",
     ]
     if requirement is not None:
-        arguments.append(f"-R={requirement}")
+        arguments.extend(["-R", requirement])
     # A bare positive integer is interpreted by codesign as a PID and causes
     # dynamic validation of the running code object, not its current path.
     arguments.append(str(pid))

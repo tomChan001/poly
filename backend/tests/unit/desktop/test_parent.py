@@ -190,7 +190,7 @@ def test_dynamic_parent_verification_uses_pid_and_release_requirement(
         "com.poly.desktop", "ABCDE12345", False
     )
     assert calls[0][-1] == "4242"
-    assert calls[0][-2] == f"-R={requirement}"
+    assert calls[0][-3:-1] == ["-R", requirement]
     assert calls[1][-1] == "4242"
 
 
