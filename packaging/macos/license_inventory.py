@@ -175,8 +175,8 @@ def classify_runtime_paths(
         bundled_path = _without_contents_directory(relative)
         if bundled_path.startswith("postgres/"):
             classifications[relative] = "PostgreSQL"
-        elif bundled_path == "alembic.ini" or bundled_path.startswith(
-            ("migrations/", "frontend/dist/")
+        elif bundled_path in {"alembic.ini", "expected-parent-team-id"} or (
+            bundled_path.startswith(("migrations/", "frontend/dist/"))
         ):
             classifications[relative] = "Poly application asset"
         elif bundled_path == "base_library.zip" or _is_cpython_file(

@@ -746,6 +746,8 @@ class DistributionContractTests(unittest.TestCase):
         known = module.classify_runtime_paths(
             [
                 "alembic.ini",
+                "expected-parent-team-id",
+                "_internal/expected-parent-team-id",
                 "frontend/dist/index.html",
                 "_internal/base_library.zip",
                 "_internal/certifi/cacert.pem",
@@ -760,6 +762,12 @@ class DistributionContractTests(unittest.TestCase):
             pyinstaller_runtime_files={"pyimod01_archive.pyc"},
         )
         self.assertEqual(known["alembic.ini"], "Poly application asset")
+        self.assertEqual(
+            known["expected-parent-team-id"], "Poly application asset"
+        )
+        self.assertEqual(
+            known["_internal/expected-parent-team-id"], "Poly application asset"
+        )
         self.assertIn("certifi (MPL-2.0)", known["_internal/certifi/cacert.pem"])
         for unknown in (
             "_internal/mystery.wasm",
@@ -768,6 +776,7 @@ class DistributionContractTests(unittest.TestCase):
             "_internal/certifi/untracked.wasm",
             "_internal/json/untracked.bin",
             "_internal/pyimod_untrusted.sh",
+            "_internal/nested/expected-parent-team-id",
         ):
             with self.subTest(unknown=unknown), self.assertRaisesRegex(
                 ValueError, "packaged file lacks license inventory"

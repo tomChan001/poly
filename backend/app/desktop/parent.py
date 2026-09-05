@@ -50,29 +50,59 @@ def trusted_packaged_parent(project_root: Path) -> bool:
             return False
         expected_parent = (contents / "MacOS" / "Poly").resolve(strict=True)
         runtime_executable = (root.parent / "poly-runtime").resolve(strict=True)
-        if _parent_executable(os.getppid()) != expected_parent:
+        parent_pid = os.getppid()
+        if parent_pid <= 1 or _parent_executable(parent_pid) != expected_parent:
             return False
 
         # Verify the complete bundle so the sealed identity resource cannot be
         # replaced and used to downgrade a production build to ad-hoc mode.
         parent_signature = _verified_signature(app_bundle, deep=True)
         runtime_signature = _verified_signature(runtime_executable)
+        requirement = None
+        if expected_team != ADHOC_VALIDATION_TEAM:
+            requirement = (
+                '=anchor apple generic and identifier "com.poly.desktop" '
+                "and certificate "
+                "leaf[field.1.2.840.113635.100.6.1.13] exists "
+                f'and certificate leaf[subject.OU] = "{expected_team}"'
+            )
+        running_parent_signature = _verified_running_signature(
+            parent_pid, requirement=requirement
+        )
+        if (
+            os.getppid() != parent_pid
+            or _parent_executable(parent_pid) != expected_parent
+        ):
+            return False
         if parent_signature.identifier != "com.poly.desktop":
             return False
         if expected_team == ADHOC_VALIDATION_TEAM:
             return bool(
                 parent_signature.ad_hoc
+                and running_parent_signature.ad_hoc
                 and runtime_signature.ad_hoc
                 and parent_signature.team_identifier is None
+                and running_parent_signature.team_identifier is None
                 and runtime_signature.team_identifier is None
+                and running_parent_signature.identifier == "com.poly.desktop"
             )
         return bool(
             not parent_signature.ad_hoc
+            and not running_parent_signature.ad_hoc
             and not runtime_signature.ad_hoc
             and parent_signature.team_identifier == expected_team
+            and running_parent_signature.identifier == "com.poly.desktop"
+            and running_parent_signature.team_identifier == expected_team
             and runtime_signature.team_identifier == expected_team
         )
-    except (IndexError, OSError, RuntimeError, UnicodeError, ValueError):
+    except (
+        IndexError,
+        OSError,
+        RuntimeError,
+        subprocess.SubprocessError,
+        UnicodeError,
+        ValueError,
+    ):
         return False
 
 
@@ -104,13 +134,51 @@ def _verified_signature(path: Path, *, deep: bool = False) -> CodeSignature:
     )
     if verify.returncode != 0:
         raise RuntimeError("code signature verification failed")
-    describe = subprocess.run(
-        ["/usr/bin/codesign", "--display", "--verbose=4", str(path)],
+    return _describe_signature(str(path), environment=environment)
+
+
+def _verified_running_signature(
+    pid: int, *, requirement: str | None
+) -> CodeSignature:
+    if pid <= 1:
+        raise ValueError("invalid parent process")
+    environment = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+    arguments = [
+        "/usr/bin/codesign",
+        "--verify",
+        "--strict",
+        "--verbose=2",
+    ]
+    if requirement is not None:
+        arguments.append(f"-R={requirement}")
+    # A bare positive integer is interpreted by codesign as a PID and causes
+    # dynamic validation of the running code object, not its current path.
+    arguments.append(str(pid))
+    verify = subprocess.run(
+        arguments,
         capture_output=True,
         text=True,
         timeout=10,
         check=False,
         env=environment,
+        cwd="/",
+    )
+    if verify.returncode != 0:
+        raise RuntimeError("running code signature verification failed")
+    return _describe_signature(str(pid), environment=environment)
+
+
+def _describe_signature(
+    target: str, *, environment: dict[str, str]
+) -> CodeSignature:
+    describe = subprocess.run(
+        ["/usr/bin/codesign", "--display", "--verbose=4", target],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+        env=environment,
+        cwd="/",
     )
     if describe.returncode != 0:
         raise RuntimeError("code signature description failed")

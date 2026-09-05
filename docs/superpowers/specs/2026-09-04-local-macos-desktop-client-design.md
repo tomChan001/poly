@@ -154,7 +154,7 @@ sidecar 通过标准输出发送逐行 JSON 事件，例如：
 {"version":1,"state":"ready","port":49152,"bootstrap_path":"/desktop/bootstrap/..."}
 ```
 
-标准输出只承载控制协议。诊断信息写到经过脱敏和轮转的本地日志，不记录凭证、启动令牌、会话 capability 或完整请求 URL。冻结的 sidecar 还会验证直接父进程位于同一 bundle，并校验父进程与自身的签名 Team ID；任意终端或同用户进程不能直接启动生产控制面。
+标准输出只承载控制协议。诊断信息写到经过脱敏和轮转的本地日志，不记录凭证、启动令牌、会话 capability 或完整请求 URL。冻结的 sidecar 会在校验完整 bundle 密封的同时，以父 PID 对正在运行的代码对象执行 macOS 动态签名验证，并要求精确的 bundle 路径、identifier、Developer ID Application 证书和构建时 Team ID；验证前后父 PID 与路径都必须保持一致。任意终端或同用户进程因此不能仅靠替换磁盘路径来直接启动生产控制面。
 
 ### 5.2 HTTP 端口分配
 
