@@ -420,10 +420,10 @@ async def test_service_exit_latches_failure_before_overlapping_parent_shutdown(
 
     assert overlapping_stop.state is RuntimeState.FAILED
     assert overlapping_stop.fields["code"] == "runtime_unavailable"
-    assert events[-1] == overlapping_stop
     assert (tmp_path / "data" / "unclean_shutdown").exists()
     release_cleanup.set()
     assert await asyncio.wait_for(failure_task, timeout=1) == overlapping_stop
+    assert events[-1] == overlapping_stop
 
 
 @pytest.mark.asyncio

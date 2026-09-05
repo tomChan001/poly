@@ -304,11 +304,11 @@ class DesktopRuntime:
     async def _finalize_unexpected_failure(
         self, failed: RuntimeEvent
     ) -> RuntimeEvent:
+        await self._finish_cleanup(clean=False, disable_reason=None)
         try:
             await self._emit(failed)
         except Exception as emit_error:  # noqa: BLE001 - cleanup still owns resources
             del emit_error
-        await self._finish_cleanup(clean=False, disable_reason=None)
         return failed
 
     async def _finish_cleanup(self, *, clean: bool, disable_reason: str | None) -> bool:
