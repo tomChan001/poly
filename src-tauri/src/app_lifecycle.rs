@@ -40,6 +40,9 @@ pub type ShutdownFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ()>> + Send
 pub trait RuntimeShutdown: Send + Sync {
     fn shutdown(&self, reason: &'static str) -> ShutdownFuture<'_>;
     fn cleanup_owned(&self);
+    fn wait_for_cleanup(&self) -> ShutdownFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 pub fn handle_second_instance(app: &dyn LifecycleApplication) {
@@ -93,6 +96,7 @@ impl AppLifecycle {
     ) {
         if runtime.shutdown(APPLICATION_QUIT_REASON).await.is_err() {
             self.cleanup_once(runtime.as_ref());
+            let _ = runtime.wait_for_cleanup().await;
             app.report_shutdown_failure();
         }
         self.phase.store(SHUTDOWN_COMPLETE, Ordering::Release);
@@ -104,6 +108,21 @@ impl AppLifecycle {
             return;
         }
         self.cleanup_once(runtime);
+    }
+
+    pub async fn teardown_and_wait(&self, runtime: &dyn RuntimeShutdown) -> Result<(), ()> {
+        self.teardown(runtime);
+        runtime.wait_for_cleanup().await
+    }
+
+    pub async fn teardown_and_report(
+        &self,
+        app: &dyn LifecycleApplication,
+        runtime: &dyn RuntimeShutdown,
+    ) {
+        if self.teardown_and_wait(runtime).await.is_err() {
+            app.report_shutdown_failure();
+        }
     }
 
     fn cleanup_once(&self, runtime: &dyn RuntimeShutdown) {
@@ -164,6 +183,21 @@ impl RuntimeShutdown for RuntimeShutdownRegistry {
         {
             current.cleanup_owned();
         }
+    }
+
+    fn wait_for_cleanup(&self) -> ShutdownFuture<'_> {
+        let current = self
+            .current
+            .read()
+            .expect("runtime shutdown lock poisoned")
+            .clone();
+        Box::pin(async move {
+            if let Some(current) = current {
+                current.wait_for_cleanup().await
+            } else {
+                Ok(())
+            }
+        })
     }
 }
 
@@ -263,7 +297,12 @@ fn teardown_tauri_runtime(app: &tauri::AppHandle) {
     use tauri::Manager as _;
 
     if let Some(state) = app.try_state::<crate::DesktopAppState>() {
-        state.lifecycle.teardown(state.runtime_shutdown.as_ref());
+        let application = TauriLifecycleApplication { app: app.clone() };
+        tauri::async_runtime::block_on(
+            state
+                .lifecycle
+                .teardown_and_report(&application, state.runtime_shutdown.as_ref()),
+        );
     }
 }
 
@@ -299,13 +338,26 @@ pub(crate) fn configure_tauri_builder(
 pub(crate) fn handle_tauri_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
     use tauri::Manager as _;
 
-    match event {
-        tauri::RunEvent::ExitRequested { api, .. } => {
-            if request_tauri_shutdown(app, app.get_webview_window("main")) != CloseDecision::Allow {
-                api.prevent_exit();
-            }
+    if is_teardown_event(&event) {
+        teardown_tauri_runtime(app);
+        return;
+    }
+    if let tauri::RunEvent::ExitRequested { api, .. } = event {
+        if request_tauri_shutdown(app, app.get_webview_window("main")) != CloseDecision::Allow {
+            api.prevent_exit();
         }
-        tauri::RunEvent::Exit => teardown_tauri_runtime(app),
-        _ => {}
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+const fn is_teardown_event(event: &tauri::RunEvent) -> bool {
+    matches!(event, tauri::RunEvent::Exit)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn production_exit_event_maps_to_confirmed_teardown() {
+        assert!(super::is_teardown_event(&tauri::RunEvent::Exit));
     }
 }

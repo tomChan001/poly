@@ -292,6 +292,8 @@ const PHASE_IDLE: u8 = 0;
 const PHASE_RUNNING: u8 = 1;
 const PHASE_TERMINAL: u8 = 2;
 const PHASE_RETRYING: u8 = 3;
+const SHUTDOWN_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(17);
+const TASK_CANCELLATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl<R, N> DesktopRuntimeService<R, N>
 where
@@ -487,16 +489,36 @@ where
 {
     fn shutdown(&self, reason: &'static str) -> ShutdownFuture<'_> {
         Box::pin(async move {
-            let result = self.shutdown.shutdown(reason).await;
             let task = self
                 .supervision_task
                 .lock()
                 .expect("desktop supervision task lock poisoned")
                 .take();
-            if let Some(task) = task {
+            let Some(task) = task else {
+                return Ok(());
+            };
+            if task.inner().is_finished() {
                 let _ = task.await;
+                return Ok(());
             }
-            result
+            let result =
+                tokio::time::timeout(SHUTDOWN_COMPLETION_TIMEOUT, self.shutdown.shutdown(reason))
+                    .await
+                    .map_err(|_| ())
+                    .and_then(std::convert::identity);
+            let mut task = task;
+            if result.is_err() {
+                task.abort();
+            }
+            let joined = match tokio::time::timeout(TASK_CANCELLATION_TIMEOUT, &mut task).await {
+                Ok(_) => Ok(()),
+                Err(_) => {
+                    task.abort();
+                    let _ = tokio::time::timeout(TASK_CANCELLATION_TIMEOUT, task).await;
+                    Err(())
+                }
+            };
+            result.and(joined)
         })
     }
 
@@ -504,16 +526,36 @@ where
         if self.cleanup_requested.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.shutdown.cleanup_owned();
         if let Some(task) = self
             .supervision_task
             .lock()
             .expect("desktop supervision task lock poisoned")
-            .take()
+            .as_ref()
         {
             task.abort();
-        } else {
-            self.shutdown.cleanup_owned();
         }
+    }
+
+    fn wait_for_cleanup(&self) -> ShutdownFuture<'_> {
+        let task = self
+            .supervision_task
+            .lock()
+            .expect("desktop supervision task lock poisoned")
+            .take();
+        let shutdown = Arc::clone(&self.shutdown);
+        Box::pin(async move {
+            let task_result = if let Some(task) = task {
+                tokio::time::timeout(TASK_CANCELLATION_TIMEOUT, task)
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| ())
+            } else {
+                Ok(())
+            };
+            let cleanup_result = shutdown.wait_for_cleanup().await;
+            task_result.and(cleanup_result)
+        })
     }
 }
 
@@ -738,6 +780,7 @@ mod tests {
         DesktopServiceError, DesktopSetupFailure, InstalledDesktopRuntime, RecoverableDesktopSetup,
         PHASE_TERMINAL,
     };
+    use crate::app_lifecycle::{RuntimeShutdown, ShutdownFuture};
     use crate::runtime::protocol::RuntimeEvent;
     use crate::runtime::supervisor::{RuntimeFailure, RuntimeSupervisorNotice};
 
@@ -800,6 +843,108 @@ mod tests {
         notices: watch::Sender<Option<RuntimeSupervisorNotice>>,
         entered: Arc<Notify>,
         release: Arc<Notify>,
+    }
+
+    struct CompletedRuntime {
+        notices: watch::Sender<Option<RuntimeSupervisorNotice>>,
+        terminal: bool,
+    }
+
+    impl DesktopRuntime for CompletedRuntime {
+        fn subscribe_notices(&self) -> watch::Receiver<Option<RuntimeSupervisorNotice>> {
+            self.notices.subscribe()
+        }
+
+        fn is_terminal(&self) -> bool {
+            self.terminal
+        }
+
+        fn explicit_operator_retry(&mut self) -> Result<(), DesktopServiceError> {
+            Ok(())
+        }
+
+        fn supervise_until_terminal(&mut self) -> RuntimeFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[derive(Default)]
+    struct NeverCompletingShutdown {
+        calls: AtomicUsize,
+    }
+
+    struct CancellationRuntime {
+        notices: watch::Sender<Option<RuntimeSupervisorNotice>>,
+        entered: Arc<Notify>,
+        cancellations: Arc<AtomicUsize>,
+    }
+
+    struct CancellationGuard(Arc<AtomicUsize>);
+
+    impl Drop for CancellationGuard {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl DesktopRuntime for CancellationRuntime {
+        fn subscribe_notices(&self) -> watch::Receiver<Option<RuntimeSupervisorNotice>> {
+            self.notices.subscribe()
+        }
+
+        fn is_terminal(&self) -> bool {
+            false
+        }
+
+        fn explicit_operator_retry(&mut self) -> Result<(), DesktopServiceError> {
+            Ok(())
+        }
+
+        fn supervise_until_terminal(&mut self) -> RuntimeFuture<'_> {
+            Box::pin(async move {
+                let _guard = CancellationGuard(Arc::clone(&self.cancellations));
+                self.entered.notify_waiters();
+                std::future::pending().await
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct ConfirmingCleanup {
+        cleanup_calls: AtomicUsize,
+        confirmation_calls: AtomicUsize,
+        fail_confirmation: AtomicBool,
+    }
+
+    impl RuntimeShutdown for ConfirmingCleanup {
+        fn shutdown(&self, _reason: &'static str) -> ShutdownFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn cleanup_owned(&self) {
+            self.cleanup_calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wait_for_cleanup(&self) -> ShutdownFuture<'_> {
+            self.confirmation_calls.fetch_add(1, Ordering::SeqCst);
+            let failed = self.fail_confirmation.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if failed {
+                    Err(())
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    impl RuntimeShutdown for NeverCompletingShutdown {
+        fn shutdown(&self, _reason: &'static str) -> ShutdownFuture<'_> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+
+        fn cleanup_owned(&self) {}
     }
 
     #[derive(Default)]
@@ -1154,6 +1299,133 @@ mod tests {
             wait_for(|| supervise_calls.load(Ordering::SeqCst) == 2).await;
             assert_eq!(retry_calls.load(Ordering::SeqCst), 1);
             observer.abort();
+        });
+    }
+
+    #[test]
+    fn shutdown_returns_promptly_after_terminal_supervision_already_finished() {
+        tauri::async_runtime::block_on(async {
+            let (notices, _) = watch::channel(None);
+            let shutdown = Arc::new(NeverCompletingShutdown::default());
+            let service = Arc::new(DesktopRuntimeService::with_reporter_and_shutdown(
+                CompletedRuntime {
+                    notices,
+                    terminal: true,
+                },
+                FakeNavigator::default(),
+                Arc::new(RecordingReporter::default()),
+                Arc::clone(&shutdown) as Arc<dyn RuntimeShutdown>,
+            ));
+            assert!(service.start_supervision());
+            wait_for(|| {
+                service
+                    .supervision_task
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|task| task.inner().is_finished())
+            })
+            .await;
+
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                RuntimeShutdown::shutdown(service.as_ref(), "application quit"),
+            )
+            .await
+            .expect("completed supervision shutdown must not hang")
+            .unwrap();
+
+            assert_eq!(shutdown.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn shutdown_without_an_active_supervision_task_returns_promptly() {
+        tauri::async_runtime::block_on(async {
+            let (notices, _) = watch::channel(None);
+            let shutdown = Arc::new(NeverCompletingShutdown::default());
+            let service = DesktopRuntimeService::with_reporter_and_shutdown(
+                CompletedRuntime {
+                    notices,
+                    terminal: false,
+                },
+                FakeNavigator::default(),
+                Arc::new(RecordingReporter::default()),
+                Arc::clone(&shutdown) as Arc<dyn RuntimeShutdown>,
+            );
+
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                RuntimeShutdown::shutdown(&service, "application quit"),
+            )
+            .await
+            .expect("no-active-child shutdown must not hang")
+            .unwrap();
+
+            assert_eq!(shutdown.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn active_service_teardown_awaits_task_cancellation_and_exact_cleanup_once() {
+        tauri::async_runtime::block_on(async {
+            let (notices, _) = watch::channel(None);
+            let entered = Arc::new(Notify::new());
+            let cancellations = Arc::new(AtomicUsize::new(0));
+            let cleanup = Arc::new(ConfirmingCleanup::default());
+            let service = Arc::new(DesktopRuntimeService::with_reporter_and_shutdown(
+                CancellationRuntime {
+                    notices,
+                    entered: Arc::clone(&entered),
+                    cancellations: Arc::clone(&cancellations),
+                },
+                FakeNavigator::default(),
+                Arc::new(RecordingReporter::default()),
+                Arc::clone(&cleanup) as Arc<dyn RuntimeShutdown>,
+            ));
+            assert!(service.start_supervision());
+            entered.notified().await;
+
+            service.cleanup_owned();
+            service.cleanup_owned();
+            tokio::time::timeout(Duration::from_millis(50), service.wait_for_cleanup())
+                .await
+                .expect("teardown confirmation must be bounded")
+                .unwrap();
+
+            assert_eq!(cancellations.load(Ordering::SeqCst), 1);
+            assert_eq!(cleanup.cleanup_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(cleanup.confirmation_calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn active_service_teardown_surfaces_sanitized_cleanup_failure() {
+        tauri::async_runtime::block_on(async {
+            let (notices, _) = watch::channel(None);
+            let entered = Arc::new(Notify::new());
+            let cancellations = Arc::new(AtomicUsize::new(0));
+            let cleanup = Arc::new(ConfirmingCleanup::default());
+            cleanup.fail_confirmation.store(true, Ordering::SeqCst);
+            let service = Arc::new(DesktopRuntimeService::with_reporter_and_shutdown(
+                CancellationRuntime {
+                    notices,
+                    entered: Arc::clone(&entered),
+                    cancellations: Arc::clone(&cancellations),
+                },
+                FakeNavigator::default(),
+                Arc::new(RecordingReporter::default()),
+                Arc::clone(&cleanup) as Arc<dyn RuntimeShutdown>,
+            ));
+            assert!(service.start_supervision());
+            entered.notified().await;
+
+            service.cleanup_owned();
+            assert!(service.wait_for_cleanup().await.is_err());
+
+            assert_eq!(cancellations.load(Ordering::SeqCst), 1);
+            assert_eq!(cleanup.cleanup_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(cleanup.confirmation_calls.load(Ordering::SeqCst), 1);
         });
     }
 

@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::future::{poll_fn, Future};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use rand::Rng as _;
@@ -11,8 +12,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::app_lifecycle::{RuntimeShutdown, ShutdownFuture};
 
 use super::process::{
-    drain_stderr, launch_runtime, read_runtime_event, DiagnosticLog, LaunchError, ProcessError,
-    RunningRuntime, RuntimeLauncher, RuntimeStreamItem,
+    drain_stderr, launch_runtime, read_runtime_event, DiagnosticLog, LaunchError,
+    OwnedRuntimeCleanup, ProcessError, RunningRuntime, RuntimeLauncher, RuntimeStreamItem,
 };
 use super::protocol::{FailureCode, RuntimeEvent};
 use super::state::{Supervisor, SupervisorState, TransitionError};
@@ -196,6 +197,9 @@ pub enum RuntimeSupervisorError {
 #[derive(Clone)]
 pub struct RuntimeShutdownControl {
     requests: mpsc::UnboundedSender<RuntimeControlMessage>,
+    active_cleanup: Arc<RwLock<Option<Arc<dyn OwnedRuntimeCleanup>>>>,
+    pending_cleanup: Arc<Mutex<Option<PendingOwnedCleanup>>>,
+    supervision_active: watch::Sender<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -208,13 +212,39 @@ pub enum RuntimeShutdownError {
 
 impl RuntimeShutdownControl {
     pub async fn shutdown(&self, reason: &'static str) -> Result<(), RuntimeShutdownError> {
+        let mut active = self.supervision_active.subscribe();
+        if !*active.borrow() {
+            return Err(RuntimeShutdownError::Unavailable);
+        }
         let (completion, completed) = oneshot::channel();
         self.requests
             .send(RuntimeControlMessage::Shutdown { reason, completion })
             .map_err(|_| RuntimeShutdownError::Unavailable)?;
-        completed
-            .await
-            .map_err(|_| RuntimeShutdownError::Unavailable)?
+        tokio::time::timeout(Duration::from_secs(17), async move {
+            let mut completed = Box::pin(completed);
+            loop {
+                let mut changed = Box::pin(active.changed());
+                let result = poll_fn(|context| {
+                    if let std::task::Poll::Ready(result) = completed.as_mut().poll(context) {
+                        return std::task::Poll::Ready(Some(result));
+                    }
+                    if changed.as_mut().poll(context).is_ready() {
+                        return std::task::Poll::Ready(None);
+                    }
+                    std::task::Poll::Pending
+                })
+                .await;
+                drop(changed);
+                if let Some(result) = result {
+                    return result.map_err(|_| RuntimeShutdownError::Unavailable)?;
+                }
+                if !*active.borrow_and_update() {
+                    return Err(RuntimeShutdownError::Unavailable);
+                }
+            }
+        })
+        .await
+        .map_err(|_| RuntimeShutdownError::Unavailable)?
     }
 }
 
@@ -228,7 +258,86 @@ impl RuntimeShutdown for RuntimeShutdownControl {
     }
 
     fn cleanup_owned(&self) {
+        if let Some(cleanup) = self
+            .active_cleanup
+            .read()
+            .expect("owned cleanup lock poisoned")
+            .clone()
+        {
+            let signal_failed = cleanup.signal().is_err();
+            *self
+                .pending_cleanup
+                .lock()
+                .expect("pending cleanup lock poisoned") = Some(PendingOwnedCleanup {
+                cleanup,
+                signal_failed,
+            });
+        }
         let _ = self.requests.send(RuntimeControlMessage::CleanupOwned);
+    }
+
+    fn wait_for_cleanup(&self) -> ShutdownFuture<'_> {
+        let pending = self
+            .pending_cleanup
+            .lock()
+            .expect("pending cleanup lock poisoned")
+            .take();
+        Box::pin(async move {
+            let Some(pending) = pending else {
+                return Ok(());
+            };
+            let confirmed = tokio::time::timeout(Duration::from_secs(2), pending.cleanup.confirm())
+                .await
+                .map_err(|_| ())?
+                .map_err(|_| ());
+            if pending.signal_failed {
+                Err(())
+            } else {
+                confirmed
+            }
+        })
+    }
+}
+
+struct PendingOwnedCleanup {
+    cleanup: Arc<dyn OwnedRuntimeCleanup>,
+    signal_failed: bool,
+}
+
+struct OwnedCleanupRegistration {
+    active: Arc<RwLock<Option<Arc<dyn OwnedRuntimeCleanup>>>>,
+}
+
+struct SupervisionActivityGuard {
+    active: watch::Sender<bool>,
+}
+
+impl SupervisionActivityGuard {
+    fn new(active: watch::Sender<bool>) -> Self {
+        active.send_replace(true);
+        Self { active }
+    }
+}
+
+impl Drop for SupervisionActivityGuard {
+    fn drop(&mut self) {
+        self.active.send_replace(false);
+    }
+}
+
+impl OwnedCleanupRegistration {
+    fn new(
+        active: Arc<RwLock<Option<Arc<dyn OwnedRuntimeCleanup>>>>,
+        cleanup: Option<Arc<dyn OwnedRuntimeCleanup>>,
+    ) -> Self {
+        *active.write().expect("owned cleanup lock poisoned") = cleanup;
+        Self { active }
+    }
+}
+
+impl Drop for OwnedCleanupRegistration {
+    fn drop(&mut self) {
+        *self.active.write().expect("owned cleanup lock poisoned") = None;
     }
 }
 
@@ -290,6 +399,8 @@ where
     ) -> Self {
         let (latest_notice, _) = watch::channel(None);
         let (requests, shutdown_requests) = mpsc::unbounded_channel();
+        let active_cleanup = Arc::new(RwLock::new(None));
+        let (supervision_active, _) = watch::channel(false);
         Self {
             launcher,
             clock,
@@ -301,7 +412,12 @@ where
             terminal_failure: None,
             latest_notice,
             shutdown_requests,
-            shutdown_control: RuntimeShutdownControl { requests },
+            shutdown_control: RuntimeShutdownControl {
+                requests,
+                active_cleanup,
+                pending_cleanup: Arc::new(Mutex::new(None)),
+                supervision_active,
+            },
         }
     }
 
@@ -336,6 +452,8 @@ where
             );
             return Ok(SupervisionOutcome::Terminal(failure));
         }
+        let _activity =
+            SupervisionActivityGuard::new(self.shutdown_control.supervision_active.clone());
         loop {
             let started = self.clock.now();
             let mut running =
@@ -354,7 +472,11 @@ where
                                     &notices,
                                     RuntimeSupervisorNotice::RestartScheduled { attempt, delay },
                                 );
-                                self.clock.sleep(delay).await;
+                                if let Some(outcome) =
+                                    self.wait_for_restart_or_shutdown(delay, &notices).await
+                                {
+                                    return Ok(outcome);
+                                }
                                 continue;
                             }
                             RestartDecision::Terminal => {
@@ -363,6 +485,10 @@ where
                         }
                     }
                 };
+            let cleanup_registration = OwnedCleanupRegistration::new(
+                Arc::clone(&self.shutdown_control.active_cleanup),
+                running.owned_cleanup_handle(),
+            );
 
             let mut stdout = match running.take_stdout() {
                 Ok(stdout) => stdout,
@@ -579,6 +705,8 @@ where
                 }
             }
 
+            drop(cleanup_registration);
+
             if classify_failure(&observed.failure) == FailureDisposition::Terminal {
                 return self.publish_terminal(&notices, observed.failure).await;
             }
@@ -592,7 +720,10 @@ where
                         &notices,
                         RuntimeSupervisorNotice::RestartScheduled { attempt, delay },
                     );
-                    self.clock.sleep(delay).await;
+                    if let Some(outcome) = self.wait_for_restart_or_shutdown(delay, &notices).await
+                    {
+                        return Ok(outcome);
+                    }
                 }
                 RestartDecision::Terminal => {
                     return self.publish_terminal(&notices, observed.failure).await;
@@ -617,6 +748,49 @@ where
             RuntimeSupervisorNotice::Terminal(failure),
         );
         Ok(SupervisionOutcome::Terminal(failure))
+    }
+
+    async fn wait_for_restart_or_shutdown(
+        &mut self,
+        delay: Duration,
+        notices: &mpsc::Sender<RuntimeSupervisorNotice>,
+    ) -> Option<SupervisionOutcome> {
+        let mut sleep = self.clock.sleep(delay);
+        let mut shutdown = Box::pin(self.shutdown_requests.recv());
+        let signal = poll_fn(|context| {
+            if sleep.as_mut().poll(context).is_ready() {
+                return std::task::Poll::Ready(None);
+            }
+            if let std::task::Poll::Ready(request) = shutdown.as_mut().poll(context) {
+                return std::task::Poll::Ready(request);
+            }
+            std::task::Poll::Pending
+        })
+        .await;
+        drop(sleep);
+        drop(shutdown);
+
+        match signal {
+            Some(RuntimeControlMessage::Shutdown { reason, completion }) => {
+                debug_assert_eq!(reason, "application quit");
+                let _ = completion.send(Ok(()));
+                publish_notice(
+                    &self.latest_notice,
+                    notices,
+                    RuntimeSupervisorNotice::Stopped,
+                );
+                Some(SupervisionOutcome::Stopped)
+            }
+            Some(RuntimeControlMessage::CleanupOwned) => {
+                publish_notice(
+                    &self.latest_notice,
+                    notices,
+                    RuntimeSupervisorNotice::Stopped,
+                );
+                Some(SupervisionOutcome::Stopped)
+            }
+            None => None,
+        }
     }
 
     async fn complete_clean_stop(
@@ -751,11 +925,12 @@ mod tests {
     use std::io::Cursor;
     use std::path::PathBuf;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use tokio::io::{AsyncBufRead, BufReader};
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, Notify};
 
     use super::*;
     use crate::runtime::process::{LaunchError, LaunchRequest, RuntimeChild, RuntimeLauncher};
@@ -883,11 +1058,15 @@ mod tests {
         kills: usize,
         drop_signals: usize,
         stderr_drops: usize,
+        exact_signals: usize,
+        exact_confirmations: usize,
     }
 
     #[derive(Clone, Default)]
     struct FakeClock {
         inner: Arc<Mutex<FakeClockState>>,
+        block_sleep: Arc<AtomicBool>,
+        sleep_entered: Arc<Notify>,
     }
 
     #[derive(Default)]
@@ -906,9 +1085,15 @@ mod tests {
             duration: Duration,
         ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
             Box::pin(async move {
-                let mut state = self.inner.lock().unwrap();
-                state.sleeps.push(duration);
-                state.now += duration;
+                {
+                    let mut state = self.inner.lock().unwrap();
+                    state.sleeps.push(duration);
+                    state.now += duration;
+                }
+                if self.block_sleep.load(Ordering::SeqCst) {
+                    self.sleep_entered.notify_waiters();
+                    std::future::pending().await
+                }
             })
         }
     }
@@ -931,6 +1116,22 @@ mod tests {
         kill_error: bool,
         stderr_pending: bool,
         start_write_error: bool,
+    }
+
+    struct FakeOwnedCleanup(Arc<Mutex<LauncherState>>);
+
+    impl OwnedRuntimeCleanup for FakeOwnedCleanup {
+        fn signal(&self) -> io::Result<()> {
+            self.0.lock().unwrap().exact_signals += 1;
+            Ok(())
+        }
+
+        fn confirm(&self) -> IoFuture<'_> {
+            Box::pin(async move {
+                self.0.lock().unwrap().exact_confirmations += 1;
+                Ok(())
+            })
+        }
     }
 
     impl RuntimeLauncher for FakeLauncher {
@@ -1039,6 +1240,10 @@ mod tests {
 
         fn signal_owned_on_drop(&mut self) {
             self.state.lock().unwrap().drop_signals += 1;
+        }
+
+        fn owned_cleanup_handle(&self) -> Option<Arc<dyn OwnedRuntimeCleanup>> {
+            Some(Arc::new(FakeOwnedCleanup(Arc::clone(&self.state))))
         }
     }
 
@@ -1870,6 +2075,97 @@ mod tests {
             state.writes.last().unwrap(),
             b"{\"version\":1,\"command\":\"shutdown\"}\n"
         );
+        drop(state);
+        std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
+    fn external_shutdown_interrupts_pending_restart_backoff_without_relaunching() {
+        let (mut supervisor, state, clock, support_dir) = fake_supervisor(
+            vec![ChildScript::crash("", Duration::ZERO)],
+            "shutdown-during-backoff",
+        );
+        clock.block_sleep.store(true, Ordering::SeqCst);
+        let shutdown = supervisor.shutdown_control();
+        let sleep_entered = Arc::clone(&clock.sleep_entered);
+        let (sender, _receiver) = mpsc::channel(16);
+
+        let outcome = runtime().block_on(async move {
+            let supervision =
+                tokio::spawn(async move { supervisor.supervise_until_terminal(sender).await });
+            sleep_entered.notified().await;
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                shutdown.shutdown("application quit"),
+            )
+            .await
+            .expect("shutdown must interrupt restart backoff")
+            .unwrap();
+            supervision.await.unwrap().unwrap()
+        });
+
+        assert_eq!(outcome, SupervisionOutcome::Stopped);
+        assert_eq!(state.lock().unwrap().launches, 1);
+        std::fs::remove_dir_all(support_dir).unwrap();
+    }
+
+    #[test]
+    fn shutdown_after_terminal_launch_failure_returns_unavailable_promptly() {
+        let (mut supervisor, state, _clock, support_dir) =
+            fake_supervisor(Vec::new(), "shutdown-after-launch-failure");
+        let shutdown = supervisor.shutdown_control();
+        let (sender, _receiver) = mpsc::channel(16);
+
+        let result = runtime().block_on(async {
+            assert_eq!(
+                supervisor.supervise_until_terminal(sender).await.unwrap(),
+                SupervisionOutcome::Terminal(RuntimeFailure::ResourceMissing)
+            );
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                shutdown.shutdown("application quit"),
+            )
+            .await
+            .expect("terminal supervisor control must not hang")
+        });
+
+        assert_eq!(result, Err(RuntimeShutdownError::Unavailable));
+        assert_eq!(state.lock().unwrap().launches, 0);
+        if support_dir.exists() {
+            std::fs::remove_dir_all(support_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn cleanup_handle_survives_supervision_abort_and_confirms_exact_owned_cleanup() {
+        let script = ChildScript {
+            stdout_pending: true,
+            wait_pending: true,
+            stderr_pending: true,
+            ..ChildScript::crash("", Duration::ZERO)
+        };
+        let (mut supervisor, state, _clock, support_dir) =
+            fake_supervisor(vec![script], "confirmed-abort-cleanup");
+        let cleanup = supervisor.shutdown_control();
+        let observed_state = Arc::clone(&state);
+        let (sender, _receiver) = mpsc::channel(16);
+
+        runtime().block_on(async move {
+            let supervision =
+                tokio::spawn(async move { supervisor.supervise_until_terminal(sender).await });
+            while observed_state.lock().unwrap().launches == 0 {
+                tokio::task::yield_now().await;
+            }
+            RuntimeShutdown::cleanup_owned(&cleanup);
+            supervision.abort();
+            let _ = supervision.await;
+            RuntimeShutdown::wait_for_cleanup(&cleanup).await.unwrap();
+        });
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.exact_signals, 1);
+        assert_eq!(state.exact_confirmations, 1);
+        assert_eq!(state.drop_signals, 0);
         drop(state);
         std::fs::remove_dir_all(support_dir).unwrap();
     }

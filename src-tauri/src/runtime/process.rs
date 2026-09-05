@@ -5,6 +5,8 @@ use std::future::Future;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -56,6 +58,11 @@ pub trait RuntimeLauncher: Send + Sync {
     fn launch(&self, request: LaunchRequest) -> Result<Box<dyn RuntimeChild>, LaunchError>;
 }
 
+pub trait OwnedRuntimeCleanup: Send + Sync {
+    fn signal(&self) -> io::Result<()>;
+    fn confirm(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>>;
+}
+
 pub trait RuntimeChild: Send {
     fn write_stdin<'a>(&'a mut self, bytes: &'a [u8]) -> ChildFuture<'a>;
     fn take_stdout(&mut self) -> Option<Box<dyn AsyncBufRead + Send + Unpin>>;
@@ -67,6 +74,9 @@ pub trait RuntimeChild: Send {
     /// Best-effort synchronous cleanup used only when the async owner is cancelled.
     /// Implementations must target only the child or process group captured at launch.
     fn signal_owned_on_drop(&mut self);
+    fn owned_cleanup_handle(&self) -> Option<Arc<dyn OwnedRuntimeCleanup>> {
+        None
+    }
 }
 
 #[derive(Debug, Error)]
@@ -220,9 +230,17 @@ pub async fn launch_runtime<L: RuntimeLauncher>(
         launch_token: &launch_token,
     })?;
     let child = launcher.launch(request)?;
+    let cleanup_armed = Arc::new(AtomicBool::new(true));
+    let owned_cleanup = child.owned_cleanup_handle().map(|cleanup| {
+        Arc::new(DisarmingOwnedCleanup {
+            cleanup,
+            armed: Arc::clone(&cleanup_armed),
+        }) as Arc<dyn OwnedRuntimeCleanup>
+    });
     let mut running = RunningRuntime {
         child,
-        cleanup_armed: true,
+        cleanup_armed,
+        owned_cleanup,
     };
     if let Err(source) = running.child.write_stdin(&line).await {
         let kind = source.kind();
@@ -246,12 +264,13 @@ fn validate_absolute_directory(path: &Path) -> Result<(), ProcessError> {
 
 pub struct RunningRuntime {
     child: Box<dyn RuntimeChild>,
-    cleanup_armed: bool,
+    cleanup_armed: Arc<AtomicBool>,
+    owned_cleanup: Option<Arc<dyn OwnedRuntimeCleanup>>,
 }
 
 impl Drop for RunningRuntime {
     fn drop(&mut self) {
-        if self.cleanup_armed {
+        if self.cleanup_armed.swap(false, Ordering::AcqRel) {
             self.child.signal_owned_on_drop();
         }
     }
@@ -266,6 +285,9 @@ impl fmt::Debug for RunningRuntime {
 }
 
 impl RunningRuntime {
+    pub fn owned_cleanup_handle(&self) -> Option<Arc<dyn OwnedRuntimeCleanup>> {
+        self.owned_cleanup.clone()
+    }
     pub fn take_stdout(&mut self) -> Result<Box<dyn AsyncBufRead + Send + Unpin>, ProcessError> {
         self.child
             .take_stdout()
@@ -296,7 +318,7 @@ impl RunningRuntime {
             .await
             .map_err(ProcessError::ForcedCleanup);
         if result.is_ok() {
-            self.cleanup_armed = false;
+            self.cleanup_armed.store(false, Ordering::Release);
         }
         result
     }
@@ -310,7 +332,7 @@ impl RunningRuntime {
             let cleanup_failed = if self.child.kill_owned().await.is_err() {
                 true
             } else {
-                self.cleanup_armed = false;
+                self.cleanup_armed.store(false, Ordering::Release);
                 false
             };
             return Err(ProcessError::ShutdownFailed {
@@ -330,7 +352,7 @@ impl RunningRuntime {
                         let cleanup_failed = if self.child.kill_owned().await.is_err() {
                             true
                         } else {
-                            self.cleanup_armed = false;
+                            self.cleanup_armed.store(false, Ordering::Release);
                             false
                         };
                         return Err(ProcessError::ShutdownFailed {
@@ -349,9 +371,26 @@ impl RunningRuntime {
             .await
             .map_err(ProcessError::ForcedCleanup);
         if result.is_ok() {
-            self.cleanup_armed = false;
+            self.cleanup_armed.store(false, Ordering::Release);
         }
         result
+    }
+}
+
+struct DisarmingOwnedCleanup {
+    cleanup: Arc<dyn OwnedRuntimeCleanup>,
+    armed: Arc<AtomicBool>,
+}
+
+impl OwnedRuntimeCleanup for DisarmingOwnedCleanup {
+    fn signal(&self) -> io::Result<()> {
+        self.cleanup.signal()?;
+        self.armed.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn confirm(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+        self.cleanup.confirm()
     }
 }
 
@@ -594,18 +633,62 @@ impl RuntimeChild for ProductionChild {
     fn signal_owned_on_drop(&mut self) {
         signal_owned_process_group(self);
     }
+
+    fn owned_cleanup_handle(&self) -> Option<Arc<dyn OwnedRuntimeCleanup>> {
+        #[cfg(unix)]
+        {
+            self.process_group.map(|group| {
+                Arc::new(ProductionOwnedCleanup { group }) as Arc<dyn OwnedRuntimeCleanup>
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
 }
 
 #[cfg(unix)]
-fn signal_owned_process_group(child: &mut ProductionChild) {
+struct ProductionOwnedCleanup {
+    group: i32,
+}
+
+#[cfg(unix)]
+impl OwnedRuntimeCleanup for ProductionOwnedCleanup {
+    fn signal(&self) -> io::Result<()> {
+        signal_exact_process_group(self.group)
+    }
+
+    fn confirm(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+        Box::pin(confirm_owned_process_group_gone(self.group))
+    }
+}
+
+#[cfg(unix)]
+fn signal_exact_process_group(group: i32) -> io::Result<()> {
     const SIGKILL: i32 = 9;
     extern "C" {
         fn kill(pid: i32, signal: i32) -> i32;
     }
 
+    let result = unsafe { kill(-group, SIGKILL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(3) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_owned_process_group(child: &mut ProductionChild) {
     if let Some(group) = child.process_group {
         // The group id was captured from this exact child after it became group leader.
-        let _ = unsafe { kill(-group, SIGKILL) };
+        let _ = signal_exact_process_group(group);
     } else {
         let _ = child.child.start_kill();
     }
@@ -982,11 +1065,29 @@ mod tests {
         write_pending: bool,
         waits: VecDeque<io::Result<()>>,
         killed: usize,
+        exact_signals: usize,
+        exact_confirmations: usize,
     }
 
     struct FakeLauncher(Arc<Mutex<FakeState>>);
 
     struct FakeChild(Arc<Mutex<FakeState>>);
+
+    struct FakeOwnedCleanup(Arc<Mutex<FakeState>>);
+
+    impl OwnedRuntimeCleanup for FakeOwnedCleanup {
+        fn signal(&self) -> io::Result<()> {
+            self.0.lock().unwrap().exact_signals += 1;
+            Ok(())
+        }
+
+        fn confirm(&self) -> IoFuture<'_> {
+            Box::pin(async move {
+                self.0.lock().unwrap().exact_confirmations += 1;
+                Ok(())
+            })
+        }
+    }
 
     struct OneByteReader {
         bytes: Vec<u8>,
@@ -1057,6 +1158,10 @@ mod tests {
 
         fn signal_owned_on_drop(&mut self) {
             self.0.lock().unwrap().killed += 1;
+        }
+
+        fn owned_cleanup_handle(&self) -> Option<Arc<dyn OwnedRuntimeCleanup>> {
+            Some(Arc::new(FakeOwnedCleanup(Arc::clone(&self.0))))
         }
     }
 
@@ -1236,6 +1341,26 @@ mod tests {
         assert_eq!(state.killed, 1);
         let shutdown = state.writes.last().unwrap();
         assert_eq!(shutdown, b"{\"version\":1,\"command\":\"shutdown\"}\n");
+    }
+
+    #[test]
+    fn cloneable_cleanup_handle_signals_and_confirms_the_exact_owned_group() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let launcher = FakeLauncher(Arc::clone(&state));
+        let (data_dir, runtime_dir) = absolute_test_dirs();
+        let running = runtime()
+            .block_on(launch_runtime(&launcher, &data_dir, &runtime_dir))
+            .unwrap();
+        let cleanup = running.owned_cleanup_handle().unwrap();
+
+        cleanup.signal().unwrap();
+        runtime().block_on(cleanup.confirm()).unwrap();
+        drop(running);
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.exact_signals, 1);
+        assert_eq!(state.exact_confirmations, 1);
+        assert_eq!(state.killed, 0);
     }
 
     #[test]

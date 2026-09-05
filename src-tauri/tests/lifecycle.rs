@@ -83,6 +83,7 @@ struct FakeShutdown {
     result: Result<(), ()>,
     release: Mutex<Option<oneshot::Receiver<()>>>,
     started: AtomicBool,
+    cleanup_result: Mutex<Option<Result<(), ()>>>,
 }
 
 impl FakeShutdown {
@@ -93,6 +94,7 @@ impl FakeShutdown {
             result,
             release: Mutex::new(None),
             started: AtomicBool::new(false),
+            cleanup_result: Mutex::new(None),
         }
     }
 
@@ -105,6 +107,7 @@ impl FakeShutdown {
                 result: Ok(()),
                 release: Mutex::new(Some(receiver)),
                 started: AtomicBool::new(false),
+                cleanup_result: Mutex::new(None),
             },
             sender,
         )
@@ -127,6 +130,11 @@ impl RuntimeShutdown for FakeShutdown {
 
     fn cleanup_owned(&self) {
         self.cleanup_calls.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wait_for_cleanup(&self) -> ShutdownFuture<'_> {
+        let result = self.cleanup_result.lock().unwrap().take().unwrap_or(Ok(()));
+        Box::pin(async move { result })
     }
 }
 
@@ -271,5 +279,21 @@ fn completed_shutdown_needs_no_teardown_cleanup() {
         lifecycle.teardown(shutdown.as_ref());
 
         assert_eq!(shutdown.cleanup_calls.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+fn production_teardown_mapping_reports_cleanup_failure_once() {
+    runtime().block_on(async {
+        let lifecycle = AppLifecycle::new();
+        let app = FakeApp::default();
+        let shutdown = FakeShutdown::immediate(Ok(()));
+        *shutdown.cleanup_result.lock().unwrap() = Some(Err(()));
+
+        lifecycle.teardown_and_report(&app, &shutdown).await;
+        lifecycle.teardown_and_report(&app, &shutdown).await;
+
+        assert_eq!(shutdown.cleanup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(app.reports.load(Ordering::SeqCst), 1);
     });
 }
