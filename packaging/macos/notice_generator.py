@@ -86,7 +86,7 @@ UPDATES, ENHANCEMENTS, OR MODIFICATIONS."""
 # Windows check environment.  This value is from the versioned PyPI metadata:
 # https://pypi.org/project/uvloop/0.22.1/
 PORTABLE_PYTHON_LICENSES = {
-    ("uvloop", "0.22.1"): "MIT OR Apache-2.0",
+    ("uvloop", "0.22.1"): "Apache-2.0 OR MIT",
 }
 
 
