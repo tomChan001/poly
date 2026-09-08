@@ -146,7 +146,8 @@ class DistributionContractTests(unittest.TestCase):
         ):
             self.assertIn(token, script)
         self.assertNotIn('cp -R -- "${INSTALL_PREFIX}/lib/postgresql"', script)
-        self.assertIn("plpgsql.so", script)
+        self.assertIn("plpgsql.dylib", script)
+        self.assertNotIn('/lib/postgresql/', script)
 
     def test_empty_entitlements_have_no_forbidden_capabilities(self) -> None:
         data = (MACOS / "entitlements.plist").read_bytes()

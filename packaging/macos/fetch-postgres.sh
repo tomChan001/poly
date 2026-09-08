@@ -140,9 +140,8 @@ fi
 while IFS= read -r -d '' library; do
   cp -P -- "${library}" "${STAGED}/lib/"
 done <"${BUILD_TEMP}/libpq-files"
-[[ -f "${INSTALL_PREFIX}/lib/postgresql/plpgsql.so" ]] || die "required PL/pgSQL extension library is missing"
-mkdir -p "${STAGED}/lib/postgresql"
-cp -- "${INSTALL_PREFIX}/lib/postgresql/plpgsql.so" "${STAGED}/lib/postgresql/plpgsql.so"
+[[ -f "${INSTALL_PREFIX}/lib/plpgsql.dylib" ]] || die "required PL/pgSQL extension library is missing"
+cp -- "${INSTALL_PREFIX}/lib/plpgsql.dylib" "${STAGED}/lib/plpgsql.dylib"
 cp -R -- "${INSTALL_PREFIX}/share/." "${STAGED}/share/"
 cp -- "${SOURCE_DIR}/COPYRIGHT" "${STAGED}/COPYRIGHT"
 
@@ -162,8 +161,6 @@ while IFS= read -r -d '' macho; do
     dependency_name="$(basename -- "${dependency}")"
     if [[ "${macho}" == "${STAGED}/bin/"* ]]; then
       replacement="@loader_path/../lib/${dependency_name}"
-    elif [[ "${macho}" == "${STAGED}/lib/postgresql/"* ]]; then
-      replacement="@loader_path/../${dependency_name}"
     else
       replacement="@loader_path/${dependency_name}"
     fi
