@@ -98,6 +98,28 @@ macho_otool_dependencies() {
   fi
 }
 
+macho_otool_install_name() {
+  local owner="$1"
+  local output
+  if ! output="$("${MACHO_AUDIT_OTOOL_BIN}" -l "${owner}")"; then
+    die "otool -l failed for ${owner}"
+  fi
+  if ! printf '%s\n' "${output}" | awk '
+    $1 == "cmd" {
+      command = $2
+      next
+    }
+    command == "LC_ID_DYLIB" && $1 == "name" {
+      count += 1
+      if (count == 1) print $2
+      command = ""
+    }
+    END { if (count > 1) exit 1 }
+  '; then
+    die "could not parse LC_ID_DYLIB entry for ${owner}"
+  fi
+}
+
 macho_otool_rpaths() {
   local owner="$1"
   local output
@@ -273,7 +295,8 @@ macho_check_dependency() {
 macho_audit_tree() {
   local tree="$1"
   local work_dir="$2"
-  local candidate canonical_candidate canonical_boundary dependency
+  local candidate canonical_candidate canonical_boundary dependency install_name
+  local first_dependency
   if ! canonical_boundary="$(realpath "${MACHO_AUDIT_BOUNDARY:-${tree}}")"; then
     die "could not canonicalize audit boundary: ${MACHO_AUDIT_BOUNDARY:-${tree}}"
   fi
@@ -322,10 +345,21 @@ macho_audit_tree() {
       "${MACHO_AUDIT_CODESIGN_BIN}" --verify --strict --verbose=2 "${candidate}"
     fi
     macho_otool_dependencies "${candidate}" >"${work_dir}/dependencies"
+    macho_otool_install_name "${candidate}" >"${work_dir}/install-name"
     macho_otool_rpaths "${candidate}" >"${work_dir}/rpaths"
     macho_resolve_rpaths "${candidate}" "${work_dir}/rpaths" "${work_dir}/resolved-rpaths"
+    install_name=""
+    if [[ -s "${work_dir}/install-name" ]]; then
+      IFS= read -r install_name <"${work_dir}/install-name"
+    fi
+    first_dependency=1
     while IFS= read -r dependency; do
       [[ -n "${dependency}" ]] || continue
+      if [[ "${first_dependency}" -eq 1 && -n "${install_name}" && "${dependency}" == "${install_name}" ]]; then
+        first_dependency=0
+        continue
+      fi
+      first_dependency=0
       macho_check_dependency "${candidate}" "${dependency}" "${work_dir}/resolved-rpaths"
     done <"${work_dir}/dependencies"
   done <"${work_dir}/audit-files"

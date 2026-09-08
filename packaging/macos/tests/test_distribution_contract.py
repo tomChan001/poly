@@ -543,6 +543,56 @@ class DistributionContractTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_macho_audit_does_not_treat_a_dylib_id_as_a_dependency(self) -> None:
+        bash = bash_executable()
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary)
+            tree = fixture / "tree"
+            owner = tree / "lib" / "libowner.dylib"
+            owner.parent.mkdir(parents=True)
+            owner.write_bytes(b"Mach-O fixture")
+            stubs = fixture / "stubs"
+            stubs.mkdir()
+            write_stub(stubs, "find", "printf '%s\\0' \"$1/lib/libowner.dylib\"")
+            write_stub(
+                stubs,
+                "file",
+                "printf 'Mach-O 64-bit dynamically linked shared library\\n'",
+            )
+            write_stub(
+                stubs,
+                "otool",
+                "if [[ \"$1\" == '-L' ]]; then "
+                "printf '%s:\\n\\t@rpath/libowner.dylib "
+                "(compatibility version 1.0.0)\\n"
+                "\\t/usr/lib/libSystem.B.dylib "
+                "(compatibility version 1.0.0)\\n' \"$2\"; "
+                "else printf '          cmd LC_ID_DYLIB\\n"
+                "      cmdsize 48\\n"
+                "         name @rpath/libowner.dylib (offset 24)\\n'; fi",
+            )
+            env = os.environ.copy()
+            env["PATH"] = f"{git_bash_path(stubs)}:/usr/bin:/bin"
+            env.update(
+                POLY_TEST_FIND=git_bash_path(stubs / "find"),
+                POLY_TEST_FILE=git_bash_path(stubs / "file"),
+                POLY_TEST_OTOOL=git_bash_path(stubs / "otool"),
+            )
+            for script_name in ("fetch-postgres.sh", "verify-bundle.sh"):
+                result = subprocess.run(
+                    [
+                        bash,
+                        str(MACOS / script_name),
+                        "--audit-tree",
+                        git_bash_path(tree),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_macho_audit_uses_main_executable_context(self) -> None:
         bash = bash_executable()
         with tempfile.TemporaryDirectory() as temporary:
