@@ -155,3 +155,17 @@ Return no PID for `ps -p` status 1. Preserve hard failures for a live PID and fo
 - [ ] **Step 3: Run the process-enumeration and full packaging contract suites**
 
 Require the exit-race test, failure-closed tests, bounded descendant test, script syntax, and lint checks to pass.
+
+### Task 6: Preserve validation DMGs for installation testing
+
+**Files:**
+- Modify: `.github/workflows/macos-desktop.yml`
+- Modify: `packaging/macos/tests/test_ci_documentation_contract.py`
+
+- [ ] **Step 1: Require validation artifact upload after smoke failure**
+
+Add a contract proving non-release DMGs are uploaded after a failed smoke assertion while cancelled jobs and failed signed releases remain excluded.
+
+- [ ] **Step 2: Add the guarded upload condition and verify contracts**
+
+Use `!cancelled() && (success() || env.IS_RELEASE != 'true')` on the architecture-specific DMG upload and run the workflow contract suite.

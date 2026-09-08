@@ -290,6 +290,18 @@ def test_keychain_smoke_is_limited_to_signed_release_builds() -> None:
         assert end_position != -1
 
 
+def test_validation_dmg_upload_survives_smoke_failure() -> None:
+    workflow = read(WORKFLOW)
+    upload_header = workflow.split(
+        "- name: Upload architecture-specific DMG", 1
+    )[1].split("uses:", 1)[0]
+
+    assert (
+        "if: ${{ !cancelled() && (success() || env.IS_RELEASE != 'true') }}"
+        in upload_header
+    )
+
+
 def test_smoke_restores_trimmed_keychain_paths_or_fails_closed() -> None:
     workflow = read(WORKFLOW)
     for marker in (
