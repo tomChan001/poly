@@ -51,11 +51,19 @@ fi
 if ! CPYTHON_LICENSE="$(uv run --frozen python - <<'PY'
 from pathlib import Path
 import sys
+import sysconfig
 
-license_path = Path(sys.base_prefix) / "LICENSE.txt"
-if not license_path.is_file():
-    raise SystemExit(f"CPython license file is missing: {license_path}")
-print(license_path)
+candidates = (
+    Path(sys.base_prefix) / "LICENSE.txt",
+    Path(sysconfig.get_path("stdlib")) / "LICENSE.txt",
+)
+for license_path in candidates:
+    if license_path.is_file():
+        print(license_path)
+        break
+else:
+    searched = ", ".join(str(candidate) for candidate in candidates)
+    raise SystemExit(f"CPython license file is missing; searched: {searched}")
 PY
 )"; then
   die "could not locate the CPython license in the frozen Python environment"
