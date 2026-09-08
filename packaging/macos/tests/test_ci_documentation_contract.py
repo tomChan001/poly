@@ -52,6 +52,23 @@ def test_workflow_is_read_only_and_uses_the_exact_native_matrix() -> None:
     )
 
 
+def test_workflow_uses_a_pinned_managed_python_with_its_license() -> None:
+    workflow = read(WORKFLOW)
+    job_environment = workflow.split("    env:", 1)[1].split("    steps:", 1)[0]
+
+    assert re.search(
+        r"(?m)^\s+UV_PYTHON:\s*['\"]3\.12\.11['\"]\s*$",
+        job_environment,
+    )
+    assert re.search(
+        r"(?m)^\s+UV_MANAGED_PYTHON:\s*['\"]1['\"]\s*$",
+        job_environment,
+    )
+    install = 'uv python install "${UV_PYTHON}"'
+    assert install in workflow
+    assert workflow.index(install) < workflow.index("uv sync --frozen")
+
+
 def test_workflow_separates_validation_from_protected_release_signing() -> None:
     workflow = read(WORKFLOW)
     for trigger in ("pull_request:", "workflow_dispatch:", "tags:"):

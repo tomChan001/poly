@@ -9,7 +9,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -43,6 +43,8 @@ def write_stub(directory: Path, name: str, body: str) -> None:
 def git_bash_path(path: Path) -> str:
     resolved = path.resolve()
     drive = resolved.drive.rstrip(":").lower()
+    if not drive:
+        return resolved.as_posix()
     tail = resolved.as_posix().split(":", 1)[1]
     return f"/{drive}{tail}"
 
@@ -64,6 +66,23 @@ def load_macos_module(name: str):
 class DistributionContractTests(unittest.TestCase):
     def read(self, name: str) -> str:
         return (MACOS / name).read_text(encoding="utf-8")
+
+    def test_git_bash_path_preserves_native_posix_paths(self) -> None:
+        with patch.object(
+            Path,
+            "resolve",
+            return_value=PurePosixPath("/private/tmp/poly fixture"),
+        ):
+            self.assertEqual(
+                git_bash_path(Path("ignored")),
+                "/private/tmp/poly fixture",
+            )
+
+    def test_async_sqlalchemy_dependency_installs_greenlet_on_every_architecture(
+        self,
+    ) -> None:
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertIn("sqlalchemy[asyncio]>=2.0.52", project["project"]["dependencies"])
 
     def test_runtime_verifier_uses_pyinstaller_internal_postgres_layout(self) -> None:
         verifier = self.read("verify-runtime.sh")
