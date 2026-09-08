@@ -152,7 +152,7 @@ fi
 while IFS= read -r -d '' macho; do
   macho_is_macho "${macho}" || continue
   if [[ "${macho}" == *.dylib || "${macho}" == *.dylib.* ]]; then
-    install_name_tool -id "@rpath/$(basename -- "${macho}")" "${macho}"
+    install_name_tool -id "@loader_path/$(basename -- "${macho}")" "${macho}"
   fi
   if ! macho_otool_dependencies "${macho}" >"${BUILD_TEMP}/dependencies"; then
     die "dependency inspection failed for ${macho}"
