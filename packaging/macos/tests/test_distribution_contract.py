@@ -468,7 +468,7 @@ class DistributionContractTests(unittest.TestCase):
                     "unresolved @rpath dependency",
                 ),
                 (
-                    git_bash_path(library),
+                    "/Applications/Poly/libok.dylib",
                     "",
                     "nonrelocatable absolute dependency",
                 ),
@@ -1103,6 +1103,14 @@ class DistributionContractTests(unittest.TestCase):
         self.assertIn("pyinstaller_runtime_files", helper)
         self.assertIn("macho-inventory", script)
         self.assertNotIn(".env", script + helper)
+
+    def test_notice_generator_reads_license_from_managed_interpreter_root(
+        self,
+    ) -> None:
+        script = self.read("generate-notices.sh")
+
+        self.assertIn('Path(sys.base_prefix) / "LICENSE.txt"', script)
+        self.assertNotIn('sysconfig.get_path("stdlib")', script)
 
     def test_committed_notices_are_generated_and_checkable_without_bundle(self) -> None:
         notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")

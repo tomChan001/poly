@@ -50,9 +50,9 @@ fi
 
 if ! CPYTHON_LICENSE="$(uv run --frozen python - <<'PY'
 from pathlib import Path
-import sysconfig
+import sys
 
-license_path = Path(sysconfig.get_path("stdlib")).parent / "LICENSE.txt"
+license_path = Path(sys.base_prefix) / "LICENSE.txt"
 if not license_path.is_file():
     raise SystemExit(f"CPython license file is missing: {license_path}")
 print(license_path)
