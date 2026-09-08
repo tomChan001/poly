@@ -738,6 +738,7 @@ class DistributionContractTests(unittest.TestCase):
                 "poly-runtime",
                 "_internal/postgres/bin/postgres",
                 "postgres/bin/psql",
+                "_internal/libpq.5.dylib",
                 "_internal/libpython3.12.dylib",
                 "libpython3.12.dylib",
             ]
@@ -761,8 +762,9 @@ class DistributionContractTests(unittest.TestCase):
             )
             self.assertEqual(classifications[paths[1]], "PostgreSQL")
             self.assertEqual(classifications[paths[2]], "PostgreSQL")
-            self.assertEqual(classifications[paths[3]], "CPython")
+            self.assertEqual(classifications[paths[3]], "PostgreSQL")
             self.assertEqual(classifications[paths[4]], "CPython")
+            self.assertEqual(classifications[paths[5]], "CPython")
             with self.assertRaisesRegex(ValueError, "packaged native file lacks inventory"):
                 module.classify_macho_paths(
                     ["_internal/libmystery.dylib"],

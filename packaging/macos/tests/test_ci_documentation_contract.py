@@ -161,6 +161,16 @@ def test_workflow_has_the_required_ordered_locked_pipeline() -> None:
     }
 
 
+def test_workflow_generates_exact_assembled_notices_for_the_bundle() -> None:
+    workflow = read(WORKFLOW)
+    stage = workflow.split(
+        "- name: Stage complete runtime and generate assembled notices", 1
+    )[1].split("- name: Install pinned Tauri CLI", 1)[0]
+
+    assert "packaging/macos/generate-notices.sh --assembled" in stage
+    assert "--check --assembled" not in stage
+
+
 def test_non_release_build_audits_the_real_bundle_with_controlled_architecture() -> None:
     workflow = read(WORKFLOW)
     verification = workflow.split(

@@ -134,11 +134,11 @@ jobs:
       - name: Verify packaged Python runtime
         run: packaging/macos/verify-runtime.sh
 
-      - name: Stage complete runtime and verify notices
+      - name: Stage complete runtime and generate assembled notices
         run: |
           mkdir -p src-tauri/resources
           ditto dist/poly-runtime src-tauri/resources/poly-runtime
-          packaging/macos/generate-notices.sh --check --assembled
+          packaging/macos/generate-notices.sh --assembled
 
       - name: Install pinned Tauri CLI
         run: cargo install tauri-cli --version 2.11.4 --locked

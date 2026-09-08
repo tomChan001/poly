@@ -7,6 +7,10 @@ from collections.abc import Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from pathlib import Path
 
+_PYINSTALLER_POSTGRESQL_MACHO_ALIASES = frozenset(
+    {"_internal/libpq.5.dylib"}
+)
+
 
 def normalize_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).casefold()
@@ -114,7 +118,9 @@ def classify_macho_paths(
         if bundled_path == "poly-runtime":
             classifications[relative] = "Poly launcher / PyInstaller bootloader"
             continue
-        if bundled_path.startswith("postgres/"):
+        if bundled_path.startswith("postgres/") or (
+            relative in _PYINSTALLER_POSTGRESQL_MACHO_ALIASES
+        ):
             classifications[relative] = "PostgreSQL"
             continue
         if relative in normalized_cpython_libraries or (
