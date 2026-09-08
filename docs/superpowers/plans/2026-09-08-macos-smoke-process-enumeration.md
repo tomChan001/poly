@@ -118,3 +118,22 @@ Push `main`, dispatch `.github/workflows/macos-desktop.yml`, and track only `Pol
 - [ ] **Step 3: Download and verify the DMG**
 
 After the arm64 job succeeds, download `Poly-macos-arm64` to a fresh Desktop directory. Record the absolute path, byte size, and SHA-256 digest.
+
+### Task 4: Avoid headless Keychain authorization in validation builds
+
+**Files:**
+- Modify: `.github/workflows/macos-desktop.yml`
+- Modify: `packaging/macos/tests/test_ci_documentation_contract.py`
+- Modify: `docs/runbooks/macos-desktop-build.md`
+
+- [ ] **Step 1: Add a failing workflow contract**
+
+Require every packaged-runtime `--keychain-smoke` invocation to be enclosed by an `IS_RELEASE == true` guard.
+
+- [ ] **Step 2: Guard Keychain setup and integration checks**
+
+Skip temporary Keychain creation and packaged `KeyringSecretStore` calls for ad-hoc workflow-dispatch validation. Retain set/verify/delete as mandatory checks for Developer ID signed release builds.
+
+- [ ] **Step 3: Update the runbook and verify**
+
+Document the validation/release distinction and run the packaging contracts plus focused desktop Keychain unit tests.

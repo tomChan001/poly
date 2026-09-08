@@ -271,6 +271,25 @@ def test_installed_dmg_smoke_has_step_timeout() -> None:
     assert "timeout-minutes: 10" in smoke_header
 
 
+def test_keychain_smoke_is_limited_to_signed_release_builds() -> None:
+    workflow = read(WORKFLOW)
+    smoke = workflow.split(
+        "- name: Install DMG into an isolated home and smoke test", 1
+    )[1].split("- name: Remove temporary signing keychain", 1)[0]
+    release_guard = "if [[ \"${IS_RELEASE}\" == 'true' ]]; then"
+
+    for marker in (
+        '"${RUNTIME_EXECUTABLE}" --keychain-smoke set --account',
+        '"${RUNTIME_EXECUTABLE}" --keychain-smoke verify --account',
+        '"${RUNTIME_EXECUTABLE}" --keychain-smoke delete --account',
+    ):
+        marker_position = smoke.index(marker)
+        guard_position = smoke.rfind(release_guard, 0, marker_position)
+        end_position = smoke.find("\n          fi", marker_position)
+        assert guard_position != -1
+        assert end_position != -1
+
+
 def test_smoke_restores_trimmed_keychain_paths_or_fails_closed() -> None:
     workflow = read(WORKFLOW)
     for marker in (

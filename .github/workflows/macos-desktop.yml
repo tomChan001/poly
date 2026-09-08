@@ -234,14 +234,17 @@ jobs:
           trim_keychain_path() {
             /usr/bin/sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//'
           }
-          ORIGINAL_DEFAULT_KEYCHAIN="$(/usr/bin/security default-keychain -d user | trim_keychain_path)"
+          ORIGINAL_DEFAULT_KEYCHAIN=""
           ORIGINAL_KEYCHAINS=()
-          while IFS= read -r keychain_path; do
-            keychain_path="$(printf '%s\n' "${keychain_path}" | trim_keychain_path)"
-            [[ -n "${keychain_path}" ]] && ORIGINAL_KEYCHAINS+=("${keychain_path}")
-          done < <(/usr/bin/security list-keychains -d user)
-          [[ -n "${ORIGINAL_DEFAULT_KEYCHAIN}" ]]
-          [[ "${#ORIGINAL_KEYCHAINS[@]}" -gt 0 ]]
+          if [[ "${IS_RELEASE}" == 'true' ]]; then
+            ORIGINAL_DEFAULT_KEYCHAIN="$(/usr/bin/security default-keychain -d user | trim_keychain_path)"
+            while IFS= read -r keychain_path; do
+              keychain_path="$(printf '%s\n' "${keychain_path}" | trim_keychain_path)"
+              [[ -n "${keychain_path}" ]] && ORIGINAL_KEYCHAINS+=("${keychain_path}")
+            done < <(/usr/bin/security list-keychains -d user)
+            [[ -n "${ORIGINAL_DEFAULT_KEYCHAIN}" ]]
+            [[ "${#ORIGINAL_KEYCHAINS[@]}" -gt 0 ]]
+          fi
           mkdir -p "${SMOKE_HOME}/Library/Application Support" "${SMOKE_HOME}/Library/Caches"
           mkdir -p "${SMOKE_APPLICATIONS}" "${GUARD_DIR}" "${MOUNT_POINT}" "${DIAGNOSTICS_DIR}"
           chmod 700 "${SMOKE_HOME}" "${SMOKE_APPLICATIONS}"
@@ -306,18 +309,22 @@ jobs:
           /usr/bin/hdiutil detach "${MOUNT_POINT}"
           mounted=0
 
-          /usr/bin/security create-keychain -p "${SMOKE_KEYCHAIN_PASSWORD}" "${SMOKE_KEYCHAIN}"
-          keychain_created=1
-          /usr/bin/security set-keychain-settings -lut 21600 "${SMOKE_KEYCHAIN}"
-          /usr/bin/security unlock-keychain -p "${SMOKE_KEYCHAIN_PASSWORD}" "${SMOKE_KEYCHAIN}"
-          /usr/bin/security list-keychains -d user -s "${SMOKE_KEYCHAIN}" "${ORIGINAL_KEYCHAINS[@]}"
-          /usr/bin/security default-keychain -d user -s "${SMOKE_KEYCHAIN}"
+          if [[ "${IS_RELEASE}" == 'true' ]]; then
+            /usr/bin/security create-keychain -p "${SMOKE_KEYCHAIN_PASSWORD}" "${SMOKE_KEYCHAIN}"
+            keychain_created=1
+            /usr/bin/security set-keychain-settings -lut 21600 "${SMOKE_KEYCHAIN}"
+            /usr/bin/security unlock-keychain -p "${SMOKE_KEYCHAIN_PASSWORD}" "${SMOKE_KEYCHAIN}"
+            /usr/bin/security list-keychains -d user -s "${SMOKE_KEYCHAIN}" "${ORIGINAL_KEYCHAINS[@]}"
+            /usr/bin/security default-keychain -d user -s "${SMOKE_KEYCHAIN}"
+          fi
 
           export HOME="${SMOKE_HOME}"
           export PATH="${GUARD_DIR}:/usr/bin:/bin:/usr/sbin:/sbin"
           export POLY_GUARD_LOG="${GUARD_LOG}"
-          printf '%s' "${SMOKE_SECRET}" \
-            | "${RUNTIME_EXECUTABLE}" --keychain-smoke set --account "${SMOKE_ACCOUNT}" >/dev/null
+          if [[ "${IS_RELEASE}" == 'true' ]]; then
+            printf '%s' "${SMOKE_SECRET}" \
+              | "${RUNTIME_EXECUTABLE}" --keychain-smoke set --account "${SMOKE_ACCOUNT}" >/dev/null
+          fi
           app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
           [[ "${app_count}" -eq 0 ]]
           /usr/bin/open -n "${INSTALLED_APP}"
@@ -347,8 +354,10 @@ jobs:
 
           /usr/bin/open -n "${INSTALLED_APP}"
           /bin/sleep 2
-          printf '%s' "${SMOKE_SECRET}" \
-            | "${RUNTIME_EXECUTABLE}" --keychain-smoke verify --account "${SMOKE_ACCOUNT}" >/dev/null
+          if [[ "${IS_RELEASE}" == 'true' ]]; then
+            printf '%s' "${SMOKE_SECRET}" \
+              | "${RUNTIME_EXECUTABLE}" --keychain-smoke verify --account "${SMOKE_ACCOUNT}" >/dev/null
+          fi
           /usr/bin/open -n "${INSTALLED_APP}"
           /bin/sleep 3
           app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
@@ -362,7 +371,9 @@ jobs:
             /bin/sleep 1
           done
           [[ -z "${remaining}" && "${app_count}" -eq 0 ]]
-          "${RUNTIME_EXECUTABLE}" --keychain-smoke delete --account "${SMOKE_ACCOUNT}" >/dev/null
+          if [[ "${IS_RELEASE}" == 'true' ]]; then
+            "${RUNTIME_EXECUTABLE}" --keychain-smoke delete --account "${SMOKE_ACCOUNT}" >/dev/null
+          fi
           copy_smoke_diagnostics
           [[ ! -s "${GUARD_LOG}" ]]
 
