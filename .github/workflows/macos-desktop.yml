@@ -455,7 +455,7 @@ jobs:
           }
           C
           /usr/bin/clang -Wall -Wextra -Werror -Os "${CALIBRATION_SOURCE}" -o "${CALIBRATION_PARENT}"
-          start_exec_trace "${CALIBRATION_TRACE}" Poly poly-runtime
+          start_exec_trace "${CALIBRATION_TRACE}" poly-runtime Python python3
           "${CALIBRATION_PARENT}"
           assert_exec_trace_alive
           /bin/sleep 1
@@ -480,7 +480,7 @@ jobs:
           export POLY_GUARD_LOG="${GUARD_LOG}"
           printf '%s' "${SMOKE_SECRET}" \
             | "${RUNTIME_EXECUTABLE}" --keychain-smoke set --account "${SMOKE_ACCOUNT}" >/dev/null
-          start_exec_trace "${APP_EXEC_TRACE}" Poly poly-runtime
+          start_exec_trace "${APP_EXEC_TRACE}" Poly poly-runtime Python python python3 node postgres aws docker brew
           app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
           [[ "${app_count}" -eq 0 ]]
           /usr/bin/open -n "${INSTALLED_APP}"

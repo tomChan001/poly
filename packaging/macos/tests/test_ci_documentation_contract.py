@@ -275,9 +275,18 @@ def test_smoke_uses_calibrated_kernel_exec_tracing() -> None:
     assert "audit_app_processes" not in workflow
     assert workflow.count('start_exec_trace "${') == 2
     assert (
-        workflow.count('start_exec_trace "${CALIBRATION_TRACE}" Poly poly-runtime') == 1
+        workflow.count(
+            'start_exec_trace "${CALIBRATION_TRACE}" poly-runtime Python python3'
+        )
+        == 1
     )
-    assert workflow.count('start_exec_trace "${APP_EXEC_TRACE}" Poly poly-runtime') == 1
+    assert (
+        workflow.count(
+            'start_exec_trace "${APP_EXEC_TRACE}" Poly poly-runtime '
+            "Python python python3 node postgres aws docker brew"
+        )
+        == 1
+    )
     assert re.search(
         r"start_exec_trace.*?CALIBRATION_PARENT.*?stop_exec_trace.*?"
         r"grep.*?/usr/bin/python3",
