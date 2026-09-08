@@ -185,6 +185,15 @@ class DistributionContractTests(unittest.TestCase):
             (ROOT / "src-tauri" / "Cargo.toml").read_text(encoding="utf-8")
         )
         bundle = config["bundle"]
+        self.assertEqual(
+            config["build"]["beforeBuildCommand"],
+            "npm --prefix frontend run build",
+        )
+        self.assertEqual(
+            config["build"]["beforeDevCommand"],
+            "npm --prefix frontend run dev -- --host 127.0.0.1",
+        )
+        self.assertEqual(config["build"]["frontendDist"], "../frontend/dist")
         self.assertEqual(config["mainBinaryName"], "Poly")
         self.assertNotIn("mainBinaryName", config["build"])
         self.assertEqual(

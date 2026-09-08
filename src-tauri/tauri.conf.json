@@ -5,9 +5,9 @@
   "version": "0.1.0",
   "identifier": "com.poly.desktop",
   "build": {
-    "beforeDevCommand": "npm --prefix ../frontend run dev -- --host 127.0.0.1",
+    "beforeDevCommand": "npm --prefix frontend run dev -- --host 127.0.0.1",
     "devUrl": "http://127.0.0.1:5173",
-    "beforeBuildCommand": "npm --prefix ../frontend run build",
+    "beforeBuildCommand": "npm --prefix frontend run build",
     "frontendDist": "../frontend/dist"
   },
   "app": {
