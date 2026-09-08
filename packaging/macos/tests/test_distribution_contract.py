@@ -145,6 +145,7 @@ class DistributionContractTests(unittest.TestCase):
             "initdb postgres pg_isready psql createdb",
         ):
             self.assertIn(token, script)
+        self.assertIn('BUILD_TEMP="$(cd -- "${BUILD_TEMP}" && pwd -P)"', script)
         self.assertNotIn('cp -R -- "${INSTALL_PREFIX}/lib/postgresql"', script)
         self.assertIn("plpgsql.dylib", script)
         self.assertNotIn('/lib/postgresql/', script)

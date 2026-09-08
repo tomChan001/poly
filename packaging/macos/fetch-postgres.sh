@@ -99,6 +99,7 @@ readonly DESTINATION="${DESTINATION_PARENT}/${TARGET_TRIPLE}"
 mkdir -p "${DESTINATION_PARENT}"
 
 BUILD_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/poly-postgres.XXXXXXXX")"
+BUILD_TEMP="$(cd -- "${BUILD_TEMP}" && pwd -P)"
 cleanup() {
   [[ -n "${BUILD_TEMP:-}" && -d "${BUILD_TEMP}" ]] && rm -rf -- "${BUILD_TEMP}"
 }
