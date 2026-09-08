@@ -139,7 +139,9 @@ if ! find "${INSTALL_PREFIX}/lib" -maxdepth 1 \( -type f -o -type l \) \
   die "find failed while locating libpq dylibs"
 fi
 while IFS= read -r -d '' library; do
-  cp -P -- "${library}" "${STAGED}/lib/"
+  # PyInstaller preserves data-file symlinks. Materialize every versioned name
+  # so the packaged-runtime safety check sees only self-contained regular files.
+  cp -L -- "${library}" "${STAGED}/lib/"
 done <"${BUILD_TEMP}/libpq-files"
 [[ -f "${INSTALL_PREFIX}/lib/plpgsql.dylib" ]] || die "required PL/pgSQL extension library is missing"
 cp -- "${INSTALL_PREFIX}/lib/plpgsql.dylib" "${STAGED}/lib/plpgsql.dylib"

@@ -152,6 +152,12 @@ class DistributionContractTests(unittest.TestCase):
         self.assertIn('install_name_tool -id "@loader_path/', script)
         self.assertNotIn('install_name_tool -id "@rpath/', script)
 
+    def test_fetch_dereferences_libpq_links_before_packaging(self) -> None:
+        script = self.read("fetch-postgres.sh")
+
+        self.assertIn('cp -L -- "${library}" "${STAGED}/lib/"', script)
+        self.assertNotIn('cp -P -- "${library}" "${STAGED}/lib/"', script)
+
     def test_empty_entitlements_have_no_forbidden_capabilities(self) -> None:
         data = (MACOS / "entitlements.plist").read_bytes()
         self.assertEqual(plistlib.loads(data), {})
