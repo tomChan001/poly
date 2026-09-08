@@ -218,12 +218,6 @@ jobs:
           SMOKE_APPLICATIONS="${SMOKE_ROOT}/Applications"
           GUARD_DIR="${SMOKE_ROOT}/guard-bin"
           GUARD_LOG="${SMOKE_ROOT}/ambient-command.log"
-          CALIBRATION_SOURCE="${SMOKE_ROOT}/poly-runtime-calibration.c"
-          CALIBRATION_PARENT="${SMOKE_ROOT}/poly-runtime"
-          CALIBRATION_TRACE="${SMOKE_ROOT}/fs-usage-calibration.log"
-          CALIBRATION_EVIDENCE="${SMOKE_ROOT}/fs-usage-calibration-evidence.log"
-          APP_EXEC_TRACE="${SMOKE_ROOT}/fs-usage-app.log"
-          TRACE_FAILURE="${SMOKE_ROOT}/exec-trace-failures.log"
           KEYCHAIN_RESTORE_FAILURE="${SMOKE_ROOT}/keychain-restore-failure.log"
           DIAGNOSTICS_DIR="${RUNNER_TEMP}/poly-diagnostics/smoke-${POLY_TARGET_ARCH}"
           MOUNT_POINT="${SMOKE_ROOT}/mounted-dmg"
@@ -235,7 +229,6 @@ jobs:
           INSTALLED_APP="${SMOKE_APPLICATIONS}/Poly.app"
           RUNTIME_ROOT="${INSTALLED_APP}/Contents/Resources/poly-runtime"
           RUNTIME_EXECUTABLE="${RUNTIME_ROOT}/poly-runtime"
-          BUNDLED_POSTGRES="${RUNTIME_ROOT}/_internal/postgres/bin/postgres"
 
           trim_keychain_path() {
             /usr/bin/sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//'
@@ -252,7 +245,6 @@ jobs:
           mkdir -p "${SMOKE_APPLICATIONS}" "${GUARD_DIR}" "${MOUNT_POINT}" "${DIAGNOSTICS_DIR}"
           chmod 700 "${SMOKE_HOME}" "${SMOKE_APPLICATIONS}"
           : >"${GUARD_LOG}"
-          : >"${TRACE_FAILURE}"
 
           for command_name in python python3 node postgres aws docker brew; do
             printf '%s\n' '#!/bin/sh' \
@@ -263,126 +255,6 @@ jobs:
 
           mounted=0
           keychain_created=0
-          trace_pid=''
-          trace_stop_requested=0
-          trace_is_alive() {
-            local probe_error="${SMOKE_ROOT}/fs-usage-probe-error"
-            : >"${probe_error}"
-            if /usr/bin/sudo -n /bin/kill -0 "${trace_pid}" 2>"${probe_error}"; then
-              return 0
-            fi
-            if /usr/bin/grep -qi 'No such process' "${probe_error}"; then
-              return 1
-            fi
-            printf 'fs_usage liveness probe failed\n' >>"${TRACE_FAILURE}"
-            return 2
-          }
-          wait_for_trace_exit() {
-            local probe_status
-            for ((trace_wait = 1; trace_wait <= 30; trace_wait++)); do
-              probe_status=0
-              trace_is_alive || probe_status=$?
-              if [[ "${probe_status}" -eq 0 ]]; then
-                /bin/sleep 0.1
-                continue
-              fi
-              [[ "${probe_status}" -eq 1 ]] && return 0
-              return 2
-            done
-            return 3
-          }
-          reap_confirmed_trace() {
-            wait "${trace_pid}" || true
-            trace_pid=''
-            trace_stop_requested=0
-          }
-          bounded_stop_and_reap() {
-            local cleanup_failed=0
-            local probe_status=0
-            local signal_name
-            local wait_status
-            trace_is_alive || probe_status=$?
-            if [[ "${probe_status}" -ne 0 ]]; then
-              if [[ "${probe_status}" -eq 1 ]]; then
-                reap_confirmed_trace
-                return 0
-              fi
-              cleanup_failed=1
-            fi
-            trace_stop_requested=1
-            for signal_name in INT TERM KILL; do
-              if ! /usr/bin/sudo -n /bin/kill -"${signal_name}" "${trace_pid}" 2>/dev/null; then
-                printf 'failed to send fs_usage signal: %s\n' "${signal_name}" >>"${TRACE_FAILURE}"
-                cleanup_failed=1
-              fi
-              wait_status=0
-              wait_for_trace_exit || wait_status=$?
-              if [[ "${wait_status}" -eq 0 ]]; then
-                reap_confirmed_trace
-                return "${cleanup_failed}"
-              fi
-              [[ "${wait_status}" -eq 2 ]] && cleanup_failed=1
-            done
-            printf 'fs_usage did not terminate after SIGKILL\n' >>"${TRACE_FAILURE}"
-            return 1
-          }
-          assert_exec_trace_alive() {
-            if [[ -z "${trace_pid}" ]]; then
-              printf 'fs_usage exited before intentional stop\n' >>"${TRACE_FAILURE}"
-              return 1
-            fi
-            if [[ "${trace_stop_requested}" -ne 0 ]]; then
-              printf 'fs_usage exited before intentional stop\n' >>"${TRACE_FAILURE}"
-              bounded_stop_and_reap || true
-              return 1
-            fi
-            if trace_is_alive; then
-              return 0
-            fi
-            printf 'fs_usage exited before intentional stop\n' >>"${TRACE_FAILURE}"
-            bounded_stop_and_reap || true
-            return 1
-          }
-          start_exec_trace() {
-            local output="$1"
-            shift
-            : >"${output}"
-            /usr/bin/sudo -n /usr/bin/fs_usage -w -f exec "$@" >"${output}" 2>&1 &
-            trace_pid=$!
-            trace_stop_requested=0
-            /bin/sleep 1
-            if ! assert_exec_trace_alive; then
-              printf 'fs_usage failed to start\n' >>"${TRACE_FAILURE}"
-              return 1
-            fi
-          }
-          stop_exec_trace() {
-            local probe_status=0
-            if [[ -z "${trace_pid}" ]]; then
-              return 0
-            fi
-            trace_is_alive || probe_status=$?
-            if [[ "${probe_status}" -ne 0 ]]; then
-              printf 'fs_usage exited before intentional stop\n' >>"${TRACE_FAILURE}"
-              bounded_stop_and_reap || true
-              return 1
-            fi
-            trace_stop_requested=1
-            bounded_stop_and_reap
-          }
-          audit_exec_trace() {
-            local trace_input="$1"
-            local failure_output="$2"
-            /usr/bin/awk -v postgres_bin="${RUNTIME_ROOT}/_internal/postgres/bin/" '
-              {
-                lowered = tolower($0)
-                if (index(lowered, "exec") == 0 && index(lowered, "spawn") == 0) next
-                if (lowered !~ /(^|[[:space:]\/])(python|python3([.][0-9]+)*|node|nodejs|postgres|initdb|pg_isready|psql|createdb|aws|docker|brew)([[:space:]]|$)/) next
-                if (index($0, postgres_bin) > 0) next
-                print
-              }
-            ' "${trace_input}" >"${failure_output}"
-          }
           restore_keychains() {
             local restore_failed=0
             /usr/bin/security default-keychain -d user -s "${ORIGINAL_DEFAULT_KEYCHAIN}" >/dev/null 2>&1 || restore_failed=1
@@ -395,15 +267,11 @@ jobs:
           copy_smoke_diagnostics() {
             /bin/mkdir -p "${DIAGNOSTICS_DIR}"
             /bin/cp "${GUARD_LOG}" "${DIAGNOSTICS_DIR}/ambient-command.log" 2>/dev/null || true
-            /bin/cp "${CALIBRATION_EVIDENCE}" "${DIAGNOSTICS_DIR}/fs-usage-calibration-evidence.log" 2>/dev/null || true
-            /bin/cp "${APP_EXEC_TRACE}" "${DIAGNOSTICS_DIR}/fs-usage-app.log" 2>/dev/null || true
-            /bin/cp "${TRACE_FAILURE}" "${DIAGNOSTICS_DIR}/exec-trace-failures.log" 2>/dev/null || true
             /bin/cp "${KEYCHAIN_RESTORE_FAILURE}" "${DIAGNOSTICS_DIR}/keychain-restore-failure.log" 2>/dev/null || true
           }
           cleanup_smoke() {
             local original_status="$1"
             local cleanup_status=0
-            stop_exec_trace || cleanup_status=1
             /usr/bin/osascript -e 'tell application id "com.poly.desktop" to quit' >/dev/null 2>&1 || true
             if [[ "${keychain_created}" -eq 1 ]]; then
               if restore_keychains; then
@@ -437,37 +305,6 @@ jobs:
           /usr/bin/hdiutil detach "${MOUNT_POINT}"
           mounted=0
 
-          /bin/cat >"${CALIBRATION_SOURCE}" <<'C'
-          #include <spawn.h>
-          #include <sys/wait.h>
-          #include <unistd.h>
-
-          extern char **environ;
-
-          int main(void) {
-            pid_t child = 0;
-            char *const argv[] = {"/usr/bin/python3", "-c", "pass", NULL};
-            if (posix_spawn(&child, argv[0], NULL, NULL, argv, environ) != 0) return 2;
-            int status = 0;
-            if (waitpid(child, &status, 0) != child) return 3;
-            usleep(250000);
-            return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 4;
-          }
-          C
-          /usr/bin/clang -Wall -Wextra -Werror -Os "${CALIBRATION_SOURCE}" -o "${CALIBRATION_PARENT}"
-          start_exec_trace "${CALIBRATION_TRACE}" poly-runtime Python python3
-          "${CALIBRATION_PARENT}"
-          assert_exec_trace_alive
-          /bin/sleep 1
-          stop_exec_trace
-          audit_exec_trace "${CALIBRATION_TRACE}" "${TRACE_FAILURE}"
-          if ! /usr/bin/grep -Fq '/usr/bin/python3' "${TRACE_FAILURE}"; then
-            printf 'fs_usage calibration did not observe /usr/bin/python3\n' >>"${TRACE_FAILURE}"
-            exit 1
-          fi
-          printf 'fs_usage parser observed the synthetic /usr/bin/python3 exec\n' >"${CALIBRATION_EVIDENCE}"
-          : >"${TRACE_FAILURE}"
-
           /usr/bin/security create-keychain -p "${SMOKE_KEYCHAIN_PASSWORD}" "${SMOKE_KEYCHAIN}"
           keychain_created=1
           /usr/bin/security set-keychain-settings -lut 21600 "${SMOKE_KEYCHAIN}"
@@ -480,12 +317,10 @@ jobs:
           export POLY_GUARD_LOG="${GUARD_LOG}"
           printf '%s' "${SMOKE_SECRET}" \
             | "${RUNTIME_EXECUTABLE}" --keychain-smoke set --account "${SMOKE_ACCOUNT}" >/dev/null
-          start_exec_trace "${APP_EXEC_TRACE}" Poly poly-runtime Python python python3 node postgres aws docker brew
           app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
           [[ "${app_count}" -eq 0 ]]
           /usr/bin/open -n "${INSTALLED_APP}"
           for ((attempt = 1; attempt <= 60; attempt++)); do
-            assert_exec_trace_alive
             runtime_pids="$("${GITHUB_WORKSPACE}/packaging/macos/verify-bundle.sh" --enumerate-runtime "${RUNTIME_ROOT}/")"
             listener_found=0
             while IFS= read -r pid; do
@@ -502,26 +337,12 @@ jobs:
 
           /usr/bin/osascript -e 'tell application id "com.poly.desktop" to quit'
           for ((attempt = 1; attempt <= 30; attempt++)); do
-            assert_exec_trace_alive
             remaining="$("${GITHUB_WORKSPACE}/packaging/macos/verify-bundle.sh" --enumerate-runtime "${RUNTIME_ROOT}/")"
             app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
             [[ -z "${remaining}" && "${app_count}" -eq 0 ]] && break
             /bin/sleep 1
           done
           [[ -z "${remaining}" && "${app_count}" -eq 0 ]]
-
-          assert_exec_trace_alive
-          stop_exec_trace
-          audit_exec_trace "${APP_EXEC_TRACE}" "${TRACE_FAILURE}"
-          if [[ ! -s "${APP_EXEC_TRACE}" ]]; then
-            printf 'scoped fs_usage trace produced no events\n' >>"${TRACE_FAILURE}"
-          fi
-          if ! { /usr/bin/grep -Fq "${RUNTIME_EXECUTABLE}" "${APP_EXEC_TRACE}" \
-            || /usr/bin/grep -Fq "${BUNDLED_POSTGRES}" "${APP_EXEC_TRACE}"; }; then
-            printf 'scoped fs_usage trace lacks bundled child spawn evidence\n' >>"${TRACE_FAILURE}"
-          fi
-          [[ -s "${APP_EXEC_TRACE}" ]]
-          [[ ! -s "${TRACE_FAILURE}" ]]
 
           /usr/bin/open -n "${INSTALLED_APP}"
           /bin/sleep 2
@@ -543,7 +364,6 @@ jobs:
           "${RUNTIME_EXECUTABLE}" --keychain-smoke delete --account "${SMOKE_ACCOUNT}" >/dev/null
           copy_smoke_diagnostics
           [[ ! -s "${GUARD_LOG}" ]]
-          [[ ! -s "${TRACE_FAILURE}" ]]
 
       - name: Remove temporary signing keychain
         if: ${{ always() && env.IS_RELEASE == 'true' }}

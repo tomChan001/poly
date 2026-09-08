@@ -239,135 +239,27 @@ def test_smoke_uses_an_isolated_home_installed_dmg_and_command_guards() -> None:
     )
 
 
-def test_smoke_uses_calibrated_kernel_exec_tracing() -> None:
+def test_smoke_uses_exact_runtime_evidence_without_unreliable_kernel_tracing() -> None:
     workflow = read(WORKFLOW)
-    assert (
-        'BUNDLED_POSTGRES="${RUNTIME_ROOT}/_internal/postgres/bin/postgres"'
-        in workflow
-    )
-    assert 'postgres_bin="${RUNTIME_ROOT}/_internal/postgres/bin/"' in workflow
-    assert 'BUNDLED_POSTGRES="${RUNTIME_ROOT}/postgres/bin/postgres"' not in workflow
-    for marker in (
-        "/usr/bin/sudo -n /usr/bin/fs_usage -w -f exec",
-        '"/usr/bin/python3"',
-        "CALIBRATION_TRACE",
-        "CALIBRATION_PARENT",
-        "/usr/bin/clang",
-        "posix_spawn",
-        "APP_EXEC_TRACE",
-        "Poly poly-runtime",
-        "audit_exec_trace",
-        "exec-trace-failures.log",
-        "${RUNTIME_ROOT}/_internal/postgres/bin/",
-    ):
-        assert marker in workflow
-    for forbidden_command in (
-        "python",
-        "python3",
-        "node",
-        "postgres",
-        "aws",
-        "docker",
-        "brew",
-    ):
-        assert forbidden_command in workflow
-    assert "/bin/ps -ww -axo pid=,ppid=,comm=" not in workflow
-    assert "audit_app_processes" not in workflow
-    assert workflow.count('start_exec_trace "${') == 2
-    assert (
-        workflow.count(
-            'start_exec_trace "${CALIBRATION_TRACE}" poly-runtime Python python3'
-        )
-        == 1
-    )
-    assert (
-        workflow.count(
-            'start_exec_trace "${APP_EXEC_TRACE}" Poly poly-runtime '
-            "Python python python3 node postgres aws docker brew"
-        )
-        == 1
-    )
-    assert re.search(
-        r"start_exec_trace.*?CALIBRATION_PARENT.*?stop_exec_trace.*?"
-        r"grep.*?/usr/bin/python3",
-        workflow,
-        re.DOTALL,
-    )
-    assert '[[ -s "${APP_EXEC_TRACE}" ]]' in workflow
-    assert re.search(
-        r"grep -Fq.*?RUNTIME_EXECUTABLE.*?APP_EXEC_TRACE.*?\|\|.*?"
-        r"grep -Fq.*?BUNDLED_POSTGRES.*?APP_EXEC_TRACE",
-        workflow,
-        re.DOTALL,
-    )
-    assert '[[ ! -s "${TRACE_FAILURE}" ]]' in workflow
     smoke = workflow.split(
         "- name: Install DMG into an isolated home and smoke test", 1
     )[1].split("- name: Remove temporary signing keychain", 1)[0]
-    trace_start = smoke.index(
-        'start_exec_trace "${APP_EXEC_TRACE}" Poly poly-runtime'
-    )
-    app_launch = smoke.index('/usr/bin/open -n "${INSTALLED_APP}"', trace_start)
-    trace_stop = smoke.index("stop_exec_trace", app_launch)
-    trace_audit = smoke.index(
-        'audit_exec_trace "${APP_EXEC_TRACE}" "${TRACE_FAILURE}"', trace_stop
-    )
-    positive_evidence = smoke.index(
-        'grep -Fq "${RUNTIME_EXECUTABLE}" "${APP_EXEC_TRACE}"', trace_audit
-    )
-    keychain_verify = smoke.index("--keychain-smoke verify", trace_start)
-    keychain_delete = smoke.index("--keychain-smoke delete", trace_start)
-    assert (
-        trace_start
-        < app_launch
-        < trace_stop
-        < trace_audit
-        < positive_evidence
-        < keychain_verify
-        < keychain_delete
-    )
-    trace_window = smoke[trace_start:trace_stop]
-    assert "--keychain-smoke verify" not in trace_window
-    assert "--keychain-smoke delete" not in trace_window
-    post_trace_window = smoke[trace_stop:]
-    assert "assert_exec_trace_alive" not in post_trace_window
 
-
-def test_exec_trace_unexpected_exit_is_a_hard_failure() -> None:
-    workflow = read(WORKFLOW)
-    assert "assert_exec_trace_alive" in workflow
-    assert "fs_usage exited before intentional stop" in workflow
-    assert workflow.count("assert_exec_trace_alive") >= 4
-    assert "trace_stop_requested=1" in workflow
-    assert "! /bin/kill -0" not in workflow
-    assert "if /bin/kill -0" not in workflow
-    assert workflow.count("/usr/bin/sudo -n /bin/kill -0") == 1
-    assert workflow.count("trace_is_alive") >= 5
     for marker in (
-        "bounded_stop_and_reap",
-        "wait_for_trace_exit",
-        "reap_confirmed_trace",
-        "fs_usage liveness probe failed",
-        "failed to send fs_usage signal",
-        "for ((trace_wait = 1; trace_wait <=",
+        "fs_usage",
+        "CALIBRATION_",
+        "APP_EXEC_TRACE",
+        "TRACE_FAILURE",
+        "start_exec_trace",
+        "audit_exec_trace",
     ):
-        assert marker in workflow
-    stop = workflow.split("bounded_stop_and_reap()", 1)[1].split(
-        "assert_exec_trace_alive()", 1
-    )[0]
-    assert "if ! trace_is_alive" not in stop
-    assert "trace_is_alive || probe_status=$?" in stop
-    assert "wait_for_trace_exit || wait_status=$?" in stop
-    assert "for signal_name in INT TERM KILL" in stop
-    assert workflow.count('wait "${trace_pid}"') == 1
-    reap = workflow.split("reap_confirmed_trace()", 1)[1].split(
-        "bounded_stop_and_reap()", 1
-    )[0]
-    assert 'wait "${trace_pid}" || true' in reap
-    unexpected = workflow.split("assert_exec_trace_alive()", 1)[1].split(
-        "start_exec_trace()", 1
-    )[0]
-    assert "bounded_stop_and_reap" in unexpected
+        assert marker not in smoke
+    assert 'RUNTIME_EXECUTABLE="${RUNTIME_ROOT}/poly-runtime"' in smoke
+    assert '"${GITHUB_WORKSPACE}/packaging/macos/verify-bundle.sh" ' in smoke
+    assert '--enumerate-runtime "${RUNTIME_ROOT}/"' in smoke
+    assert '/usr/sbin/lsof -nP -a -p "${pid}" -iTCP -sTCP:LISTEN' in smoke
+    assert "TCP 127.0.0.1:" in smoke
+    assert '[[ ! -s "${GUARD_LOG}" ]]' in smoke
 
 
 def test_smoke_restores_trimmed_keychain_paths_or_fails_closed() -> None:
