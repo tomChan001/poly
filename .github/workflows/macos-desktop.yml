@@ -114,6 +114,9 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 
+      - name: Stage empty runtime directory for Rust checks
+        run: mkdir -p src-tauri/resources/poly-runtime
+
       - name: Lint Rust
         run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --target "${POLY_TARGET_TRIPLE}" -- -D warnings
 

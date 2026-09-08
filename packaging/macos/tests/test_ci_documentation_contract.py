@@ -128,6 +128,7 @@ def test_workflow_has_the_required_ordered_locked_pipeline() -> None:
         "npm run build",
         "rustup target add",
         "cargo fmt --manifest-path src-tauri/Cargo.toml -- --check",
+        "mkdir -p src-tauri/resources/poly-runtime",
         "cargo clippy --locked --manifest-path src-tauri/Cargo.toml",
         "cargo test --locked --manifest-path src-tauri/Cargo.toml",
         "packaging/macos/fetch-postgres.sh",
