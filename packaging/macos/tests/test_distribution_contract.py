@@ -796,6 +796,42 @@ class DistributionContractTests(unittest.TestCase):
             self.assertIn("pid=,ppid=,args=", verifier)
             self.assertNotIn('+D "${runtime_directory}"', verifier)
 
+    def test_runtime_enumeration_tolerates_candidate_exit_race(self) -> None:
+        bash = bash_executable()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stubs = root / "stubs"
+            stubs.mkdir()
+            write_stub(
+                stubs,
+                "ps",
+                "if [[ \"$*\" == *'pid=,ppid=,args='* ]]; then\n"
+                "  printf ' 4242 1 /tmp/poly-runtime/poly-runtime\\n'\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 1",
+            )
+            write_stub(stubs, "lsof", "exit 1")
+            env = os.environ.copy()
+            env["PATH"] = f"{git_bash_path(stubs)}:/usr/bin:/bin"
+            env["POLY_TEST_PS"] = git_bash_path(stubs / "ps")
+            env["POLY_TEST_LSOF"] = git_bash_path(stubs / "lsof")
+            result = subprocess.run(
+                [
+                    bash,
+                    str(MACOS / "verify-bundle.sh"),
+                    "--enumerate-runtime",
+                    "/tmp/poly-runtime/",
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+
     def test_runtime_license_classifier_handles_pyinstaller_internal_layout(self) -> None:
         module = load_macos_module("license_inventory")
         with tempfile.TemporaryDirectory() as temporary:

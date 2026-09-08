@@ -43,13 +43,16 @@ configure_target_audit() {
 
 process_executable() {
   local pid="$1"
-  local lsof_output ps_output record path
+  local lsof_output ps_output ps_status record path
   PROCESS_EXECUTABLE=""
   if ! lsof_output="$("${LSOF_BIN}" -a -p "${pid}" -d txt -Fn 2>"${VERIFY_TEMP}/lsof-txt-error")"; then
-    if ! ps_output="$("${PS_BIN}" -ww -p "${pid}" -o pid=)"; then
+    if ps_output="$("${PS_BIN}" -ww -p "${pid}" -o pid=)"; then
+      [[ -z "${ps_output//[[:space:]]/}" ]] && return 1
+    else
+      ps_status=$?
+      [[ "${ps_status}" -eq 1 ]] && return 1
       die "process enumeration failed while checking PID ${pid} after lsof failure"
     fi
-    [[ -z "${ps_output//[[:space:]]/}" ]] && return 1
     if [[ -s "${VERIFY_TEMP}/lsof-txt-error" ]]; then
       die "exact executable enumeration failed for live PID ${pid}: $(<"${VERIFY_TEMP}/lsof-txt-error")"
     fi

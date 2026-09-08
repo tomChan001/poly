@@ -137,3 +137,21 @@ Skip temporary Keychain creation and packaged `KeyringSecretStore` calls for ad-
 - [ ] **Step 3: Update the runbook and verify**
 
 Document the validation/release distinction and run the packaging contracts plus focused desktop Keychain unit tests.
+
+### Task 5: Tolerate process-exit races
+
+**Files:**
+- Modify: `packaging/macos/verify-bundle.sh`
+- Modify: `packaging/macos/tests/test_distribution_contract.py`
+
+- [ ] **Step 1: Reproduce a candidate exiting between `lsof` and `ps`**
+
+Stub the initial snapshot with one runtime PID, make `lsof` fail, and make the follow-up `ps -p` return its documented no-match status with no output.
+
+- [ ] **Step 2: Treat only the no-match status as a vanished process**
+
+Return no PID for `ps -p` status 1. Preserve hard failures for a live PID and for any other process-table error.
+
+- [ ] **Step 3: Run the process-enumeration and full packaging contract suites**
+
+Require the exit-race test, failure-closed tests, bounded descendant test, script syntax, and lint checks to pass.
