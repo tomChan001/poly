@@ -136,8 +136,13 @@ fi
 
 if [[ "${CHECK}" -eq 1 ]]; then
   [[ -f "${OUTPUT}" ]] || die "generated notice is not committed: ${OUTPUT}"
-  cmp -s "${WORK_DIR}/THIRD_PARTY_NOTICES.md" "${OUTPUT}" ||
+  if ! cmp -s "${WORK_DIR}/THIRD_PARTY_NOTICES.md" "${OUTPUT}"; then
+    if command -v diff >/dev/null 2>&1; then
+      diff -u --label committed --label generated \
+        "${OUTPUT}" "${WORK_DIR}/THIRD_PARTY_NOTICES.md" >&2 || true
+    fi
     die "${OUTPUT} is stale; run packaging/macos/generate-notices.sh and commit the result"
+  fi
   printf 'Third-party notices match committed lockfiles and available authoritative inventories.\n'
 else
   cp -- "${WORK_DIR}/THIRD_PARTY_NOTICES.md" "${OUTPUT}"
