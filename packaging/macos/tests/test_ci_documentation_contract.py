@@ -262,6 +262,15 @@ def test_smoke_uses_exact_runtime_evidence_without_unreliable_kernel_tracing() -
     assert '[[ ! -s "${GUARD_LOG}" ]]' in smoke
 
 
+def test_installed_dmg_smoke_has_step_timeout() -> None:
+    workflow = read(WORKFLOW)
+    smoke_header = workflow.split(
+        "- name: Install DMG into an isolated home and smoke test", 1
+    )[1].split("run: |", 1)[0]
+
+    assert "timeout-minutes: 10" in smoke_header
+
+
 def test_smoke_restores_trimmed_keychain_paths_or_fails_closed() -> None:
     workflow = read(WORKFLOW)
     for marker in (

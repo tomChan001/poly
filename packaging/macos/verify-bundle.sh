@@ -73,16 +73,19 @@ process_executable() {
 enumerate_process_paths() {
   local candidate_prefix="$1"
   local output_file="$2"
-  local record pid arguments runtime_directory
+  local record pid ppid arguments added
   : >"${output_file}"
   : >"${VERIFY_TEMP}/candidate-pids"
-  if ! "${PS_BIN}" -ww -axo pid=,args= >"${VERIFY_TEMP}/ps-processes"; then
+  : >"${VERIFY_TEMP}/process-tree"
+  if ! "${PS_BIN}" -ww -axo pid=,ppid=,args= >"${VERIFY_TEMP}/ps-processes"; then
     die "process enumeration failed: ps -ww could not list processes"
   fi
   while IFS= read -r record; do
-    [[ "${record}" =~ ^[[:space:]]*([0-9]+)[[:space:]]+(.*)$ ]] || continue
+    [[ "${record}" =~ ^[[:space:]]*([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+(.*)$ ]] || continue
     pid="${BASH_REMATCH[1]}"
-    arguments="${BASH_REMATCH[2]}"
+    ppid="${BASH_REMATCH[2]}"
+    arguments="${BASH_REMATCH[3]}"
+    printf '%s\t%s\t%s\n' "${pid}" "${ppid}" "${arguments}" >>"${VERIFY_TEMP}/process-tree"
     case "${arguments}" in
       *"${candidate_prefix}"*) ;;
       *) continue ;;
@@ -90,32 +93,20 @@ enumerate_process_paths() {
     printf '%s\n' "${pid}" >>"${VERIFY_TEMP}/candidate-pids"
   done <"${VERIFY_TEMP}/ps-processes"
 
-  # A runtime such as postgres may replace argv after launch.  A recursive,
-  # path-scoped lsof query finds those candidates without searching by name or
-  # inspecting unrelated system paths; exact executable identity is checked below.
-  case "${candidate_prefix}" in
-    */)
-      runtime_directory="${candidate_prefix%/}"
-      : >"${VERIFY_TEMP}/path-lsof-error"
-      if "${LSOF_BIN}" -nP +D "${runtime_directory}" -Fp \
-        >"${VERIFY_TEMP}/path-lsof" 2>"${VERIFY_TEMP}/path-lsof-error"; then
-        [[ ! -s "${VERIFY_TEMP}/path-lsof-error" ]] ||
-          die "path-scoped process enumeration was incomplete for ${runtime_directory}: $(<"${VERIFY_TEMP}/path-lsof-error")"
-        while IFS= read -r record; do
-          case "${record}" in
-            p[0-9]*)
-              pid="${record#p}"
-              if ! grep -qx "${pid}" "${VERIFY_TEMP}/candidate-pids"; then
-                printf '%s\n' "${pid}" >>"${VERIFY_TEMP}/candidate-pids"
-              fi
-              ;;
-          esac
-        done <"${VERIFY_TEMP}/path-lsof"
-      elif [[ -s "${VERIFY_TEMP}/path-lsof-error" ]]; then
-        die "path-scoped process enumeration failed for ${runtime_directory}: $(<"${VERIFY_TEMP}/path-lsof-error")"
+  # PostgreSQL workers can replace argv after launch. Expand the bounded process
+  # snapshot through parent-child relationships, then verify each candidate's
+  # exact executable path below. This avoids recursively walking the runtime tree.
+  added=1
+  while [[ "${added}" -eq 1 ]]; do
+    added=0
+    while IFS=$'\t' read -r pid ppid arguments; do
+      grep -qx "${pid}" "${VERIFY_TEMP}/candidate-pids" && continue
+      if grep -qx "${ppid}" "${VERIFY_TEMP}/candidate-pids"; then
+        printf '%s\n' "${pid}" >>"${VERIFY_TEMP}/candidate-pids"
+        added=1
       fi
-      ;;
-  esac
+    done <"${VERIFY_TEMP}/process-tree"
+  done
 
   while IFS= read -r pid; do
     [[ -n "${pid}" ]] || continue

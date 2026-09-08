@@ -720,7 +720,7 @@ class DistributionContractTests(unittest.TestCase):
                 stubs,
                 "ps",
                 "if [[ \"$*\" == *'-axo'* ]]; then "
-                "printf '4242 /tmp/poly-runtime/poly-runtime\\n'; "
+                "printf '4242 1 /tmp/poly-runtime/poly-runtime\\n'; "
                 "else printf ' 4242\\n'; fi",
             )
             write_stub(stubs, "lsof", "printf 'injected lsof failure\\n' >&2; exit 24")
@@ -742,6 +742,59 @@ class DistributionContractTests(unittest.TestCase):
                 failed_lsof.stderr,
                 r"(?:exact executable|path-scoped process) enumeration failed",
             )
+
+    def test_runtime_enumeration_uses_bounded_process_tree(self) -> None:
+        bash = bash_executable()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stubs = root / "stubs"
+            runtime = root / "poly-runtime"
+            postgres = runtime / "_internal" / "postgres" / "bin" / "postgres"
+            stubs.mkdir()
+            postgres.parent.mkdir(parents=True)
+            (runtime / "poly-runtime").touch()
+            postgres.touch()
+
+            write_stub(
+                stubs,
+                "ps",
+                "[[ \"$*\" == *'pid=,ppid=,args='* ]] || exit 91\n"
+                "printf ' 4242 1 %s/poly-runtime\\n' \"${POLY_TEST_RUNTIME_ROOT}\"\n"
+                "printf ' 4243 4242 postgres: checkpointer\\n'\n"
+                "printf ' 9000 1 /usr/bin/unrelated\\n'",
+            )
+            write_stub(
+                stubs,
+                "lsof",
+                "case \"$*\" in\n"
+                "  *'-p 4242 '*) printf 'p4242\\nn%s/poly-runtime\\n' \"${POLY_TEST_RUNTIME_ROOT}\" ;;\n"
+                "  *'-p 4243 '*) printf 'p4243\\nn%s/_internal/postgres/bin/postgres\\n' \"${POLY_TEST_RUNTIME_ROOT}\" ;;\n"
+                "  *) printf 'unexpected lsof candidate: %s\\n' \"$*\" >&2; exit 92 ;;\n"
+                "esac",
+            )
+            env = os.environ.copy()
+            env["PATH"] = f"{git_bash_path(stubs)}:/usr/bin:/bin"
+            env["POLY_TEST_PS"] = git_bash_path(stubs / "ps")
+            env["POLY_TEST_LSOF"] = git_bash_path(stubs / "lsof")
+            env["POLY_TEST_RUNTIME_ROOT"] = git_bash_path(runtime)
+            result = subprocess.run(
+                [
+                    bash,
+                    str(MACOS / "verify-bundle.sh"),
+                    "--enumerate-runtime",
+                    f"{git_bash_path(runtime)}/",
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["4242", "4243"])
+            verifier = self.read("verify-bundle.sh")
+            self.assertIn("pid=,ppid=,args=", verifier)
+            self.assertNotIn('+D "${runtime_directory}"', verifier)
 
     def test_runtime_license_classifier_handles_pyinstaller_internal_layout(self) -> None:
         module = load_macos_module("license_inventory")
@@ -1146,8 +1199,9 @@ class DistributionContractTests(unittest.TestCase):
         self.assertNotRegex(script, r"\b(?:pkill|killall)\b")
         self.assertNotRegex(script, r"pgrep\s+(?:-[^ ]+\s+)*['\"]?Poly")
         self.assertIn('-d txt -Fn', script)
-        self.assertIn('-ww -axo pid=,args=', script)
-        self.assertIn('+D "${runtime_directory}" -Fp', script)
+        self.assertIn('-ww -axo pid=,ppid=,args=', script)
+        self.assertNotIn('+D "${runtime_directory}"', script)
+        self.assertIn("process-tree", script)
         self.assertIn("pids_at_exact_executable", script)
         self.assertIn("pids_under_path", script)
         self.assertIn('realpath "$1"', script)

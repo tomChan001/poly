@@ -209,6 +209,7 @@ jobs:
           fi
 
       - name: Install DMG into an isolated home and smoke test
+        timeout-minutes: 10
         env:
           SMOKE_ACCOUNT: ci-smoke-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
