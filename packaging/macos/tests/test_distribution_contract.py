@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 import os
@@ -1104,16 +1105,23 @@ class DistributionContractTests(unittest.TestCase):
         self.assertIn("macho-inventory", script)
         self.assertNotIn(".env", script + helper)
 
-    def test_notice_generator_supports_managed_interpreter_license_layouts(
+    def test_notice_generator_uses_pinned_macos_cpython_license(
         self,
     ) -> None:
         script = self.read("generate-notices.sh")
+        license_path = MACOS / "CPython-LICENSE.txt"
 
-        self.assertIn('Path(sys.base_prefix) / "LICENSE.txt"', script)
+        self.assertTrue(license_path.is_file())
+        self.assertEqual(
+            hashlib.sha256(license_path.read_bytes()).hexdigest(),
+            "3b2f81fe21d181c499c59a256c8e1968455d6689d269aa85373bfb6af41da3bf",
+        )
         self.assertIn(
-            'Path(sysconfig.get_path("stdlib")) / "LICENSE.txt"',
+            'readonly CPYTHON_LICENSE="${SCRIPT_DIR}/CPython-LICENSE.txt"',
             script,
         )
+        self.assertNotIn("sys.base_prefix", script)
+        self.assertNotIn('sysconfig.get_path("stdlib")', script)
 
     def test_committed_notices_are_generated_and_checkable_without_bundle(self) -> None:
         notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")

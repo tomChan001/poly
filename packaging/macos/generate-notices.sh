@@ -48,26 +48,9 @@ if ! uv export --frozen --no-dev --no-emit-project \
   die "uv export --frozen --no-dev failed; synchronize the committed uv.lock"
 fi
 
-if ! CPYTHON_LICENSE="$(uv run --frozen python - <<'PY'
-from pathlib import Path
-import sys
-import sysconfig
-
-candidates = (
-    Path(sys.base_prefix) / "LICENSE.txt",
-    Path(sysconfig.get_path("stdlib")) / "LICENSE.txt",
-)
-for license_path in candidates:
-    if license_path.is_file():
-        print(license_path)
-        break
-else:
-    searched = ", ".join(str(candidate) for candidate in candidates)
-    raise SystemExit(f"CPython license file is missing; searched: {searched}")
-PY
-)"; then
-  die "could not locate the CPython license in the frozen Python environment"
-fi
+readonly CPYTHON_LICENSE="${SCRIPT_DIR}/CPython-LICENSE.txt"
+[[ -f "${CPYTHON_LICENSE}" ]] ||
+  die "pinned macOS CPython license is missing: ${CPYTHON_LICENSE}"
 
 if ! PYINSTALLER_LICENSE="$(uv run --frozen python - <<'PY'
 from pathlib import Path
