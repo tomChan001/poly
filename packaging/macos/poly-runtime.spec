@@ -105,6 +105,8 @@ EXCLUDED_IMPORTS = (
     "sqlalchemy.dialects.sqlite",
     "sqlalchemy.ext.baked",
     "MySQLdb",
+    "mypy",
+    "mypy_extensions",
     "psycopg2",
     "pysqlite2",
     "uvicorn.__main__",
