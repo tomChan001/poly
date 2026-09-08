@@ -1680,8 +1680,9 @@ mod tests {
     fn directory_preparation_preserves_shared_support_permissions() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let root =
-            std::env::temp_dir().join(format!("poly-desktop-shared-mode-{}", std::process::id()));
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("poly-desktop-shared-mode-{}", std::process::id()));
         let resources = root.join("Resources");
         let application_support = root.join("Application Support");
         let app_data = application_support.join("com.poly.desktop");
@@ -1746,7 +1747,9 @@ mod tests {
     fn directory_preparation_rejects_a_symlinked_owned_path() {
         use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join(format!("poly-desktop-paths-{}", std::process::id()));
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("poly-desktop-paths-{}", std::process::id()));
         let resources = root.join("Resources");
         let support = root.join("Application Support");
         let app_data = support.join("com.poly.desktop");
