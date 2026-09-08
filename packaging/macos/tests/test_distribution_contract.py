@@ -158,12 +158,12 @@ class DistributionContractTests(unittest.TestCase):
         self.assertIn('cp -L -- "${library}" "${STAGED}/lib/"', script)
         self.assertNotIn('cp -P -- "${library}" "${STAGED}/lib/"', script)
 
-    def test_runtime_excludes_development_only_mypy_modules(self) -> None:
+    def test_runtime_excludes_development_and_build_only_modules(self) -> None:
         spec = self.read("poly-runtime.spec")
         excluded = spec.split("EXCLUDED_IMPORTS = (", 1)[1].split("\n)", 1)[0]
 
-        self.assertIn('"mypy",', excluded)
-        self.assertIn('"mypy_extensions",', excluded)
+        for module in ("mypy", "mypy_extensions", "setuptools"):
+            self.assertIn(f'"{module}",', excluded)
 
     def test_empty_entitlements_have_no_forbidden_capabilities(self) -> None:
         data = (MACOS / "entitlements.plist").read_bytes()

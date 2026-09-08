@@ -109,6 +109,7 @@ EXCLUDED_IMPORTS = (
     "mypy_extensions",
     "psycopg2",
     "pysqlite2",
+    "setuptools",
     "uvicorn.__main__",
     "uvicorn.lifespan.off",
     "uvicorn.loops.asyncio",
