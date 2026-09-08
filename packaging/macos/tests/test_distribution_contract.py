@@ -174,6 +174,9 @@ class DistributionContractTests(unittest.TestCase):
             [{"name": "Poly", "path": "src/main.rs"}],
         )
         self.assertEqual(bundle["targets"], ["app", "dmg"])
+        self.assertEqual(bundle["icon"], ["icons/icon.icns"])
+        self.assertTrue((ROOT / "src-tauri" / "icons" / "icon.png").is_file())
+        self.assertTrue((ROOT / "src-tauri" / "icons" / "icon.icns").is_file())
         self.assertEqual(
             bundle["resources"],
             {

@@ -33,7 +33,7 @@
       "resources/poly-runtime/": "poly-runtime/",
       "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
     },
-    "icon": [],
+    "icon": ["icons/icon.icns"],
     "macOS": {
       "minimumSystemVersion": "12.0",
       "hardenedRuntime": true,
