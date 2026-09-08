@@ -136,6 +136,7 @@ class DistributionContractTests(unittest.TestCase):
     def test_fetch_builds_only_world_binaries_with_minimal_features(self) -> None:
         script = self.read("fetch-postgres.sh")
         for token in (
+            "--without-icu",
             "--without-readline",
             "--without-zlib",
             "--disable-nls",

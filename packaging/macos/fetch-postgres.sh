@@ -119,6 +119,7 @@ readonly STAGED="${BUILD_TEMP}/staged"
   cd -- "${SOURCE_DIR}"
   ./configure \
     --prefix="${INSTALL_PREFIX}" \
+    --without-icu \
     --without-readline \
     --without-zlib \
     --disable-nls
