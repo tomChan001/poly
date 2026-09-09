@@ -3,11 +3,17 @@ name: macOS desktop validation
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      arm64_artifact_run_id:
+        description: Existing workflow run whose Apple Silicon DMG should be re-smoked
+        required: false
+        type: string
   push:
     tags:
       - 'v*'
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -16,6 +22,7 @@ concurrency:
 
 jobs:
   build-native:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.arm64_artifact_run_id == '' }}
     name: ${{ matrix.artifact }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
@@ -429,3 +436,129 @@ jobs:
           path: src-tauri/target/${{ matrix.rust_target }}/release/bundle/dmg/*.dmg
           if-no-files-found: error
           retention-days: 14
+
+  resmoke-arm64-artifact:
+    name: Re-smoke existing Apple Silicon DMG
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.arm64_artifact_run_id != '' }}
+    runs-on: macos-15
+    timeout-minutes: 10
+    env:
+      POLY_TARGET_ARCH: arm64
+      POLY_TARGET_TRIPLE: aarch64-apple-darwin
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download existing Apple Silicon DMG
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/poly-resmoke-artifact"
+          gh run download "${{ inputs.arm64_artifact_run_id }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --name Poly-macos-arm64 \
+            --dir "${RUNNER_TEMP}/poly-resmoke-artifact"
+          DMG_PATH="$(find "${RUNNER_TEMP}/poly-resmoke-artifact" -type f -name '*.dmg' -print -quit)"
+          test -n "${DMG_PATH}"
+          printf 'DMG_PATH=%s\n' "${DMG_PATH}" >>"${GITHUB_ENV}"
+
+      - name: Re-smoke installed DMG with explicit phases
+        run: |
+          set -euo pipefail
+          SMOKE_ROOT="$(mktemp -d "${RUNNER_TEMP}/poly-resmoke.XXXXXXXX")"
+          SMOKE_HOME="${SMOKE_ROOT}/home"
+          SMOKE_APPLICATIONS="${SMOKE_ROOT}/Applications"
+          MOUNT_POINT="${SMOKE_ROOT}/mounted-dmg"
+          INSTALLED_APP="${SMOKE_APPLICATIONS}/Poly.app"
+          RUNTIME_ROOT="${INSTALLED_APP}/Contents/Resources/poly-runtime"
+          mounted=0
+
+          cleanup() {
+            set +e
+            /usr/bin/osascript -e 'tell application id "com.poly.desktop" to quit' >/dev/null 2>&1
+            if [[ "${mounted}" -eq 1 ]]; then
+              /usr/bin/hdiutil detach "${MOUNT_POINT}" -force >/dev/null 2>&1
+            fi
+          }
+          fail_smoke() {
+            printf 're-smoke failed: %s\n' "$1" >&2
+            return 1
+          }
+          enumerate_runtime() {
+            local output
+            if ! output="$(packaging/macos/verify-bundle.sh --enumerate-runtime "${RUNTIME_ROOT}/")"; then
+              fail_smoke 'runtime process enumeration failed'
+              return 1
+            fi
+            printf '%s' "${output}"
+          }
+          app_count() {
+            /usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")'
+          }
+          wait_for_listener() {
+            local attempt listener_found pid runtime_pids
+            for ((attempt = 1; attempt <= 60; attempt++)); do
+              runtime_pids="$(enumerate_runtime)"
+              listener_found=0
+              while IFS= read -r pid; do
+                [[ -n "${pid}" ]] || continue
+                if /usr/sbin/lsof -nP -a -p "${pid}" -iTCP -sTCP:LISTEN | /usr/bin/grep -q 'TCP 127.0.0.1:'; then
+                  listener_found=1
+                  break
+                fi
+              done <<<"${runtime_pids}"
+              if [[ "${listener_found}" -eq 1 ]]; then
+                return 0
+              fi
+              /bin/sleep 1
+            done
+            fail_smoke 'no owned loopback listener appeared within 60 seconds'
+          }
+          wait_for_shutdown() {
+            local attempt count remaining
+            for ((attempt = 1; attempt <= 30; attempt++)); do
+              remaining="$(enumerate_runtime)"
+              count="$(app_count)"
+              if [[ -z "${remaining}" && "${count}" -eq 0 ]]; then
+                return 0
+              fi
+              /bin/sleep 1
+            done
+            fail_smoke "shutdown left runtime PIDs or app processes: runtime=${remaining:-none} app_count=${count:-unknown}"
+          }
+          trap cleanup EXIT INT TERM
+
+          mkdir -p "${SMOKE_HOME}/Library/Application Support" "${SMOKE_HOME}/Library/Caches"
+          mkdir -p "${SMOKE_APPLICATIONS}" "${MOUNT_POINT}"
+          chmod 700 "${SMOKE_HOME}" "${SMOKE_APPLICATIONS}"
+          /usr/bin/hdiutil attach "${DMG_PATH}" -mountpoint "${MOUNT_POINT}" -nobrowse -readonly
+          mounted=1
+          SOURCE_APP="$(/usr/bin/find "${MOUNT_POINT}" -maxdepth 1 -type d -name 'Poly.app' -print -quit)"
+          test -n "${SOURCE_APP}"
+          /usr/bin/ditto "${SOURCE_APP}" "${INSTALLED_APP}"
+          /usr/bin/hdiutil detach "${MOUNT_POINT}"
+          mounted=0
+          export HOME="${SMOKE_HOME}"
+
+          count="$(app_count)"
+          [[ "${count}" -eq 0 ]] || fail_smoke "expected no running app before launch, found ${count}"
+          /usr/bin/open -n "${INSTALLED_APP}"
+          wait_for_listener
+          printf 're-smoke phase: listener ready\n'
+
+          /usr/bin/osascript -e 'tell application id "com.poly.desktop" to quit'
+          wait_for_shutdown
+          printf 're-smoke phase: first shutdown complete\n'
+
+          /usr/bin/open -n "${INSTALLED_APP}"
+          /bin/sleep 2
+          /usr/bin/open -n "${INSTALLED_APP}"
+          /bin/sleep 3
+          count="$(app_count)"
+          [[ "${count}" -eq 1 ]] || fail_smoke "single-instance check expected 1 app process, found ${count}"
+          printf 're-smoke phase: single instance confirmed\n'
+
+          /usr/bin/osascript -e 'tell application id "com.poly.desktop" to quit'
+          wait_for_shutdown
+          printf 're-smoke phase: final shutdown complete\n'

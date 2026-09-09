@@ -21,7 +21,10 @@ def test_release_runtime_bakes_the_expected_apple_team_identity() -> None:
 
 def test_workflow_is_read_only_and_uses_the_exact_native_matrix() -> None:
     workflow = read(WORKFLOW)
-    assert re.search(r"(?m)^permissions:\s*\n\s+contents: read\s*$", workflow)
+    assert re.search(
+        r"(?m)^permissions:\s*\n\s+actions: read\s*\n\s+contents: read\s*$",
+        workflow,
+    )
     for runner, target, architecture, artifact in (
         ("macos-15", "aarch64-apple-darwin", "arm64", "Poly-macos-arm64"),
         (
@@ -156,7 +159,12 @@ def test_workflow_has_the_required_ordered_locked_pipeline() -> None:
         assert version_comment == expected_version
         observed_counts[owner] = observed_counts.get(owner, 0) + 1
     assert observed_counts == {
-        **{owner: 1 for owner in action_pins if owner != "actions/upload-artifact"},
+        **{
+            owner: 1
+            for owner in action_pins
+            if owner not in {"actions/checkout", "actions/upload-artifact"}
+        },
+        "actions/checkout": 2,
         "actions/upload-artifact": 2,
     }
 
@@ -300,6 +308,21 @@ def test_validation_dmg_upload_survives_smoke_failure() -> None:
         "if: ${{ !cancelled() && (success() || env.IS_RELEASE != 'true') }}"
         in upload_header
     )
+
+
+def test_workflow_can_quickly_resmoke_an_existing_arm64_artifact() -> None:
+    workflow = read(WORKFLOW)
+
+    assert "arm64_artifact_run_id:" in workflow
+    assert "resmoke-arm64-artifact:" in workflow
+    assert 'gh run download "${{ inputs.arm64_artifact_run_id }}"' in workflow
+    for phase in (
+        "listener ready",
+        "first shutdown complete",
+        "single instance confirmed",
+        "final shutdown complete",
+    ):
+        assert phase in workflow
 
 
 def test_smoke_restores_trimmed_keychain_paths_or_fails_closed() -> None:
