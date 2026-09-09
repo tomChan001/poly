@@ -472,9 +472,12 @@ jobs:
           MOUNT_POINT="${SMOKE_ROOT}/mounted-dmg"
           INSTALLED_APP="${SMOKE_APPLICATIONS}/Poly.app"
           RUNTIME_ROOT="${INSTALLED_APP}/Contents/Resources/poly-runtime"
+          RUNTIME_EXECUTABLE="${RUNTIME_ROOT}/poly-runtime"
+          RUNTIME_ORIGINAL="${RUNTIME_ROOT}/poly-runtime.real"
           APP_EXECUTABLE="${INSTALLED_APP}/Contents/MacOS/Poly"
           APP_STDOUT="${SMOKE_ROOT}/app.stdout.log"
           APP_STDERR="${SMOKE_ROOT}/app.stderr.log"
+          RUNTIME_PROTOCOL_LOG="${SMOKE_HOME}/runtime.protocol.log"
           mounted=0
           app_pid=''
           runtime_pids_seen=''
@@ -495,6 +498,7 @@ jobs:
             for log_file in \
               "${APP_STDOUT}" \
               "${APP_STDERR}" \
+              "${RUNTIME_PROTOCOL_LOG}" \
               "${SMOKE_HOME}/Library/Application Support/Poly/logs/runtime.stderr.log" \
               "${SMOKE_HOME}/Library/Application Support/Poly/logs/runtime.stderr.log.1"; do
               [[ -f "${log_file}" ]] || continue
@@ -577,6 +581,22 @@ jobs:
             app_pid=$!
             runtime_pids_seen=''
           }
+          install_runtime_trace_wrapper() {
+            /bin/mv "${RUNTIME_EXECUTABLE}" "${RUNTIME_ORIGINAL}"
+            /bin/cat >"${RUNTIME_EXECUTABLE}" <<'TRACE_WRAPPER'
+          #!/bin/bash
+          set -euo pipefail
+          runtime_directory="$(cd -- "$(dirname -- "$0")" && pwd -P)"
+          exec "${runtime_directory}/poly-runtime.real" > >(/usr/bin/tee -a "${HOME}/runtime.protocol.log")
+          TRACE_WRAPPER
+            /bin/chmod 755 "${RUNTIME_EXECUTABLE}"
+            /usr/bin/codesign --force --deep --sign - "${INSTALLED_APP}"
+          }
+          restore_runtime_executable() {
+            /bin/rm -f "${RUNTIME_EXECUTABLE}"
+            /bin/mv "${RUNTIME_ORIGINAL}" "${RUNTIME_EXECUTABLE}"
+            /usr/bin/codesign --force --deep --sign - "${INSTALLED_APP}"
+          }
           trap finish EXIT
           trap 'exit 130' INT TERM
 
@@ -593,6 +613,8 @@ jobs:
           export HOME="${SMOKE_HOME}"
           : >"${APP_STDOUT}"
           : >"${APP_STDERR}"
+          : >"${RUNTIME_PROTOCOL_LOG}"
+          install_runtime_trace_wrapper
 
           count="$(app_count)"
           [[ "${count}" -eq 0 ]] || fail_smoke "expected no running app before launch, found ${count}"
@@ -603,6 +625,9 @@ jobs:
           /usr/bin/osascript -e 'tell application id "com.poly.desktop" to quit'
           wait_for_shutdown
           printf 're-smoke phase: first shutdown complete\n'
+          printf '%s\n' '--- captured runtime protocol ---'
+          /usr/bin/tail -n 200 "${RUNTIME_PROTOCOL_LOG}"
+          restore_runtime_executable
 
           launch_app
           wait_for_listener
