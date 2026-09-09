@@ -195,14 +195,18 @@ def self_test(
         (root / "migrations" / "env.py", root / "migrations"),
         (root / "expected-parent-team-id", root),
     ]
+    postgres_library_root = root / "postgres" / "lib"
+    required_files.extend(
+        (postgres_library_root / name, postgres_library_root)
+        for name in ("libpq.5.dylib", "plpgsql.dylib", "dict_snowball.dylib")
+    )
     postgres_bin = root / "postgres" / "bin"
     required_executables = [
         (postgres_bin / name, postgres_bin)
         for name in ("initdb", "postgres", "pg_isready", "psql", "createdb")
     ]
-    library_root = root / "postgres" / "lib"
     try:
-        shared_libraries = list(library_root.rglob("*.dylib"))
+        shared_libraries = list(postgres_library_root.rglob("*.dylib"))
     except OSError:
         shared_libraries = []
     if (
@@ -216,7 +220,8 @@ def self_test(
         )
         or not shared_libraries
         or any(
-            not _is_safe_packaged_file(path, library_root) for path in shared_libraries
+            not _is_safe_packaged_file(path, postgres_library_root)
+            for path in shared_libraries
         )
     ):
         return _failure("resource_missing", "required packaged resource is unavailable")

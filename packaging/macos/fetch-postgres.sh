@@ -143,8 +143,11 @@ while IFS= read -r -d '' library; do
   # so the packaged-runtime safety check sees only self-contained regular files.
   cp -L -- "${library}" "${STAGED}/lib/"
 done <"${BUILD_TEMP}/libpq-files"
-[[ -f "${INSTALL_PREFIX}/lib/plpgsql.dylib" ]] || die "required PL/pgSQL extension library is missing"
-cp -- "${INSTALL_PREFIX}/lib/plpgsql.dylib" "${STAGED}/lib/plpgsql.dylib"
+for module in plpgsql.dylib dict_snowball.dylib; do
+  [[ -f "${INSTALL_PREFIX}/lib/${module}" ]] ||
+    die "required PostgreSQL bootstrap library is missing: ${module}"
+  cp -- "${INSTALL_PREFIX}/lib/${module}" "${STAGED}/lib/${module}"
+done
 cp -R -- "${INSTALL_PREFIX}/share/." "${STAGED}/share/"
 cp -- "${SOURCE_DIR}/COPYRIGHT" "${STAGED}/COPYRIGHT"
 

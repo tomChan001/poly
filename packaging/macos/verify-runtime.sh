@@ -42,6 +42,11 @@ for program in initdb postgres pg_isready psql createdb; do
   [[ -x "${postgres_executable}" ]] ||
     die "required PostgreSQL program is missing or not executable: ${postgres_executable}"
 done
+for library in libpq.5.dylib plpgsql.dylib dict_snowball.dylib; do
+  postgres_library="${RUNTIME_RESOURCE_ROOT}/postgres/lib/${library}"
+  [[ -f "${postgres_library}" ]] ||
+    die "required PostgreSQL library is missing: ${postgres_library}"
+done
 
 "${RUNTIME_EXECUTABLE}" --self-test
 file "${RUNTIME_EXECUTABLE}"

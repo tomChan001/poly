@@ -148,9 +148,16 @@ class DistributionContractTests(unittest.TestCase):
         self.assertIn('BUILD_TEMP="$(cd -- "${BUILD_TEMP}" && pwd -P)"', script)
         self.assertNotIn('cp -R -- "${INSTALL_PREFIX}/lib/postgresql"', script)
         self.assertIn("plpgsql.dylib", script)
+        self.assertIn("dict_snowball.dylib", script)
         self.assertNotIn('/lib/postgresql/', script)
         self.assertIn('install_name_tool -id "@loader_path/', script)
         self.assertNotIn('install_name_tool -id "@rpath/', script)
+
+    def test_runtime_verifier_requires_postgres_bootstrap_libraries(self) -> None:
+        verifier = self.read("verify-runtime.sh")
+
+        for library in ("libpq.5.dylib", "plpgsql.dylib", "dict_snowball.dylib"):
+            self.assertIn(library, verifier)
 
     def test_fetch_dereferences_libpq_links_before_packaging(self) -> None:
         script = self.read("fetch-postgres.sh")

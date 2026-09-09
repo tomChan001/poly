@@ -50,6 +50,8 @@ def populate_self_test_layout(root: Path) -> dict[str, Path]:
         "psql": root / "postgres" / "bin" / "psql",
         "createdb": root / "postgres" / "bin" / "createdb",
         "library": root / "postgres" / "lib" / "libpq.5.dylib",
+        "plpgsql": root / "postgres" / "lib" / "plpgsql.dylib",
+        "dict_snowball": root / "postgres" / "lib" / "dict_snowball.dylib",
     }
     for path in paths.values():
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1390,6 +1392,23 @@ def test_self_test_requires_a_postgres_shared_library(tmp_path: Path) -> None:
     event = desktop_main.self_test(project_root=tmp_path, temp_root=tmp_path)
 
     assert event.fields["code"] == "resource_missing"
+
+
+@pytest.mark.parametrize(
+    "library", ["libpq.5.dylib", "plpgsql.dylib", "dict_snowball.dylib"]
+)
+def test_self_test_requires_each_postgres_runtime_library(
+    tmp_path: Path, library: str
+) -> None:
+    populate_self_test_layout(tmp_path)
+    (tmp_path / "postgres" / "lib" / library).unlink()
+
+    event = desktop_main.self_test(project_root=tmp_path, temp_root=tmp_path)
+
+    assert event.fields == {
+        "code": "resource_missing",
+        "detail": "required packaged resource is unavailable",
+    }
 
 
 @pytest.mark.parametrize("resource", ["postgres", "library"])
