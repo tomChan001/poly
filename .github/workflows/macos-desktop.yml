@@ -474,6 +474,7 @@ jobs:
           RUNTIME_ROOT="${INSTALLED_APP}/Contents/Resources/poly-runtime"
           RUNTIME_EXECUTABLE="${RUNTIME_ROOT}/poly-runtime"
           RUNTIME_ORIGINAL="${RUNTIME_ROOT}/poly-runtime.real"
+          POSTGRES_BIN="${RUNTIME_ROOT}/_internal/postgres/bin"
           APP_EXECUTABLE="${INSTALLED_APP}/Contents/MacOS/Poly"
           APP_STDOUT="${SMOKE_ROOT}/app.stdout.log"
           APP_STDERR="${SMOKE_ROOT}/app.stderr.log"
@@ -505,9 +506,21 @@ jobs:
               printf '%s\n' "--- ${log_file} (last 200 lines) ---" >&2
               /usr/bin/tail -n 200 "${log_file}" >&2 || true
             done
+            if /usr/bin/grep -q '"code":"database_unavailable"' "${RUNTIME_PROTOCOL_LOG}"; then
+              printf '%s\n' '--- postgres initdb probe ---' >&2
+              "${POSTGRES_BIN}/initdb" \
+                --pgdata "${SMOKE_ROOT}/postgres-probe-data" \
+                --username poly \
+                --encoding UTF8 \
+                --auth-local trust \
+                --auth-host reject \
+                --no-instructions >&2
+              printf 'postgres initdb probe exit code: %s\n' "$?" >&2
+            fi
           }
           finish() {
             local status=$?
+            set +e
             trap - EXIT
             if [[ "${status}" -ne 0 ]]; then
               dump_diagnostics

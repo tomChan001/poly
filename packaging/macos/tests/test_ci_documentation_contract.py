@@ -297,6 +297,8 @@ def test_fast_resmoke_launches_directly_and_captures_failure_diagnostics() -> No
     assert "/usr/bin/xcrun clang" in smoke
     assert "execv(runtime_path, argv)" in smoke
     assert "runtime reported a terminal failure before listener" in smoke
+    assert "postgres initdb probe" in smoke
+    assert '"${POSTGRES_BIN}/initdb"' in smoke
     assert "restore_runtime_executable" in smoke
     assert smoke.count('/usr/bin/codesign --force --deep --sign - "${INSTALLED_APP}"') == 2
     assert '/usr/bin/open -n "${INSTALLED_APP}"' not in smoke
