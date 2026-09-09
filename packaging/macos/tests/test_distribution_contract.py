@@ -850,7 +850,7 @@ class DistributionContractTests(unittest.TestCase):
                 "[[ \"$*\" == *'pid=,ppid=,args='* ]] || exit 91\n"
                 "printf ' 4242 1 /bin/bash verify-bundle.sh --enumerate-runtime /tmp/poly-runtime/\\n'",
             )
-            write_stub(stubs, "lsof", "printf 'p4242\\nn/usr/bin/bash\\n'")
+            write_stub(stubs, "lsof", "printf 'p4242\\nn/bin/sh\\n'")
             env = os.environ.copy()
             env["PATH"] = f"{git_bash_path(stubs)}:/usr/bin:/bin"
             env["POLY_TEST_PS"] = git_bash_path(stubs / "ps")
