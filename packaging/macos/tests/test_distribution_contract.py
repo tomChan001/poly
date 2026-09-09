@@ -914,6 +914,10 @@ class DistributionContractTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.splitlines(), ["4242"])
+            verifier = self.read("verify-bundle.sh")
+            self.assertIn("candidate_pids", verifier)
+            self.assertNotIn('grep -qx "${pid}"', verifier)
+            self.assertNotIn('grep -qx "${ppid}"', verifier)
 
     def test_runtime_enumeration_can_start_from_a_known_app_pid(self) -> None:
         bash = bash_executable()

@@ -77,9 +77,9 @@ enumerate_process_paths() {
   local output_file="$1"
   local seed_pid="$2"
   shift 2
-  local record pid ppid arguments added candidate_prefix matched
+  local candidate_pids="${VERIFY_TEMP}/candidate-pids"
+  local record pid ppid arguments candidate_prefix matched
   : >"${output_file}"
-  : >"${VERIFY_TEMP}/candidate-pids"
   : >"${VERIFY_TEMP}/process-tree"
   if ! "${PS_BIN}" -ww -axo pid=,ppid=,args= >"${VERIFY_TEMP}/ps-processes"; then
     die "process enumeration failed: ps -ww could not list processes"
@@ -89,7 +89,6 @@ enumerate_process_paths() {
     pid="${BASH_REMATCH[1]}"
     ppid="${BASH_REMATCH[2]}"
     arguments="${BASH_REMATCH[3]}"
-    printf '%s\t%s\t%s\n' "${pid}" "${ppid}" "${arguments}" >>"${VERIFY_TEMP}/process-tree"
     matched=0
     if [[ -n "${seed_pid}" ]]; then
       [[ "${pid}" == "${seed_pid}" ]] && matched=1
@@ -100,31 +99,45 @@ enumerate_process_paths() {
         esac
       done
     fi
-    [[ "${matched}" -eq 1 ]] || continue
-    printf '%s\n' "${pid}" >>"${VERIFY_TEMP}/candidate-pids"
+    printf '%s\t%s\t%s\n' "${pid}" "${ppid}" "${matched}" >>"${VERIFY_TEMP}/process-tree"
   done <"${VERIFY_TEMP}/ps-processes"
 
   # PostgreSQL workers can replace argv after launch. Expand the bounded process
   # snapshot through parent-child relationships, then verify each candidate's
-  # exact executable path below. This avoids recursively walking the runtime tree.
-  added=1
-  while [[ "${added}" -eq 1 ]]; do
-    added=0
-    while IFS=$'\t' read -r pid ppid arguments; do
-      grep -qx "${pid}" "${VERIFY_TEMP}/candidate-pids" && continue
-      if grep -qx "${ppid}" "${VERIFY_TEMP}/candidate-pids"; then
-        printf '%s\n' "${pid}" >>"${VERIFY_TEMP}/candidate-pids"
-        added=1
-      fi
-    done <"${VERIFY_TEMP}/process-tree"
-  done
+  # exact executable path below. Resolve the snapshot in one awk process so a
+  # poll does not spawn two grep processes for every system process.
+  if ! awk -F '\t' '
+    {
+      count += 1
+      pid[count] = $1
+      ppid[count] = $2
+      if ($3 == 1) candidate[$1] = 1
+    }
+    END {
+      changed = 1
+      while (changed == 1) {
+        changed = 0
+        for (i = 1; i <= count; i += 1) {
+          if (!(pid[i] in candidate) && (ppid[i] in candidate)) {
+            candidate[pid[i]] = 1
+            changed = 1
+          }
+        }
+      }
+      for (i = 1; i <= count; i += 1) {
+        if (pid[i] in candidate) print pid[i]
+      }
+    }
+  ' "${VERIFY_TEMP}/process-tree" >"${candidate_pids}"; then
+    die "process enumeration failed while resolving the bounded process tree"
+  fi
 
   while IFS= read -r pid; do
     [[ -n "${pid}" ]] || continue
     if process_executable "${pid}"; then
       printf '%s\t%s\n' "${pid}" "${PROCESS_EXECUTABLE}" >>"${output_file}"
     fi
-  done <"${VERIFY_TEMP}/candidate-pids"
+  done <"${candidate_pids}"
 }
 
 pids_at_exact_executable() {
