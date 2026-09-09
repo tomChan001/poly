@@ -74,9 +74,9 @@ process_executable() {
 }
 
 enumerate_process_paths() {
-  local candidate_prefix="$1"
-  local output_file="$2"
-  local record pid ppid arguments added
+  local output_file="$1"
+  shift
+  local record pid ppid arguments added candidate_prefix matched
   : >"${output_file}"
   : >"${VERIFY_TEMP}/candidate-pids"
   : >"${VERIFY_TEMP}/process-tree"
@@ -89,10 +89,13 @@ enumerate_process_paths() {
     ppid="${BASH_REMATCH[2]}"
     arguments="${BASH_REMATCH[3]}"
     printf '%s\t%s\t%s\n' "${pid}" "${ppid}" "${arguments}" >>"${VERIFY_TEMP}/process-tree"
-    case "${arguments}" in
-      *"${candidate_prefix}"*) ;;
-      *) continue ;;
-    esac
+    matched=0
+    for candidate_prefix in "$@"; do
+      case "${arguments}" in
+        *"${candidate_prefix}"*) matched=1 ;;
+      esac
+    done
+    [[ "${matched}" -eq 1 ]] || continue
     printf '%s\n' "${pid}" >>"${VERIFY_TEMP}/candidate-pids"
   done <"${VERIFY_TEMP}/ps-processes"
 
@@ -123,7 +126,7 @@ pids_at_exact_executable() {
   local wanted="$1"
   local scan_file="${VERIFY_TEMP}/exact-processes"
   local pid executable
-  enumerate_process_paths "${wanted}" "${scan_file}"
+  enumerate_process_paths "${scan_file}" "${wanted}"
   while IFS=$'\t' read -r pid executable; do
     [[ "${executable}" == "${wanted}" ]] && printf '%s\n' "${pid}"
   done <"${scan_file}"
@@ -132,9 +135,14 @@ pids_at_exact_executable() {
 
 pids_under_path() {
   local prefix="$1"
+  local app_executable="${2:-}"
   local scan_file="${VERIFY_TEMP}/runtime-processes"
   local pid executable
-  enumerate_process_paths "${prefix}" "${scan_file}"
+  if [[ -n "${app_executable}" ]]; then
+    enumerate_process_paths "${scan_file}" "${prefix}" "${app_executable}"
+  else
+    enumerate_process_paths "${scan_file}" "${prefix}"
+  fi
   while IFS=$'\t' read -r pid executable; do
     [[ "${executable}" == "${prefix}"* ]] && printf '%s\n' "${pid}"
   done <"${scan_file}"
@@ -187,19 +195,22 @@ audit_runtime_listeners() {
 }
 
 if [[ "${1:-}" == "--check" ]]; then
-  [[ "$#" -eq 1 ]] || die "usage: $0 --check | --enumerate-runtime /absolute/runtime/ | /absolute/path/to/Poly.app"
+  [[ "$#" -eq 1 ]] || die "usage: $0 --check | --enumerate-runtime /absolute/runtime/ [/absolute/app-executable] | /absolute/path/to/Poly.app"
   printf 'Bundle verifier static contract is available; signed launch verification requires macOS.\n'
   exit 0
 fi
 
 if [[ "${1:-}" == "--enumerate-runtime" ]]; then
-  [[ "$#" -eq 2 && "$2" == /*/ ]] || die "usage: $0 --enumerate-runtime /absolute/runtime/"
+  [[ ( "$#" -eq 2 || "$#" -eq 3 ) && "$2" == /*/ ]] ||
+    die "usage: $0 --enumerate-runtime /absolute/runtime/ [/absolute/app-executable]"
+  [[ "$#" -eq 2 || "$3" == /* ]] ||
+    die "usage: $0 --enumerate-runtime /absolute/runtime/ [/absolute/app-executable]"
   # Fault-injection overrides are accepted only by this non-launching test mode.
   PS_BIN="${POLY_TEST_PS:-ps}"
   LSOF_BIN="${POLY_TEST_LSOF:-lsof}"
   VERIFY_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/poly-bundle-processes.XXXXXXXX")"
   trap cleanup_temp EXIT INT TERM
-  pids_under_path "$2"
+  pids_under_path "$2" "${3:-}"
   exit 0
 fi
 
@@ -341,8 +352,9 @@ collect_pids() {
   local selector="$1"
   local path="$2"
   local pid
+  shift 2
   COLLECTED_PIDS=()
-  if ! "${selector}" "${path}" >"${VERIFY_TEMP}/selected-pids"; then
+  if ! "${selector}" "${path}" "$@" >"${VERIFY_TEMP}/selected-pids"; then
     die "process enumeration failed for ${path}"
   fi
   while IFS= read -r pid; do
@@ -352,7 +364,7 @@ collect_pids() {
 
 collect_pids pids_at_exact_executable "${APP_EXECUTABLE}"
 existing_app=("${COLLECTED_PIDS[@]}")
-collect_pids pids_under_path "${RUNTIME_ROOT}/"
+collect_pids pids_under_path "${RUNTIME_ROOT}/" "${APP_EXECUTABLE}"
 existing_runtime=("${COLLECTED_PIDS[@]}")
 if [[ "${#existing_app[@]}" -ne 0 || "${#existing_runtime[@]}" -ne 0 ]]; then
   die "refusing to mix verification with existing bundle processes"
@@ -375,7 +387,7 @@ ready=0
 for ((attempt = 0; attempt < 60; attempt++)); do
   collect_pids pids_at_exact_executable "${APP_EXECUTABLE}"
   app_pids=("${COLLECTED_PIDS[@]}")
-  collect_pids pids_under_path "${RUNTIME_ROOT}/"
+  collect_pids pids_under_path "${RUNTIME_ROOT}/" "${APP_EXECUTABLE}"
   runtime_pids=("${COLLECTED_PIDS[@]}")
   for pid in "${app_pids[@]}" "${runtime_pids[@]}"; do
     [[ -n "${pid}" ]] || continue
@@ -404,7 +416,7 @@ LAUNCHED=0
 for ((attempt = 0; attempt < 30; attempt++)); do
   collect_pids pids_at_exact_executable "${APP_EXECUTABLE}"
   remaining_app=("${COLLECTED_PIDS[@]}")
-  collect_pids pids_under_path "${RUNTIME_ROOT}/"
+  collect_pids pids_under_path "${RUNTIME_ROOT}/" "${APP_EXECUTABLE}"
   remaining_runtime=("${COLLECTED_PIDS[@]}")
   if [[ "${#remaining_app[@]}" -eq 0 && "${#remaining_runtime[@]}" -eq 0 ]]; then
     break
@@ -414,7 +426,7 @@ done
 
 collect_pids pids_at_exact_executable "${APP_EXECUTABLE}"
 remaining_app=("${COLLECTED_PIDS[@]}")
-collect_pids pids_under_path "${RUNTIME_ROOT}/"
+collect_pids pids_under_path "${RUNTIME_ROOT}/" "${APP_EXECUTABLE}"
 remaining_runtime=("${COLLECTED_PIDS[@]}")
 [[ "${#remaining_app[@]}" -eq 0 ]] || die "application process remained after Apple Events quit: ${remaining_app[*]}"
 [[ "${#remaining_runtime[@]}" -eq 0 ]] || die "process remained under exact runtime path: ${remaining_runtime[*]}"

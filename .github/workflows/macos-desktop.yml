@@ -336,7 +336,7 @@ jobs:
           [[ "${app_count}" -eq 0 ]]
           /usr/bin/open -n "${INSTALLED_APP}"
           for ((attempt = 1; attempt <= 60; attempt++)); do
-            runtime_pids="$("${GITHUB_WORKSPACE}/packaging/macos/verify-bundle.sh" --enumerate-runtime "${RUNTIME_ROOT}/")"
+            runtime_pids="$("${GITHUB_WORKSPACE}/packaging/macos/verify-bundle.sh" --enumerate-runtime "${RUNTIME_ROOT}/" "${INSTALLED_APP}/Contents/MacOS/Poly")"
             listener_found=0
             while IFS= read -r pid; do
               [[ -n "${pid}" ]] || continue
@@ -352,7 +352,7 @@ jobs:
 
           /usr/bin/osascript -e 'tell application id "com.poly.desktop" to quit'
           for ((attempt = 1; attempt <= 30; attempt++)); do
-            remaining="$("${GITHUB_WORKSPACE}/packaging/macos/verify-bundle.sh" --enumerate-runtime "${RUNTIME_ROOT}/")"
+            remaining="$("${GITHUB_WORKSPACE}/packaging/macos/verify-bundle.sh" --enumerate-runtime "${RUNTIME_ROOT}/" "${INSTALLED_APP}/Contents/MacOS/Poly")"
             app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
             [[ -z "${remaining}" && "${app_count}" -eq 0 ]] && break
             /bin/sleep 1
@@ -372,7 +372,7 @@ jobs:
 
           /usr/bin/osascript -e 'tell application id "com.poly.desktop" to quit'
           for ((attempt = 1; attempt <= 30; attempt++)); do
-            remaining="$("${GITHUB_WORKSPACE}/packaging/macos/verify-bundle.sh" --enumerate-runtime "${RUNTIME_ROOT}/")"
+            remaining="$("${GITHUB_WORKSPACE}/packaging/macos/verify-bundle.sh" --enumerate-runtime "${RUNTIME_ROOT}/" "${INSTALLED_APP}/Contents/MacOS/Poly")"
             app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
             [[ -z "${remaining}" && "${app_count}" -eq 0 ]] && break
             /bin/sleep 1
@@ -487,7 +487,7 @@ jobs:
           }
           enumerate_runtime() {
             local output
-            if ! output="$(packaging/macos/verify-bundle.sh --enumerate-runtime "${RUNTIME_ROOT}/")"; then
+            if ! output="$(packaging/macos/verify-bundle.sh --enumerate-runtime "${RUNTIME_ROOT}/" "${INSTALLED_APP}/Contents/MacOS/Poly")"; then
               fail_smoke 'runtime process enumeration failed'
               return 1
             fi

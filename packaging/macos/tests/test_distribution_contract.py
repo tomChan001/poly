@@ -864,6 +864,57 @@ class DistributionContractTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "")
 
+    def test_runtime_enumeration_follows_the_verified_app_process_tree(self) -> None:
+        bash = bash_executable()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stubs = root / "stubs"
+            runtime = root / "Poly.app" / "Contents" / "Resources" / "poly-runtime"
+            app_executable = root / "Poly.app" / "Contents" / "MacOS" / "Poly"
+            stubs.mkdir()
+            runtime.mkdir(parents=True)
+            app_executable.parent.mkdir(parents=True)
+            (runtime / "poly-runtime").touch()
+            app_executable.touch()
+            write_stub(
+                stubs,
+                "ps",
+                "[[ \"$*\" == *'pid=,ppid=,args='* ]] || exit 91\n"
+                "printf ' 4100 1 %s\\n' \"${POLY_TEST_APP_EXECUTABLE}\"\n"
+                "printf ' 4242 4100 poly-runtime\\n'",
+            )
+            write_stub(
+                stubs,
+                "lsof",
+                "case \"$*\" in\n"
+                "  *'-p 4100 '*) printf 'p4100\\nn%s\\n' \"${POLY_TEST_APP_EXECUTABLE}\" ;;\n"
+                "  *'-p 4242 '*) printf 'p4242\\nn%s/poly-runtime\\n' \"${POLY_TEST_RUNTIME_ROOT}\" ;;\n"
+                "  *) exit 92 ;;\n"
+                "esac",
+            )
+            env = os.environ.copy()
+            env["PATH"] = f"{git_bash_path(stubs)}:/usr/bin:/bin"
+            env["POLY_TEST_PS"] = git_bash_path(stubs / "ps")
+            env["POLY_TEST_LSOF"] = git_bash_path(stubs / "lsof")
+            env["POLY_TEST_RUNTIME_ROOT"] = git_bash_path(runtime)
+            env["POLY_TEST_APP_EXECUTABLE"] = git_bash_path(app_executable)
+            result = subprocess.run(
+                [
+                    bash,
+                    str(MACOS / "verify-bundle.sh"),
+                    "--enumerate-runtime",
+                    f"{git_bash_path(runtime)}/",
+                    git_bash_path(app_executable),
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["4242"])
+
     def test_runtime_license_classifier_handles_pyinstaller_internal_layout(self) -> None:
         module = load_macos_module("license_inventory")
         with tempfile.TemporaryDirectory() as temporary:
