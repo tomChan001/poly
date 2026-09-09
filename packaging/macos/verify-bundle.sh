@@ -127,6 +127,7 @@ pids_at_exact_executable() {
   while IFS=$'\t' read -r pid executable; do
     [[ "${executable}" == "${wanted}" ]] && printf '%s\n' "${pid}"
   done <"${scan_file}"
+  return 0
 }
 
 pids_under_path() {
@@ -137,6 +138,7 @@ pids_under_path() {
   while IFS=$'\t' read -r pid executable; do
     [[ "${executable}" == "${prefix}"* ]] && printf '%s\n' "${pid}"
   done <"${scan_file}"
+  return 0
 }
 
 PID_LOOPBACK_READY=0
