@@ -293,7 +293,10 @@ def test_fast_resmoke_launches_directly_and_captures_failure_diagnostics() -> No
     assert "re-smoke process snapshot" in smoke
     assert "runtime.stderr.log" in smoke
     assert "runtime.protocol.log" in smoke
-    assert 'poly-runtime.real" > >(/usr/bin/tee' in smoke
+    assert "runtime-protocol-proxy.c" in smoke
+    assert "/usr/bin/xcrun clang" in smoke
+    assert "execv(runtime_path, argv)" in smoke
+    assert "runtime reported a terminal failure before listener" in smoke
     assert "restore_runtime_executable" in smoke
     assert smoke.count('/usr/bin/codesign --force --deep --sign - "${INSTALLED_APP}"') == 2
     assert '/usr/bin/open -n "${INSTALLED_APP}"' not in smoke

@@ -546,6 +546,10 @@ jobs:
               if [[ "${listener_found}" -eq 1 ]]; then
                 return 0
               fi
+              if /usr/bin/grep -q '"state":"failed"' "${RUNTIME_PROTOCOL_LOG}"; then
+                fail_smoke 'runtime reported a terminal failure before listener'
+                return 1
+              fi
               if ! /bin/kill -0 "${app_pid}" 2>/dev/null; then
                 fail_smoke "app exited before its loopback listener was ready (PID ${app_pid})"
                 return 1
@@ -583,13 +587,73 @@ jobs:
           }
           install_runtime_trace_wrapper() {
             /bin/mv "${RUNTIME_EXECUTABLE}" "${RUNTIME_ORIGINAL}"
-            /bin/cat >"${RUNTIME_EXECUTABLE}" <<'TRACE_WRAPPER'
-          #!/bin/bash
-          set -euo pipefail
-          runtime_directory="$(cd -- "$(dirname -- "$0")" && pwd -P)"
-          exec "${runtime_directory}/poly-runtime.real" > >(/usr/bin/tee -a "${HOME}/runtime.protocol.log")
-          TRACE_WRAPPER
-            /bin/chmod 755 "${RUNTIME_EXECUTABLE}"
+            /bin/cat >"${SMOKE_ROOT}/runtime-protocol-proxy.c" <<'TRACE_PROXY'
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <limits.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/types.h>
+          #include <unistd.h>
+
+          static void write_all(int descriptor, const char *buffer, size_t length) {
+            while (length > 0) {
+              ssize_t written = write(descriptor, buffer, length);
+              if (written < 0 && errno == EINTR) continue;
+              if (written <= 0) return;
+              buffer += written;
+              length -= (size_t)written;
+            }
+          }
+
+          int main(int argc, char **argv) {
+            char runtime_path[PATH_MAX];
+            char log_path[PATH_MAX];
+            if (argc < 1 || argv[0] == NULL) return 111;
+            const char *home = getenv("HOME");
+            const char *slash = strrchr(argv[0], '/');
+            if (home == NULL || slash == NULL) return 111;
+            size_t directory_length = (size_t)(slash - argv[0]);
+            if (directory_length + sizeof("/poly-runtime.real") > sizeof(runtime_path)) return 112;
+            memcpy(runtime_path, argv[0], directory_length);
+            strcpy(runtime_path + directory_length, "/poly-runtime.real");
+            if (snprintf(log_path, sizeof(log_path), "%s/runtime.protocol.log", home) >= (int)sizeof(log_path)) return 113;
+
+            int stream[2];
+            if (pipe(stream) != 0) return 114;
+            int original_stdout = dup(STDOUT_FILENO);
+            if (original_stdout < 0) return 115;
+            pid_t proxy_pid = fork();
+            if (proxy_pid < 0) return 116;
+            if (proxy_pid == 0) {
+              close(stream[1]);
+              int log = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+              if (log < 0) return 117;
+              char buffer[4096];
+              ssize_t count;
+              while ((count = read(stream[0], buffer, sizeof(buffer))) > 0) {
+                write_all(log, buffer, (size_t)count);
+                write_all(original_stdout, buffer, (size_t)count);
+              }
+              close(log);
+              close(original_stdout);
+              close(stream[0]);
+              return 0;
+            }
+
+            close(stream[0]);
+            if (dup2(stream[1], STDOUT_FILENO) < 0) return 118;
+            close(stream[1]);
+            close(original_stdout);
+            argv[0] = runtime_path;
+            execv(runtime_path, argv);
+            perror("runtime protocol proxy execv");
+            return 127;
+          }
+          TRACE_PROXY
+            /usr/bin/xcrun clang -std=c11 -Os -Wall -Wextra -Werror \
+              "${SMOKE_ROOT}/runtime-protocol-proxy.c" -o "${RUNTIME_EXECUTABLE}"
             /usr/bin/codesign --force --deep --sign - "${INSTALLED_APP}"
           }
           restore_runtime_executable() {
