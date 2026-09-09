@@ -75,7 +75,8 @@ process_executable() {
 
 enumerate_process_paths() {
   local output_file="$1"
-  shift
+  local seed_pid="$2"
+  shift 2
   local record pid ppid arguments added candidate_prefix matched
   : >"${output_file}"
   : >"${VERIFY_TEMP}/candidate-pids"
@@ -90,11 +91,15 @@ enumerate_process_paths() {
     arguments="${BASH_REMATCH[3]}"
     printf '%s\t%s\t%s\n' "${pid}" "${ppid}" "${arguments}" >>"${VERIFY_TEMP}/process-tree"
     matched=0
-    for candidate_prefix in "$@"; do
-      case "${arguments}" in
-        *"${candidate_prefix}"*) matched=1 ;;
-      esac
-    done
+    if [[ -n "${seed_pid}" ]]; then
+      [[ "${pid}" == "${seed_pid}" ]] && matched=1
+    else
+      for candidate_prefix in "$@"; do
+        case "${arguments}" in
+          *"${candidate_prefix}"*) matched=1 ;;
+        esac
+      done
+    fi
     [[ "${matched}" -eq 1 ]] || continue
     printf '%s\n' "${pid}" >>"${VERIFY_TEMP}/candidate-pids"
   done <"${VERIFY_TEMP}/ps-processes"
@@ -126,7 +131,7 @@ pids_at_exact_executable() {
   local wanted="$1"
   local scan_file="${VERIFY_TEMP}/exact-processes"
   local pid executable
-  enumerate_process_paths "${scan_file}" "${wanted}"
+  enumerate_process_paths "${scan_file}" "" "${wanted}"
   while IFS=$'\t' read -r pid executable; do
     [[ "${executable}" == "${wanted}" ]] && printf '%s\n' "${pid}"
   done <"${scan_file}"
@@ -139,10 +144,22 @@ pids_under_path() {
   local scan_file="${VERIFY_TEMP}/runtime-processes"
   local pid executable
   if [[ -n "${app_executable}" ]]; then
-    enumerate_process_paths "${scan_file}" "${prefix}" "${app_executable}"
+    enumerate_process_paths "${scan_file}" "" "${prefix}" "${app_executable}"
   else
-    enumerate_process_paths "${scan_file}" "${prefix}"
+    enumerate_process_paths "${scan_file}" "" "${prefix}"
   fi
+  while IFS=$'\t' read -r pid executable; do
+    [[ "${executable}" == "${prefix}"* ]] && printf '%s\n' "${pid}"
+  done <"${scan_file}"
+  return 0
+}
+
+pids_under_path_from_pid() {
+  local prefix="$1"
+  local root_pid="$2"
+  local scan_file="${VERIFY_TEMP}/runtime-processes"
+  local pid executable
+  enumerate_process_paths "${scan_file}" "${root_pid}"
   while IFS=$'\t' read -r pid executable; do
     [[ "${executable}" == "${prefix}"* ]] && printf '%s\n' "${pid}"
   done <"${scan_file}"
@@ -195,8 +212,20 @@ audit_runtime_listeners() {
 }
 
 if [[ "${1:-}" == "--check" ]]; then
-  [[ "$#" -eq 1 ]] || die "usage: $0 --check | --enumerate-runtime /absolute/runtime/ [/absolute/app-executable] | /absolute/path/to/Poly.app"
+  [[ "$#" -eq 1 ]] || die "usage: $0 --check | --enumerate-runtime /absolute/runtime/ [/absolute/app-executable] | --enumerate-runtime-from-pid /absolute/runtime/ PID | /absolute/path/to/Poly.app"
   printf 'Bundle verifier static contract is available; signed launch verification requires macOS.\n'
+  exit 0
+fi
+
+if [[ "${1:-}" == "--enumerate-runtime-from-pid" ]]; then
+  [[ "$#" -eq 3 && "$2" == /*/ && "$3" =~ ^[0-9]+$ ]] ||
+    die "usage: $0 --enumerate-runtime-from-pid /absolute/runtime/ PID"
+  # Fault-injection overrides are accepted only by this non-launching test mode.
+  PS_BIN="${POLY_TEST_PS:-ps}"
+  LSOF_BIN="${POLY_TEST_LSOF:-lsof}"
+  VERIFY_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/poly-bundle-processes.XXXXXXXX")"
+  trap cleanup_temp EXIT INT TERM
+  pids_under_path_from_pid "$2" "$3"
   exit 0
 fi
 

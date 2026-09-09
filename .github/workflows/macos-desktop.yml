@@ -472,7 +472,12 @@ jobs:
           MOUNT_POINT="${SMOKE_ROOT}/mounted-dmg"
           INSTALLED_APP="${SMOKE_APPLICATIONS}/Poly.app"
           RUNTIME_ROOT="${INSTALLED_APP}/Contents/Resources/poly-runtime"
+          APP_EXECUTABLE="${INSTALLED_APP}/Contents/MacOS/Poly"
+          APP_STDOUT="${SMOKE_ROOT}/app.stdout.log"
+          APP_STDERR="${SMOKE_ROOT}/app.stderr.log"
           mounted=0
+          app_pid=''
+          runtime_pids_seen=''
 
           cleanup() {
             set +e
@@ -481,13 +486,38 @@ jobs:
               /usr/bin/hdiutil detach "${MOUNT_POINT}" -force >/dev/null 2>&1
             fi
           }
+          dump_diagnostics() {
+            local log_file
+            printf '%s\n' '--- re-smoke process snapshot ---' >&2
+            /bin/ps -ww -axo pid=,ppid=,state=,etime=,args= >&2 || true
+            printf '%s\n' '--- re-smoke files under isolated home ---' >&2
+            /usr/bin/find "${SMOKE_HOME}" -type f -maxdepth 10 -print >&2 || true
+            for log_file in \
+              "${APP_STDOUT}" \
+              "${APP_STDERR}" \
+              "${SMOKE_HOME}/Library/Application Support/Poly/logs/runtime.stderr.log" \
+              "${SMOKE_HOME}/Library/Application Support/Poly/logs/runtime.stderr.log.1"; do
+              [[ -f "${log_file}" ]] || continue
+              printf '%s\n' "--- ${log_file} (last 200 lines) ---" >&2
+              /usr/bin/tail -n 200 "${log_file}" >&2 || true
+            done
+          }
+          finish() {
+            local status=$?
+            trap - EXIT
+            if [[ "${status}" -ne 0 ]]; then
+              dump_diagnostics
+            fi
+            cleanup
+            exit "${status}"
+          }
           fail_smoke() {
             printf 're-smoke failed: %s\n' "$1" >&2
             return 1
           }
           enumerate_runtime() {
-            local output
-            if ! output="$(packaging/macos/verify-bundle.sh --enumerate-runtime "${RUNTIME_ROOT}/" "${INSTALLED_APP}/Contents/MacOS/Poly")"; then
+            local output root_pid="$1"
+            if ! output="$(packaging/macos/verify-bundle.sh --enumerate-runtime-from-pid "${RUNTIME_ROOT}/" "${root_pid}")"; then
               fail_smoke 'runtime process enumeration failed'
               return 1
             fi
@@ -499,7 +529,8 @@ jobs:
           wait_for_listener() {
             local attempt listener_found pid runtime_pids
             for ((attempt = 1; attempt <= 60; attempt++)); do
-              runtime_pids="$(enumerate_runtime)"
+              runtime_pids="$(enumerate_runtime "${app_pid}")"
+              runtime_pids_seen="${runtime_pids}"
               listener_found=0
               while IFS= read -r pid; do
                 [[ -n "${pid}" ]] || continue
@@ -511,23 +542,43 @@ jobs:
               if [[ "${listener_found}" -eq 1 ]]; then
                 return 0
               fi
+              if ! /bin/kill -0 "${app_pid}" 2>/dev/null; then
+                fail_smoke "app exited before its loopback listener was ready (PID ${app_pid})"
+                return 1
+              fi
               /bin/sleep 1
             done
             fail_smoke 'no owned loopback listener appeared within 60 seconds'
           }
           wait_for_shutdown() {
-            local attempt count remaining
+            local app_alive attempt count orphaned pid remaining
             for ((attempt = 1; attempt <= 30; attempt++)); do
-              remaining="$(enumerate_runtime)"
+              app_alive=0
+              /bin/kill -0 "${app_pid}" 2>/dev/null && app_alive=1
+              remaining=''
+              while IFS= read -r pid; do
+                [[ -n "${pid}" ]] || continue
+                if /bin/kill -0 "${pid}" 2>/dev/null; then
+                  remaining="${remaining}${remaining:+,}${pid}"
+                fi
+              done <<<"${runtime_pids_seen}"
               count="$(app_count)"
-              if [[ -z "${remaining}" && "${count}" -eq 0 ]]; then
-                return 0
+              if [[ "${app_alive}" -eq 0 && -z "${remaining}" && "${count}" -eq 0 ]]; then
+                orphaned="$(packaging/macos/verify-bundle.sh --enumerate-runtime "${RUNTIME_ROOT}/")"
+                [[ -z "${orphaned}" ]] && return 0
+                remaining="${orphaned}"
               fi
               /bin/sleep 1
             done
-            fail_smoke "shutdown left runtime PIDs or app processes: runtime=${remaining:-none} app_count=${count:-unknown}"
+            fail_smoke "shutdown left processes: app_alive=${app_alive:-unknown} runtime=${remaining:-none} app_count=${count:-unknown}"
           }
-          trap cleanup EXIT INT TERM
+          launch_app() {
+            "${APP_EXECUTABLE}" >>"${APP_STDOUT}" 2>>"${APP_STDERR}" &
+            app_pid=$!
+            runtime_pids_seen=''
+          }
+          trap finish EXIT
+          trap 'exit 130' INT TERM
 
           mkdir -p "${SMOKE_HOME}/Library/Application Support" "${SMOKE_HOME}/Library/Caches"
           mkdir -p "${SMOKE_APPLICATIONS}" "${MOUNT_POINT}"
@@ -540,10 +591,12 @@ jobs:
           /usr/bin/hdiutil detach "${MOUNT_POINT}"
           mounted=0
           export HOME="${SMOKE_HOME}"
+          : >"${APP_STDOUT}"
+          : >"${APP_STDERR}"
 
           count="$(app_count)"
           [[ "${count}" -eq 0 ]] || fail_smoke "expected no running app before launch, found ${count}"
-          /usr/bin/open -n "${INSTALLED_APP}"
+          launch_app
           wait_for_listener
           printf 're-smoke phase: listener ready\n'
 
@@ -551,12 +604,14 @@ jobs:
           wait_for_shutdown
           printf 're-smoke phase: first shutdown complete\n'
 
-          /usr/bin/open -n "${INSTALLED_APP}"
-          /bin/sleep 2
-          /usr/bin/open -n "${INSTALLED_APP}"
+          launch_app
+          wait_for_listener
+          "${APP_EXECUTABLE}" >>"${APP_STDOUT}" 2>>"${APP_STDERR}" &
+          second_pid=$!
           /bin/sleep 3
           count="$(app_count)"
           [[ "${count}" -eq 1 ]] || fail_smoke "single-instance check expected 1 app process, found ${count}"
+          ! /bin/kill -0 "${second_pid}" 2>/dev/null || fail_smoke "second app process remained alive: ${second_pid}"
           printf 're-smoke phase: single instance confirmed\n'
 
           /usr/bin/osascript -e 'tell application id "com.poly.desktop" to quit'

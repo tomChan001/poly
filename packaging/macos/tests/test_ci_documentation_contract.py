@@ -279,6 +279,22 @@ def test_installed_dmg_smoke_has_step_timeout() -> None:
     assert "timeout-minutes: 10" in smoke_header
 
 
+def test_fast_resmoke_launches_directly_and_captures_failure_diagnostics() -> None:
+    workflow = read(WORKFLOW)
+    smoke = workflow.split(
+        "- name: Re-smoke installed DMG with explicit phases", 1
+    )[1]
+
+    assert 'APP_EXECUTABLE="${INSTALLED_APP}/Contents/MacOS/Poly"' in smoke
+    assert '"${APP_EXECUTABLE}" >>"${APP_STDOUT}" 2>>"${APP_STDERR}" &' in smoke
+    assert "app_pid=$!" in smoke
+    assert '--enumerate-runtime-from-pid "${RUNTIME_ROOT}/" "${root_pid}"' in smoke
+    assert 'runtime_pids="$(enumerate_runtime "${app_pid}")"' in smoke
+    assert "re-smoke process snapshot" in smoke
+    assert "runtime.stderr.log" in smoke
+    assert '/usr/bin/open -n "${INSTALLED_APP}"' not in smoke
+
+
 def test_keychain_smoke_is_limited_to_signed_release_builds() -> None:
     workflow = read(WORKFLOW)
     smoke = workflow.split(
