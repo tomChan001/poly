@@ -883,6 +883,7 @@ async def test_security_uses_app_scoped_settings(
 @pytest.mark.asyncio
 async def test_stdio_parent_eof_stops_runtime_without_leaking_token() -> None:
     output: list[str] = []
+    protocol_output: list[str] = []
     lines = iter(
         [
             b'{"version":1,"command":"start","data_dir":"/data","runtime_dir":"/run","launch_token":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}\n',
@@ -893,6 +894,9 @@ async def test_stdio_parent_eof_stops_runtime_without_leaking_token() -> None:
     class Runtime:
         async def start(self, command: StartCommand) -> RuntimeEvent:
             assert len(command.launch_token) == 43
+            assert [json.loads(line)["state"] for line in protocol_output] == [
+                "initializing"
+            ]
             event = RuntimeEvent(
                 RuntimeState.READY,
                 {"port": 49152, "bootstrap_path": "/desktop/bootstrap/safe"},
@@ -913,7 +917,7 @@ async def test_stdio_parent_eof_stops_runtime_without_leaking_token() -> None:
     result = await desktop_main.run_stdio(
         runtime=cast(DesktopRuntime, Runtime()),
         line_reader=lambda: next(lines),
-        event_writer=lambda line: None,
+        event_writer=protocol_output.append,
     )
 
     assert result == 0

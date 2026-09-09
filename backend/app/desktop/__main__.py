@@ -133,6 +133,7 @@ async def run_stdio(
         await emit(_failure("invalid_start_command", "invalid desktop command"))
         return 2
 
+    await emit(RuntimeEvent(RuntimeState.INITIALIZING, {}))
     active_runtime = runtime or DesktopRuntime(event_sink=emit)
     try:
         result = await active_runtime.start(first)
