@@ -219,7 +219,6 @@ def test_smoke_uses_an_isolated_home_installed_dmg_and_command_guards() -> None:
     ):
         assert marker in workflow
     assert 'export PATH="${GUARD_DIR}:/usr/bin:/bin:/usr/sbin:/sbin"' in workflow
-    assert "export PGSSLMODE=require" in smoke
     assert "$(seq " not in workflow
     assert "for ((attempt = 1; attempt <=" in workflow
     for absolute_tool in (
@@ -246,6 +245,31 @@ def test_smoke_uses_an_isolated_home_installed_dmg_and_command_guards() -> None:
         smoke,
         re.DOTALL,
     )
+
+
+def test_installed_dmg_smoke_asserts_desktop_diagnostics_ready_marker() -> None:
+    workflow = read(WORKFLOW)
+    smoke = workflow.split(
+        "- name: Install DMG into an isolated home and smoke test", 1
+    )[1].split("- name: Remove temporary signing keychain", 1)[0]
+    log_assignment = (
+        'RUNTIME_STDERR_LOG="${SMOKE_HOME}/Library/Application '
+        'Support/Poly/logs/runtime.stderr.log"'
+    )
+    marker_assertion = (
+        "/usr/bin/grep -Fxq 'desktop_diagnostics_ready' "
+        '"${RUNTIME_STDERR_LOG}"'
+    )
+    launch = '/usr/bin/open -n "${INSTALLED_APP}"'
+
+    assert log_assignment in smoke
+    assert marker_assertion in smoke
+    launch_position = smoke.index(launch)
+    marker_position = smoke.index(marker_assertion)
+    quit_position = smoke.index("tell application id", launch_position)
+    assert launch_position < marker_position < quit_position
+    assert "PGSSLMODE" not in smoke
+    assert '/bin/cp "${RUNTIME_STDERR_LOG}"' in smoke
 
 
 def test_smoke_uses_exact_runtime_evidence_without_unreliable_kernel_tracing() -> None:

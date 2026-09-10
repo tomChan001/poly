@@ -237,6 +237,7 @@ jobs:
           INSTALLED_APP="${SMOKE_APPLICATIONS}/Poly.app"
           RUNTIME_ROOT="${INSTALLED_APP}/Contents/Resources/poly-runtime"
           RUNTIME_EXECUTABLE="${RUNTIME_ROOT}/poly-runtime"
+          RUNTIME_STDERR_LOG="${SMOKE_HOME}/Library/Application Support/Poly/logs/runtime.stderr.log"
 
           trim_keychain_path() {
             /usr/bin/sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//'
@@ -279,6 +280,8 @@ jobs:
             /bin/mkdir -p "${DIAGNOSTICS_DIR}"
             /bin/cp "${GUARD_LOG}" "${DIAGNOSTICS_DIR}/ambient-command.log" 2>/dev/null || true
             /bin/cp "${KEYCHAIN_RESTORE_FAILURE}" "${DIAGNOSTICS_DIR}/keychain-restore-failure.log" 2>/dev/null || true
+            /bin/cp "${RUNTIME_STDERR_LOG}" "${DIAGNOSTICS_DIR}/runtime.stderr.log" 2>/dev/null || true
+            /bin/cp "${RUNTIME_STDERR_LOG}.1" "${DIAGNOSTICS_DIR}/runtime.stderr.log.1" 2>/dev/null || true
           }
           cleanup_smoke() {
             local original_status="$1"
@@ -328,7 +331,6 @@ jobs:
           export HOME="${SMOKE_HOME}"
           export PATH="${GUARD_DIR}:/usr/bin:/bin:/usr/sbin:/sbin"
           export POLY_GUARD_LOG="${GUARD_LOG}"
-          export PGSSLMODE=require
           if [[ "${IS_RELEASE}" == 'true' ]]; then
             printf '%s' "${SMOKE_SECRET}" \
               | "${RUNTIME_EXECUTABLE}" --keychain-smoke set --account "${SMOKE_ACCOUNT}" >/dev/null
@@ -350,6 +352,8 @@ jobs:
             /bin/sleep 1
           done
           [[ "${listener_found}" -eq 1 ]]
+          test -f "${RUNTIME_STDERR_LOG}"
+          /usr/bin/grep -Fxq 'desktop_diagnostics_ready' "${RUNTIME_STDERR_LOG}"
 
           /usr/bin/osascript -e 'tell application id "com.poly.desktop" to quit'
           for ((attempt = 1; attempt <= 30; attempt++)); do
