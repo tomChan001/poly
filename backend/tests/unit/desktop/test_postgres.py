@@ -160,7 +160,8 @@ def test_database_url_uses_encoded_unix_socket_and_poly_database(
     encoded_socket = quote(str(paths.socket_dir), safe="")
 
     assert paths.database_url == (
-        f"postgresql+asyncpg://poly@/poly?host={encoded_socket}&port=5432"
+        "postgresql+asyncpg://poly@/poly?"
+        f"host={encoded_socket}&port=5432&ssl=disable"
     )
 
 

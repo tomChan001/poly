@@ -40,7 +40,10 @@ class PostgresPaths:
     @property
     def database_url(self) -> str:
         socket = quote(str(self.socket_dir), safe="")
-        return f"postgresql+asyncpg://poly@/poly?host={socket}&port=5432"
+        return (
+            "postgresql+asyncpg://poly@/poly?"
+            f"host={socket}&port=5432&ssl=disable"
+        )
 
 
 def build_initdb_command(paths: PostgresPaths) -> list[str]:
