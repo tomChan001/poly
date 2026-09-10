@@ -103,6 +103,12 @@ class RaisingStream(io.StringIO):
         raise AssertionError("flush must not run after a failed write")
 
 
+class RaisingFlushStream(RecordingStream):
+    def flush(self) -> None:
+        self.flush_count += 1
+        raise DiagnosticInterruption("flush failed")
+
+
 def _qualified_type_name(error: BaseException) -> str:
     error_type = type(error)
     return f"{error_type.__module__}.{error_type.__qualname__}"
@@ -257,3 +263,16 @@ def test_writer_swallows_every_exception_from_stream_write() -> None:
         RuntimeState.MIGRATING,
         stream=RaisingStream(),
     )
+
+
+def test_writer_swallows_every_exception_from_stream_flush() -> None:
+    error = DriverFailure(_hostile_message())
+    stream = RaisingFlushStream()
+
+    write_runtime_failure_diagnostic(error, RuntimeState.MIGRATING, stream=stream)
+
+    encoded = encode_runtime_failure_diagnostic(error, RuntimeState.MIGRATING)
+    assert stream.writes == [encoded + "\n"]
+    assert stream.flush_count == 1
+    for fragment in HOSTILE_FRAGMENTS:
+        assert fragment not in stream.writes[0]
