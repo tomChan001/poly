@@ -239,6 +239,7 @@ def make_runtime(
     events: list[RuntimeEvent] | None = None,
     postgres: FakePostgres | None = None,
     migrate: Callable[[str, Path], Awaitable[None]] | None = None,
+    diagnose: Callable[[BaseException, RuntimeState], None] | None = None,
 ) -> DesktopRuntime:
     fake_postgres = postgres or FakePostgres(trace)
     container = FakeContainer(trace)
@@ -282,6 +283,7 @@ def make_runtime(
         server_factory=server_factory,
         marker_filesystem=MarkerFileSystem(),
         event_sink=(events.append if events is not None else None),
+        failure_diagnostic_sink=diagnose,
         path_mapper=lambda path: tmp_path / str(path).lstrip("/"),
     )
 
@@ -458,8 +460,17 @@ async def test_migration_failure_stops_database_and_leaves_marker(
         trace.append("migrate")
         raise RuntimeError("postgresql://secret-value")
 
+    def diagnose(_error: BaseException, phase: RuntimeState) -> None:
+        trace.append(f"diagnostic:{phase.value}")
+
     events: list[RuntimeEvent] = []
-    runtime = make_runtime(tmp_path, trace, events=events, migrate=fail_migration)
+    runtime = make_runtime(
+        tmp_path,
+        trace,
+        events=events,
+        migrate=fail_migration,
+        diagnose=diagnose,
+    )
     failed = await runtime.start(
         StartCommand(PurePosixPath("/data"), PurePosixPath("/run"), "x" * 43)
     )
@@ -469,9 +480,58 @@ async def test_migration_failure_stops_database_and_leaves_marker(
         "code": "migration_failed",
         "detail": "database migration failed",
     }
-    assert trace == ["marker.create", "postgres.start", "migrate", "postgres.stop"]
+    assert trace == [
+        "marker.create",
+        "postgres.start",
+        "migrate",
+        "diagnostic:migrating",
+        "postgres.stop",
+    ]
     assert (tmp_path / "data" / "unclean_shutdown").exists()
     assert "secret-value" not in failed.to_json()
+    assert events[-1] == failed
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_sink_failure_preserves_migration_failure(
+    tmp_path: Path,
+) -> None:
+    trace: list[str] = []
+
+    async def fail_migration(_database_url: str, _project_root: Path) -> None:
+        trace.append("migrate")
+        raise RuntimeError("postgresql://secret-value")
+
+    def fail_diagnostic(_error: BaseException, phase: RuntimeState) -> None:
+        trace.append(f"diagnostic:{phase.value}")
+        raise OSError("stderr unavailable")
+
+    events: list[RuntimeEvent] = []
+    runtime = make_runtime(
+        tmp_path,
+        trace,
+        events=events,
+        migrate=fail_migration,
+        diagnose=fail_diagnostic,
+    )
+
+    failed = await runtime.start(
+        StartCommand(PurePosixPath("/data"), PurePosixPath("/run"), "x" * 43)
+    )
+
+    assert failed.state is RuntimeState.FAILED
+    assert failed.fields == {
+        "code": "migration_failed",
+        "detail": "database migration failed",
+    }
+    assert trace == [
+        "marker.create",
+        "postgres.start",
+        "migrate",
+        "diagnostic:migrating",
+        "postgres.stop",
+    ]
+    assert (tmp_path / "data" / "unclean_shutdown").exists()
     assert events[-1] == failed
 
 

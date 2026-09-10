@@ -13,6 +13,7 @@ from fastapi import FastAPI
 
 from backend.app.container import ApplicationContainer
 from backend.app.core.config import Settings
+from backend.app.desktop.diagnostics import write_runtime_failure_diagnostic
 from backend.app.desktop.postgres import PostgresManager, PostgresPaths
 from backend.app.desktop.protocol import RuntimeEvent, RuntimeState, StartCommand
 from backend.app.desktop.server import LoopbackServer
@@ -69,6 +70,7 @@ class MarkerFileSystem(Protocol):
 EventSink = Callable[[RuntimeEvent], None | Awaitable[None]]
 PostgresFactory = Callable[[StartCommand], PostgresLifecycle]
 MigrationRunner = Callable[[str, Path], None | Awaitable[None]]
+FailureDiagnosticSink = Callable[[BaseException, RuntimeState], None]
 ApplicationResult = tuple[ApplicationLifecycle, FastAPI]
 ApplicationFactory = Callable[
     [Settings, DesktopSession], ApplicationResult | Awaitable[ApplicationResult]
@@ -127,6 +129,7 @@ class DesktopRuntime:
         server_factory: ServerFactory | None = None,
         marker_filesystem: MarkerFileSystem | None = None,
         event_sink: EventSink | None = None,
+        failure_diagnostic_sink: FailureDiagnosticSink | None = None,
         path_mapper: PathMapper | None = None,
     ) -> None:
         self.project_root = (project_root or packaged_project_root()).resolve()
@@ -139,6 +142,9 @@ class DesktopRuntime:
         self.server_factory = server_factory or LoopbackServer
         self.marker_filesystem = marker_filesystem or LocalMarkerFileSystem()
         self.event_sink = event_sink
+        self.failure_diagnostic_sink = (
+            failure_diagnostic_sink or write_runtime_failure_diagnostic
+        )
 
         self.postgres: PostgresLifecycle | None = None
         self.container: ApplicationLifecycle | None = None
@@ -211,7 +217,11 @@ class DesktopRuntime:
         except asyncio.CancelledError:
             await self._finish_cleanup(clean=False, disable_reason=None)
             raise
-        except Exception:  # noqa: BLE001 - sanitize every orchestration boundary
+        except Exception as error:  # noqa: BLE001 - sanitize orchestration boundary
+            try:
+                self.failure_diagnostic_sink(error, phase)
+            except BaseException:  # noqa: BLE001 - diagnostics cannot alter failure flow
+                pass
             await self._finish_cleanup(clean=False, disable_reason=None)
             if phase is RuntimeState.PREPARING_DATABASE:
                 return await self._failure(
