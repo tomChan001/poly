@@ -219,6 +219,7 @@ def test_smoke_uses_an_isolated_home_installed_dmg_and_command_guards() -> None:
     ):
         assert marker in workflow
     assert 'export PATH="${GUARD_DIR}:/usr/bin:/bin:/usr/sbin:/sbin"' in workflow
+    assert "export PGSSLMODE=require" in smoke
     assert "$(seq " not in workflow
     assert "for ((attempt = 1; attempt <=" in workflow
     for absolute_tool in (

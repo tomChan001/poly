@@ -328,6 +328,7 @@ jobs:
           export HOME="${SMOKE_HOME}"
           export PATH="${GUARD_DIR}:/usr/bin:/bin:/usr/sbin:/sbin"
           export POLY_GUARD_LOG="${GUARD_LOG}"
+          export PGSSLMODE=require
           if [[ "${IS_RELEASE}" == 'true' ]]; then
             printf '%s' "${SMOKE_SECRET}" \
               | "${RUNTIME_EXECUTABLE}" --keychain-smoke set --account "${SMOKE_ACCOUNT}" >/dev/null
