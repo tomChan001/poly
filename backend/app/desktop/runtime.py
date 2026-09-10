@@ -220,8 +220,8 @@ class DesktopRuntime:
         except Exception as error:  # noqa: BLE001 - sanitize orchestration boundary
             try:
                 self.failure_diagnostic_sink(error, phase)
-            except BaseException:  # noqa: BLE001 - diagnostics cannot alter failure flow
-                pass
+            except Exception as diagnostic_error:  # noqa: BLE001
+                del diagnostic_error
             await self._finish_cleanup(clean=False, disable_reason=None)
             if phase is RuntimeState.PREPARING_DATABASE:
                 return await self._failure(

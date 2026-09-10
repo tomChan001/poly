@@ -454,7 +454,19 @@ async def test_unclean_marker_disables_opening_before_worker_lifespan(
 async def test_migration_failure_stops_database_and_leaves_marker(
     tmp_path: Path,
 ) -> None:
-    trace: list[str] = []
+    chronology: list[str] = []
+
+    class TracedOperations(list[str]):
+        def append(self, item: str) -> None:
+            chronology.append(item)
+            super().append(item)
+
+    class TracedEvents(list[RuntimeEvent]):
+        def append(self, event: RuntimeEvent) -> None:
+            chronology.append(f"event:{event.state.value}")
+            super().append(event)
+
+    trace = TracedOperations()
 
     async def fail_migration(_database_url: str, _project_root: Path) -> None:
         trace.append("migrate")
@@ -463,7 +475,7 @@ async def test_migration_failure_stops_database_and_leaves_marker(
     def diagnose(_error: BaseException, phase: RuntimeState) -> None:
         trace.append(f"diagnostic:{phase.value}")
 
-    events: list[RuntimeEvent] = []
+    events = TracedEvents()
     runtime = make_runtime(
         tmp_path,
         trace,
@@ -486,6 +498,16 @@ async def test_migration_failure_stops_database_and_leaves_marker(
         "migrate",
         "diagnostic:migrating",
         "postgres.stop",
+    ]
+    assert chronology == [
+        "marker.create",
+        "event:preparing_database",
+        "postgres.start",
+        "event:migrating",
+        "migrate",
+        "diagnostic:migrating",
+        "postgres.stop",
+        "event:failed",
     ]
     assert (tmp_path / "data" / "unclean_shutdown").exists()
     assert "secret-value" not in failed.to_json()
