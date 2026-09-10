@@ -2,9 +2,19 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make the bundled desktop database ignore ambient PostgreSQL SSL requirements and deliver a validated Apple Silicon DMG.
+> **Status: Partially superseded (2026-09-10).** This plan records an earlier
+> SSL diagnosis. The Rust launcher uses `env_clear()`, so the installed-DMG
+> smoke's exported `PGSSLMODE=require` never reached packaged Python. Supplied
+> production logs contained no SSL rejection, and the packaged migration root
+> cause remains unknown. Keep `ssl=disable` only as defensive private-database
+> isolation; do not treat it as the established production fix. Use the current
+> [Safe Desktop Migration Diagnostics design](../specs/2026-09-10-safe-migration-diagnostics-design.md)
+> and [implementation plan](./2026-09-10-safe-migration-diagnostics.md) for the
+> ongoing investigation.
 
-**Architecture:** Keep `PostgresPaths.database_url` as the single connection source for Alembic and the application database layer, but make its local-only transport contract explicit with `ssl=disable`. Harden the installed-DMG smoke test by setting `PGSSLMODE=require`, proving that the packaged application overrides hostile ambient configuration.
+**Historical Goal:** Make the bundled desktop database ignore ambient PostgreSQL SSL requirements and use an Apple Silicon DMG smoke experiment to validate the change. The smoke experiment was later shown not to exercise that environment boundary.
+
+**Architecture:** Keep `PostgresPaths.database_url` as the single connection source for Alembic and the application database layer, but make its local-only transport contract explicit with `ssl=disable`. The Task 2 `PGSSLMODE=require` smoke proposal below is retained only as superseded history: it could not prove that packaged Python overrides hostile ambient configuration.
 
 **Tech Stack:** Python 3.12, asyncpg, SQLAlchemy, Alembic, pytest, GitHub Actions, Tauri macOS packaging
 
@@ -66,15 +76,22 @@ git add -- backend/app/desktop/postgres.py backend/tests/unit/desktop/test_postg
 git commit -m "Isolate desktop PostgreSQL from ambient SSL settings"
 ```
 
-### Task 2: Reproduce the hostile environment in the installed-DMG smoke
+### Task 2: Superseded installed-DMG `PGSSLMODE` experiment
+
+> **Do not execute this task.** It records the original experiment, whose guard
+> was later removed. The workflow export did not cross the Rust launcher's
+> `env_clear()` boundary, so neither this contract test nor a green smoke run
+> validated the SSL hypothesis against packaged Python.
 
 **Files:**
 - Modify: `packaging/macos/tests/test_ci_documentation_contract.py:198`
 - Modify: `.github/workflows/macos-desktop.yml:354`
 
-- [ ] **Step 1: Require the smoke stage to force ambient SSL**
+- [ ] **Step 1 (superseded): Add a workflow-text assertion for the proposed ambient SSL setting**
 
-Add this assertion inside `test_smoke_uses_an_isolated_home_installed_dmg_and_command_guards`:
+The original plan called for this assertion inside
+`test_smoke_uses_an_isolated_home_installed_dmg_and_command_guards`; it was later
+removed:
 
 ```python
 assert "export PGSSLMODE=require" in smoke
@@ -86,11 +103,14 @@ assert "export PGSSLMODE=require" in smoke
 uv run --frozen pytest packaging/macos/tests/test_ci_documentation_contract.py::test_smoke_uses_an_isolated_home_installed_dmg_and_command_guards -q
 ```
 
-Expected: FAIL because the smoke stage does not set `PGSSLMODE=require`.
+Historical expectation: FAIL because the smoke stage does not contain
+`PGSSLMODE=require`. This checks workflow text only and provides no evidence
+that the setting reaches packaged Python.
 
-- [ ] **Step 3: Harden the installed-DMG smoke environment**
+- [ ] **Step 3 (superseded): Add the proposed installed-DMG environment export**
 
-Add the final export beside the existing isolated runtime environment:
+The original plan proposed the following export. Do not restore it as a
+diagnostic guard; the Rust launcher clears it before starting packaged Python.
 
 ```bash
 export HOME="$SMOKE_HOME"
@@ -149,6 +169,11 @@ Expected: both commands exit successfully without diagnostics.
 
 ### Task 4: Build and deliver the Apple Silicon DMG
 
+These artifact steps remain useful historical operational guidance, but a green
+clean-data smoke run does not establish the cause of the reported production
+migration failure. Follow the safe migration diagnostics design and plan linked
+at the top for current validation work.
+
 **Files:**
 - Output: `C:/Users/ai4c_/Desktop/Poly-Apple-Silicon-$runId/Poly_0.1.0_aarch64.dmg`
 
@@ -169,7 +194,11 @@ $runId = $run[0].databaseId
 $run[0]
 ```
 
-Expected: the newest run uses current HEAD and the `Poly-macos-arm64` job passes, including the installed-DMG smoke under `PGSSLMODE=require`.
+Historical operational expectation: the newest run uses current HEAD and the
+`Poly-macos-arm64` job passes. The earlier claim that a passing installed-DMG
+smoke under `PGSSLMODE=require` validated the packaged override is superseded:
+`env_clear()` prevents that export from reaching Python, and the current smoke
+instead verifies the fixed `desktop_diagnostics_ready` marker.
 
 - [ ] **Step 3: Download the Apple Silicon artifact**
 
