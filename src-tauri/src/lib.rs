@@ -70,6 +70,9 @@ impl DesktopNavigator for TauriDesktopNavigator {
 }
 
 #[cfg(any(target_os = "macos", test))]
+const DESKTOP_DIAGNOSTICS_READY_MARKER: &str = "desktop_diagnostics_ready\n";
+
+#[cfg(any(target_os = "macos", test))]
 struct BoundedDesktopReporter {
     log: Mutex<Option<runtime::process::DiagnosticLog>>,
     dropped: std::sync::atomic::AtomicUsize,
@@ -85,7 +88,11 @@ impl BoundedDesktopReporter {
     }
 
     fn configure(&self, application_support: &std::path::Path) {
-        match runtime::process::DiagnosticLog::under_application_support(application_support) {
+        match runtime::process::DiagnosticLog::under_application_support(application_support)
+            .and_then(|mut log| {
+                log.write_redacted(DESKTOP_DIAGNOSTICS_READY_MARKER)?;
+                Ok(log)
+            }) {
             Ok(log) => *self.log.lock().expect("diagnostic log lock poisoned") = Some(log),
             Err(_) => {
                 self.dropped
@@ -359,15 +366,54 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU16;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::runtime::protocol::{FailureCode, RuntimeEvent, RuntimeState};
     use crate::runtime::state::{Supervisor, SupervisorAction, SupervisorState};
     use crate::runtime::supervisor::{RuntimeFailure, RuntimeSupervisorNotice};
     use crate::webview::DesktopUiState;
-    use crate::DesktopNavigationController;
+    use crate::{BoundedDesktopReporter, DesktopNavigationController};
 
     fn parse(json: &str) -> RuntimeEvent {
         RuntimeEvent::parse_line(json).expect("valid runtime event")
+    }
+
+    #[test]
+    fn bounded_desktop_reporter_writes_fixed_startup_marker() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let application_support = std::env::temp_dir().join(format!(
+            "poly-bounded-desktop-reporter-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&application_support).expect("create application-support root");
+
+        let reporter = BoundedDesktopReporter::new();
+        reporter.configure(&application_support);
+        drop(reporter);
+
+        let log_path = application_support
+            .join("Poly")
+            .join("logs")
+            .join("runtime.stderr.log");
+        let contents = std::fs::read_to_string(&log_path).expect("read desktop diagnostic log");
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::metadata(&log_path)
+                .expect("read desktop diagnostic log metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        std::fs::remove_dir_all(&application_support).expect("remove application-support root");
+
+        assert_eq!(contents, "desktop_diagnostics_ready\n");
+        #[cfg(unix)]
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
