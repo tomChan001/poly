@@ -291,7 +291,9 @@ def test_smoke_uses_exact_runtime_evidence_without_unreliable_kernel_tracing() -
     assert '"${GITHUB_WORKSPACE}/packaging/macos/verify-bundle.sh" ' in smoke
     assert '--enumerate-runtime "${RUNTIME_ROOT}/"' in smoke
     assert '/usr/sbin/lsof -nP -a -p "${pid}" -iTCP -sTCP:LISTEN' in smoke
-    assert "TCP 127.0.0.1:" in smoke
+    assert "n127.0.0.1:" in smoke
+    assert '"http://${endpoint#n}/health"' in smoke
+    assert '{"detail":"desktop session required"}' in smoke
     assert '[[ ! -s "${GUARD_LOG}" ]]' in smoke
 
 

@@ -343,10 +343,18 @@ jobs:
             listener_found=0
             while IFS= read -r pid; do
               [[ -n "${pid}" ]] || continue
-              if /usr/sbin/lsof -nP -a -p "${pid}" -iTCP -sTCP:LISTEN | /usr/bin/grep -q 'TCP 127.0.0.1:'; then
-                listener_found=1
-                break
-              fi
+              while IFS= read -r endpoint; do
+                case "${endpoint}" in
+                  n127.0.0.1:*) ;;
+                  *) continue ;;
+                esac
+                response="$(/usr/bin/curl -q --noproxy '*' --silent --max-time 2 "http://${endpoint#n}/health" || true)"
+                if [[ "${response}" == '{"detail":"desktop session required"}' ]]; then
+                  listener_found=1
+                  break
+                fi
+              done < <(/usr/sbin/lsof -nP -a -p "${pid}" -iTCP -sTCP:LISTEN -Fn || true)
+              [[ "${listener_found}" -eq 1 ]] && break
             done <<<"${runtime_pids}"
             [[ "${listener_found}" -eq 1 ]] && break
             /bin/sleep 1

@@ -1274,6 +1274,32 @@ def test_self_test_checks_resources_and_writable_temp_directory(tmp_path: Path) 
     assert event == RuntimeEvent(RuntimeState.STOPPED, {"self_test": "ok"})
 
 
+@pytest.mark.parametrize(
+    "missing_module",
+    ["backend.app.db.tables", "backend.app.db.base", "asyncpg"],
+)
+def test_self_test_rejects_missing_migration_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_module: str
+) -> None:
+    import importlib
+
+    populate_self_test_layout(tmp_path)
+    original_import = importlib.import_module
+
+    def missing_import(name: str, package: str | None = None):
+        if name == missing_module:
+            raise ImportError("private installation path must not be printed")
+        return original_import(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", missing_import)
+    event = desktop_main.self_test(project_root=tmp_path, temp_root=tmp_path)
+
+    assert event == RuntimeEvent(
+        RuntimeState.FAILED,
+        {"code": "resource_missing", "detail": "required migration module is unavailable"},
+    )
+
+
 class FakeKeychainSmokeStore:
     def __init__(self) -> None:
         self.values: dict[str, str] = {}

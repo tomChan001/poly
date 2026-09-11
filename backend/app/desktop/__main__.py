@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hmac
+import importlib
 import inspect
 import os
 import re
@@ -225,6 +226,18 @@ def self_test(
         )
     ):
         return _failure("resource_missing", "required packaged resource is unavailable")
+    # Alembic loads migration scripts as data files, outside PyInstaller's
+    # import graph. Verify their dependencies in the frozen process as well.
+    try:
+        for module_name in (
+            "backend.app.db.base",
+            "backend.app.db.tables",
+            "sqlalchemy.dialects.postgresql.asyncpg",
+            "asyncpg",
+        ):
+            importlib.import_module(module_name)
+    except ImportError:
+        return _failure("resource_missing", "required migration module is unavailable")
     try:
         with tempfile.TemporaryDirectory(dir=temp_root) as directory:
             probe = Path(directory) / "write-probe"

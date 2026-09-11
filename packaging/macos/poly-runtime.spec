@@ -58,6 +58,9 @@ binaries = []
 # configuration need to be named here. Ordinary Python imports remain discoverable
 # by Analysis and must not be duplicated as data files.
 REQUIRED_HIDDENIMPORTS = (
+    # Imported by the data-only Alembic environment and initial revision.
+    "backend.app.db.base",
+    "backend.app.db.tables",
     "keyring.backends.chainer",
     "keyring.backends.fail",
     "keyring.backends.macOS",
