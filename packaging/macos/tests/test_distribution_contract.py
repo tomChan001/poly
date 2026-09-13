@@ -839,6 +839,38 @@ class DistributionContractTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "")
 
+    def test_runtime_enumeration_rechecks_pid_when_lsof_returns_no_text_path(self) -> None:
+        bash = bash_executable()
+        with tempfile.TemporaryDirectory() as temporary:
+            stubs = Path(temporary) / "stubs"
+            stubs.mkdir()
+            write_stub(stubs, "lsof", "printf 'p4242\\n'; exit 0")
+            env = os.environ.copy()
+            env["PATH"] = f"{git_bash_path(stubs)}:/usr/bin:/bin"
+            env["POLY_TEST_PS"] = git_bash_path(stubs / "ps")
+            env["POLY_TEST_LSOF"] = git_bash_path(stubs / "lsof")
+            for name, probe, expected in (
+                ("exited", "exit 1", 0),
+                ("empty", "exit 0", 0),
+                ("still-live", "printf ' 4242\\n'; exit 0", 1),
+                ("probe-failed", "exit 23", 1),
+            ):
+                with self.subTest(name=name):
+                    write_stub(
+                        stubs, "ps",
+                        "if [[ \"$*\" == *'pid=,ppid=,args='* ]]; then\n"
+                        "  printf ' 4242 1 /tmp/poly-runtime/poly-runtime\\n'\n"
+                        "  exit 0\n"
+                        "fi\n" + probe,
+                    )
+                    result = subprocess.run(
+                        [bash, str(MACOS / "verify-bundle.sh"),
+                         "--enumerate-runtime", "/tmp/poly-runtime/"],
+                        capture_output=True, text=True, env=env, check=False,
+                    )
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    self.assertEqual(result.stdout, "")
+
     def test_runtime_enumeration_tolerates_no_matching_processes(self) -> None:
         bash = bash_executable()
         with tempfile.TemporaryDirectory() as temporary:

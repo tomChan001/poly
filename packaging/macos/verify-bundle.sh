@@ -70,6 +70,15 @@ process_executable() {
         ;;
     esac
   done <<<"${lsof_output}"
+  # lsof can succeed with a PID record but no text mapping when that process
+  # exits during inspection. Confirm disappearance before ignoring the candidate.
+  if ps_output="$("${PS_BIN}" -ww -p "${pid}" -o pid=)"; then
+    [[ -z "${ps_output//[[:space:]]/}" ]] && return 1
+  else
+    ps_status=$?
+    [[ "${ps_status}" -eq 1 ]] && return 1
+    die "process enumeration failed while checking PID ${pid} after missing text path"
+  fi
   die "exact executable enumeration returned no text path for live PID ${pid}"
 }
 
