@@ -139,6 +139,7 @@ impl RuntimeShutdown for FakeShutdown {
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()
         .unwrap()
 }
@@ -281,11 +282,66 @@ fn completed_shutdown_needs_no_teardown_cleanup() {
 }
 
 #[test]
-fn production_teardown_mapping_reports_cleanup_failure_once() {
+fn native_exit_without_exit_requested_gracefully_stops_runtime_before_cleanup() {
     runtime().block_on(async {
         let lifecycle = AppLifecycle::new();
         let app = FakeApp::default();
         let shutdown = FakeShutdown::immediate(Ok(()));
+
+        lifecycle.teardown_and_report(&app, &shutdown).await;
+        lifecycle.teardown_and_report(&app, &shutdown).await;
+        lifecycle.teardown(&shutdown);
+
+        assert_eq!(*shutdown.calls.lock().unwrap(), [APPLICATION_QUIT_REASON]);
+        assert_eq!(shutdown.cleanup_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(app.reports.load(Ordering::SeqCst), 0);
+        assert_eq!(app.exits.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+fn native_exit_waits_for_an_existing_close_without_repeating_shutdown() {
+    runtime().block_on(async {
+        let lifecycle = Arc::new(AppLifecycle::new());
+        let app = Arc::new(FakeApp::default());
+        let (shutdown, release) = FakeShutdown::blocked();
+        let shutdown = Arc::new(shutdown);
+        assert_eq!(
+            lifecycle.close_requested(app.window.as_ref()),
+            CloseDecision::PreventAndShutdown
+        );
+        let close = tokio::spawn(Arc::clone(&lifecycle).shutdown_and_exit(
+            Arc::clone(&app) as Arc<dyn LifecycleApplication>,
+            Arc::clone(&shutdown) as Arc<dyn RuntimeShutdown>,
+        ));
+        let exit = {
+            let lifecycle = Arc::clone(&lifecycle);
+            let app = Arc::clone(&app);
+            let shutdown = Arc::clone(&shutdown);
+            tokio::spawn(async move {
+                lifecycle
+                    .teardown_and_report(app.as_ref(), shutdown.as_ref())
+                    .await;
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(shutdown.started.load(Ordering::SeqCst));
+        assert_eq!(shutdown.cleanup_calls.load(Ordering::SeqCst), 0);
+        release.send(()).unwrap();
+        close.await.unwrap();
+        exit.await.unwrap();
+        assert_eq!(*shutdown.calls.lock().unwrap(), [APPLICATION_QUIT_REASON]);
+        assert_eq!(shutdown.cleanup_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(app.reports.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+fn production_teardown_mapping_reports_cleanup_failure_once() {
+    runtime().block_on(async {
+        let lifecycle = AppLifecycle::new();
+        let app = FakeApp::default();
+        let shutdown = FakeShutdown::immediate(Err(()));
         *shutdown.cleanup_result.lock().unwrap() = Some(Err(()));
 
         lifecycle.teardown_and_report(&app, &shutdown).await;

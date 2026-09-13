@@ -139,9 +139,41 @@ impl AppLifecycle {
         app: &dyn LifecycleApplication,
         runtime: &dyn RuntimeShutdown,
     ) {
-        if self.teardown_and_wait(runtime).await.is_err() {
+        self.finish_exit(app, runtime, std::time::Duration::from_secs(25))
+            .await;
+    }
+
+    async fn finish_exit(
+        &self,
+        app: &dyn LifecycleApplication,
+        runtime: &dyn RuntimeShutdown,
+        timeout: std::time::Duration,
+    ) {
+        // macOS applicationWillTerminate can deliver Exit without ExitRequested.
+        // This callback must finish shutdown without depending on more UI events.
+        let phase =
+            self.phase
+                .compare_exchange(ACTIVE, SHUTTING_DOWN, Ordering::AcqRel, Ordering::Acquire);
+        if phase == Err(SHUTDOWN_COMPLETE) {
+            return;
+        }
+        let graceful = tokio::time::timeout(timeout, async {
+            if phase.is_ok() {
+                runtime.shutdown(APPLICATION_QUIT_REASON).await
+            } else {
+                // An earlier close request already owns the graceful shutdown.
+                while self.phase.load(Ordering::Acquire) != SHUTDOWN_COMPLETE {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Ok(())
+            }
+        })
+        .await;
+        if !matches!(graceful, Ok(Ok(()))) {
+            let _ = self.teardown_and_wait(runtime).await;
             app.report_shutdown_failure();
         }
+        self.phase.store(SHUTDOWN_COMPLETE, Ordering::Release);
     }
 
     fn cleanup_once(&self, runtime: &dyn RuntimeShutdown) {
@@ -507,6 +539,64 @@ const fn is_teardown_event(event: &tauri::RunEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Default)]
+    struct HungExit {
+        cleanup: AtomicUsize,
+        confirmed: AtomicUsize,
+        reports: AtomicUsize,
+    }
+
+    impl RuntimeShutdown for HungExit {
+        fn shutdown(&self, _reason: &'static str) -> ShutdownFuture<'_> {
+            Box::pin(std::future::pending())
+        }
+
+        fn cleanup_owned(&self) {
+            self.cleanup.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wait_for_cleanup(&self) -> ShutdownFuture<'_> {
+            Box::pin(async {
+                self.confirmed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    impl LifecycleApplication for HungExit {
+        fn main_window(&self) -> Option<Box<dyn LifecycleWindow>> {
+            None
+        }
+
+        fn exit(&self, _code: i32) {
+            panic!("native Exit must not request another UI exit");
+        }
+
+        fn report_shutdown_failure(&self) {
+            self.reports.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn native_exit_timeout_confirms_owned_cleanup_and_reports_failure_once() {
+        tauri::async_runtime::block_on(async {
+            let lifecycle = AppLifecycle::new();
+            let probe = HungExit::default();
+            lifecycle
+                .finish_exit(&probe, &probe, Duration::from_millis(10))
+                .await;
+            lifecycle
+                .finish_exit(&probe, &probe, Duration::from_millis(10))
+                .await;
+            assert_eq!(probe.cleanup.load(Ordering::SeqCst), 1);
+            assert_eq!(probe.confirmed.load(Ordering::SeqCst), 1);
+            assert_eq!(probe.reports.load(Ordering::SeqCst), 1);
+        });
+    }
+
     #[test]
     fn production_exit_event_maps_to_confirmed_teardown() {
         assert!(super::is_teardown_event(&tauri::RunEvent::Exit));
