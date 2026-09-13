@@ -89,6 +89,7 @@ jobs:
             backend/tests/integration/api/test_desktop_session.py \
             packaging/macos/tests/test_distribution_contract.py \
             packaging/macos/tests/test_ci_documentation_contract.py \
+            packaging/macos/tests/test_feedback_release_acceptance.py \
             -q
 
       - name: Lint frontend
@@ -221,7 +222,8 @@ jobs:
           SMOKE_ACCOUNT: ci-smoke-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          SMOKE_ROOT="$(mktemp -d "${RUNNER_TEMP}/poly-smoke.XXXXXXXX")"
+          # Keep the PostgreSQL Unix socket pathname below Darwin's 104-byte limit.
+          SMOKE_ROOT="$(mktemp -d "${RUNNER_TEMP}/p.XXXXXXXX")"
           SMOKE_HOME="${SMOKE_ROOT}/home"
           SMOKE_APPLICATIONS="${SMOKE_ROOT}/Applications"
           GUARD_DIR="${SMOKE_ROOT}/guard-bin"
@@ -238,6 +240,16 @@ jobs:
           RUNTIME_ROOT="${INSTALLED_APP}/Contents/Resources/poly-runtime"
           RUNTIME_EXECUTABLE="${RUNTIME_ROOT}/poly-runtime"
           RUNTIME_STDERR_LOG="${SMOKE_HOME}/Library/Application Support/Poly/logs/runtime.stderr.log"
+          APP_EXECUTABLE="${INSTALLED_APP}/Contents/MacOS/Poly"
+          APP_STDOUT="${SMOKE_ROOT}/app.stdout.log"
+          APP_STDERR="${SMOKE_ROOT}/app.stderr.log"
+          ACCEPTANCE_PYTHON="${GITHUB_WORKSPACE}/.venv/bin/python"
+          test -x "${ACCEPTANCE_PYTHON}"
+          accept_feedback() {
+            "${ACCEPTANCE_PYTHON}" "${GITHUB_WORKSPACE}/packaging/macos/accept-feedback-release.py" "$1" \
+              --runtime "${RUNTIME_ROOT}" --home "${SMOKE_HOME}" --source "${GITHUB_WORKSPACE}" \
+              --evidence "${DIAGNOSTICS_DIR}/feedback-release-evidence.json"
+          }
 
           trim_keychain_path() {
             /usr/bin/sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//'
@@ -282,6 +294,9 @@ jobs:
             /bin/cp "${KEYCHAIN_RESTORE_FAILURE}" "${DIAGNOSTICS_DIR}/keychain-restore-failure.log" 2>/dev/null || true
             /bin/cp "${RUNTIME_STDERR_LOG}" "${DIAGNOSTICS_DIR}/runtime.stderr.log" 2>/dev/null || true
             /bin/cp "${RUNTIME_STDERR_LOG}.1" "${DIAGNOSTICS_DIR}/runtime.stderr.log.1" 2>/dev/null || true
+            /bin/cp "${SMOKE_ROOT}/acceptance-postgres.log" "${DIAGNOSTICS_DIR}/acceptance-postgres.log" 2>/dev/null || true
+            /bin/cp "${APP_STDOUT}" "${DIAGNOSTICS_DIR}/app.stdout.log" 2>/dev/null || true
+            /bin/cp "${APP_STDERR}" "${DIAGNOSTICS_DIR}/app.stderr.log" 2>/dev/null || true
           }
           cleanup_smoke() {
             local original_status="$1"
@@ -331,14 +346,18 @@ jobs:
           export HOME="${SMOKE_HOME}"
           export PATH="${GUARD_DIR}:/usr/bin:/bin:/usr/sbin:/sbin"
           export POLY_GUARD_LOG="${GUARD_LOG}"
+          accept_feedback bundle
           if [[ "${IS_RELEASE}" == 'true' ]]; then
             printf '%s' "${SMOKE_SECRET}" \
               | "${RUNTIME_EXECUTABLE}" --keychain-smoke set --account "${SMOKE_ACCOUNT}" >/dev/null
           fi
           app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
           [[ "${app_count}" -eq 0 ]]
-          /usr/bin/open -n "${INSTALLED_APP}"
+          "${APP_EXECUTABLE}" >>"${APP_STDOUT}" 2>>"${APP_STDERR}" &
+          app_pid=$!
+          wait_for_health() {
           for ((attempt = 1; attempt <= 60; attempt++)); do
+            /bin/kill -0 "${app_pid}" 2>/dev/null || return 1
             runtime_pids="$("${GITHUB_WORKSPACE}/packaging/macos/verify-bundle.sh" --enumerate-runtime "${RUNTIME_ROOT}/" "${INSTALLED_APP}/Contents/MacOS/Poly")"
             listener_found=0
             while IFS= read -r pid; do
@@ -348,8 +367,8 @@ jobs:
                   n127.0.0.1:*) ;;
                   *) continue ;;
                 esac
-                response="$(/usr/bin/curl -q --noproxy '*' --silent --max-time 2 "http://${endpoint#n}/health" || true)"
-                if [[ "${response}" == '{"detail":"desktop session required"}' ]]; then
+                response="$(/usr/bin/curl -q --noproxy '*' --silent --max-time 2 --write-out '\n%{http_code}' "http://${endpoint#n}/health" || true)"
+                if [[ "${response}" == $'{"detail":"desktop session required"}\n403' ]]; then
                   listener_found=1
                   break
                 fi
@@ -360,8 +379,11 @@ jobs:
             /bin/sleep 1
           done
           [[ "${listener_found}" -eq 1 ]]
+          }
+          wait_for_health
           test -f "${RUNTIME_STDERR_LOG}"
           /usr/bin/grep -Fxq 'desktop_diagnostics_ready' "${RUNTIME_STDERR_LOG}"
+          accept_feedback fresh
 
           /usr/bin/osascript -e 'tell application id "com.poly.desktop" to quit'
           for ((attempt = 1; attempt <= 30; attempt++)); do
@@ -372,14 +394,32 @@ jobs:
           done
           [[ -z "${remaining}" && "${app_count}" -eq 0 ]]
 
-          /usr/bin/open -n "${INSTALLED_APP}"
-          /bin/sleep 2
+          accept_feedback seed-0009
+          "${APP_EXECUTABLE}" >>"${APP_STDOUT}" 2>>"${APP_STDERR}" &
+          app_pid=$!
+          wait_for_health
+          accept_feedback upgraded
+          /usr/bin/osascript -e 'tell application id "com.poly.desktop" to quit'
+          for ((attempt = 1; attempt <= 30; attempt++)); do
+            remaining="$("${GITHUB_WORKSPACE}/packaging/macos/verify-bundle.sh" --enumerate-runtime "${RUNTIME_ROOT}/" "${INSTALLED_APP}/Contents/MacOS/Poly")"
+            app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
+            [[ -z "${remaining}" && "${app_count}" -eq 0 ]] && break
+            /bin/sleep 1
+          done
+          [[ -z "${remaining}" && "${app_count}" -eq 0 ]]
+          "${APP_EXECUTABLE}" >>"${APP_STDOUT}" 2>>"${APP_STDERR}" &
+          app_pid=$!
+          wait_for_health
+          accept_feedback persisted
           if [[ "${IS_RELEASE}" == 'true' ]]; then
             printf '%s' "${SMOKE_SECRET}" \
               | "${RUNTIME_EXECUTABLE}" --keychain-smoke verify --account "${SMOKE_ACCOUNT}" >/dev/null
           fi
-          /usr/bin/open -n "${INSTALLED_APP}"
+          "${APP_EXECUTABLE}" >>"${APP_STDOUT}" 2>>"${APP_STDERR}" &
+          second_pid=$!
           /bin/sleep 3
+          ! /bin/kill -0 "${second_pid}" 2>/dev/null
+          wait_for_health
           app_count="$(/usr/bin/osascript -e 'tell application "System Events" to count (application processes whose bundle identifier is "com.poly.desktop")')"
           [[ "${app_count}" -eq 1 ]]
 

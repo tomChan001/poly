@@ -232,6 +232,9 @@ def self_test(
         for module_name in (
             "backend.app.db.base",
             "backend.app.db.tables",
+            "backend.app.adapters.native_fees",
+            "backend.app.services.pair_previews",
+            "backend.app.services.pair_risk",
             "sqlalchemy.dialects.postgresql.asyncpg",
             "asyncpg",
         ):

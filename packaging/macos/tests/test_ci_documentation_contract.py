@@ -207,7 +207,7 @@ def test_smoke_uses_an_isolated_home_installed_dmg_and_command_guards() -> None:
         "hdiutil attach",
         "hdiutil detach",
         "ditto",
-        "open -n",
+        '"${APP_EXECUTABLE}" >>"${APP_STDOUT}" 2>>"${APP_STDERR}" &',
         '"${RUNTIME_EXECUTABLE}" --keychain-smoke set --account',
         '"${RUNTIME_EXECUTABLE}" --keychain-smoke verify --account',
         '"${RUNTIME_EXECUTABLE}" --keychain-smoke delete --account',
@@ -224,13 +224,13 @@ def test_smoke_uses_an_isolated_home_installed_dmg_and_command_guards() -> None:
     for absolute_tool in (
         "/usr/bin/hdiutil",
         "/usr/bin/ditto",
-        "/usr/bin/open",
+        "/bin/kill",
         "/usr/bin/security",
         "/usr/bin/osascript",
         "/usr/sbin/lsof",
     ):
         assert absolute_tool in workflow
-    assert workflow.count("open -n") >= 2
+    assert smoke.count('"${APP_EXECUTABLE}" >>"${APP_STDOUT}" 2>>"${APP_STDERR}" &') >= 4
     assert "security add-generic-password" not in workflow
     assert "security find-generic-password" not in workflow
     assert "uv run" not in smoke
@@ -240,8 +240,8 @@ def test_smoke_uses_an_isolated_home_installed_dmg_and_command_guards() -> None:
         smoke,
     )
     assert re.search(
-        r"--keychain-smoke set.*?/usr/bin/open -n.*?tell application id.*?"
-        r"/usr/bin/open -n.*?--keychain-smoke verify.*?--keychain-smoke delete",
+        r'--keychain-smoke set.*?"\$\{APP_EXECUTABLE\}".*?tell application id.*?'
+        r'"\$\{APP_EXECUTABLE\}".*?--keychain-smoke verify.*?--keychain-smoke delete',
         smoke,
         re.DOTALL,
     )
@@ -260,7 +260,7 @@ def test_installed_dmg_smoke_asserts_desktop_diagnostics_ready_marker() -> None:
         "/usr/bin/grep -Fxq 'desktop_diagnostics_ready' "
         '"${RUNTIME_STDERR_LOG}"'
     )
-    launch = '/usr/bin/open -n "${INSTALLED_APP}"'
+    launch = '"${APP_EXECUTABLE}" >>"${APP_STDOUT}" 2>>"${APP_STDERR}" &'
 
     assert log_assignment in smoke
     assert marker_assertion in smoke

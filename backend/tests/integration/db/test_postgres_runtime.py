@@ -123,6 +123,7 @@ async def test_initial_migration_runs_on_postgres_and_protects_audit_events() ->
                 "maximum_unhedged_seconds",
                 "maximum_unhedged_loss",
                 "maximum_arrival_gap_seconds",
+                "minimum_liquidity_contracts",
             }
 
             incident_columns = set(

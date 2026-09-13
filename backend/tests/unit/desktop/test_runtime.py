@@ -1276,7 +1276,12 @@ def test_self_test_checks_resources_and_writable_temp_directory(tmp_path: Path) 
 
 @pytest.mark.parametrize(
     "missing_module",
-    ["backend.app.db.tables", "backend.app.db.base", "asyncpg"],
+    [
+        "backend.app.db.tables", "backend.app.db.base", "asyncpg",
+        "backend.app.adapters.native_fees",
+        "backend.app.services.pair_previews",
+        "backend.app.services.pair_risk",
+    ],
 )
 def test_self_test_rejects_missing_migration_import(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_module: str
