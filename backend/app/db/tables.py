@@ -38,6 +38,9 @@ class RiskPolicyVersion(Base):
     maximum_unhedged_seconds: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
     maximum_unhedged_loss: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
     maximum_arrival_gap_seconds: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    minimum_liquidity_contracts: Mapped[Decimal] = mapped_column(
+        MONEY, nullable=False, server_default="1"
+    )
 
 
 class VenueMarket(IdTimestampMixin, Base):

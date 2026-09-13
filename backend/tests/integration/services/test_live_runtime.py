@@ -336,6 +336,8 @@ async def test_live_cycle_does_not_reserve_or_submit_when_publication_fails() ->
             minimum_quantity=Decimal(10),
             quantity_step=Decimal(1),
             enabled=True,
+            kalshi_expected_settlement_at=NOW + timedelta(days=2),
+            polymarket_expected_settlement_at=NOW + timedelta(days=3),
             kalshi_category="standard",
             polymarket_category="standard",
         )
@@ -395,6 +397,8 @@ async def test_closing_opening_after_evaluation_publishes_without_submitting() -
             minimum_quantity=Decimal(10),
             quantity_step=Decimal(1),
             enabled=True,
+            kalshi_expected_settlement_at=NOW + timedelta(days=2),
+            polymarket_expected_settlement_at=NOW + timedelta(days=3),
             kalshi_category="standard",
             polymarket_category="standard",
         )
@@ -459,6 +463,8 @@ async def test_live_cycle_executes_reviewed_profitable_pair_once_per_book_sequen
             minimum_quantity=Decimal(10),
             quantity_step=Decimal(1),
             enabled=True,
+            kalshi_expected_settlement_at=NOW + timedelta(days=2),
+            polymarket_expected_settlement_at=NOW + timedelta(days=3),
             kalshi_category="standard",
             polymarket_category="standard",
         )
@@ -560,6 +566,8 @@ async def test_cancel_after_reservation_commit_releases_unclaimed_capital() -> N
             minimum_quantity=Decimal(10),
             quantity_step=Decimal(1),
             enabled=True,
+            kalshi_expected_settlement_at=NOW + timedelta(days=2),
+            polymarket_expected_settlement_at=NOW + timedelta(days=3),
             kalshi_category="standard",
             polymarket_category="standard",
         )
@@ -619,6 +627,8 @@ async def test_concurrent_live_cycles_submit_each_book_once() -> None:
             minimum_quantity=Decimal(10),
             quantity_step=Decimal(1),
             enabled=True,
+            kalshi_expected_settlement_at=NOW + timedelta(days=2),
+            polymarket_expected_settlement_at=NOW + timedelta(days=3),
             kalshi_category="standard",
             polymarket_category="standard",
         )
@@ -683,6 +693,8 @@ async def test_live_cycle_uses_the_risk_policy_snapshot_refreshed_this_cycle() -
             minimum_quantity=Decimal(10),
             quantity_step=Decimal(1),
             enabled=True,
+            kalshi_expected_settlement_at=NOW + timedelta(days=2),
+            polymarket_expected_settlement_at=NOW + timedelta(days=3),
             kalshi_category="standard",
             polymarket_category="standard",
         )
@@ -748,6 +760,8 @@ async def test_two_runtimes_leave_the_winners_reservation_on_a_lost_claim() -> N
             minimum_quantity=Decimal(10),
             quantity_step=Decimal(1),
             enabled=True,
+            kalshi_expected_settlement_at=NOW + timedelta(days=2),
+            polymarket_expected_settlement_at=NOW + timedelta(days=3),
             kalshi_category="standard",
             polymarket_category="standard",
         )
@@ -840,6 +854,8 @@ async def test_off_cycle_retries_submitted_recovery_and_converts_reservation() -
             minimum_quantity=Decimal(10),
             quantity_step=Decimal(1),
             enabled=True,
+            kalshi_expected_settlement_at=NOW + timedelta(days=2),
+            polymarket_expected_settlement_at=NOW + timedelta(days=3),
             kalshi_category="standard",
             polymarket_category="standard",
         )
@@ -950,6 +966,8 @@ async def test_terminal_settlement_failure_retries_without_resubmitting_orders()
             minimum_quantity=Decimal(10),
             quantity_step=Decimal(1),
             enabled=True,
+            kalshi_expected_settlement_at=NOW + timedelta(days=2),
+            polymarket_expected_settlement_at=NOW + timedelta(days=3),
             kalshi_category="standard",
             polymarket_category="standard",
         )
@@ -1071,6 +1089,8 @@ async def test_live_cycle_releases_reservation_when_order_outcome_stays_unknown(
             minimum_quantity=Decimal(10),
             quantity_step=Decimal(1),
             enabled=True,
+            kalshi_expected_settlement_at=NOW + timedelta(days=2),
+            polymarket_expected_settlement_at=NOW + timedelta(days=3),
             kalshi_category="standard",
             polymarket_category="standard",
         )
@@ -1133,6 +1153,8 @@ async def test_late_settlement_is_retained_as_structured_rejection() -> None:
             minimum_quantity=Decimal(10),
             quantity_step=Decimal(1),
             enabled=True,
+            kalshi_expected_settlement_at=NOW + timedelta(days=2),
+            polymarket_expected_settlement_at=NOW + timedelta(days=3),
             kalshi_category="standard",
             polymarket_category="standard",
             worst_case_settlement_at=NOW + timedelta(days=31),
@@ -1205,6 +1227,8 @@ async def test_stale_book_is_retained_as_structured_rejection() -> None:
             minimum_quantity=Decimal(10),
             quantity_step=Decimal(1),
             enabled=True,
+            kalshi_expected_settlement_at=NOW + timedelta(days=2),
+            polymarket_expected_settlement_at=NOW + timedelta(days=3),
             kalshi_category="standard",
             polymarket_category="standard",
         )
@@ -1284,6 +1308,8 @@ async def test_below_minimum_quantity_retains_calculated_quote_metrics() -> None
             minimum_quantity=Decimal(21),
             quantity_step=Decimal(1),
             enabled=True,
+            kalshi_expected_settlement_at=NOW + timedelta(days=2),
+            polymarket_expected_settlement_at=NOW + timedelta(days=3),
             kalshi_category="standard",
             polymarket_category="standard",
         )

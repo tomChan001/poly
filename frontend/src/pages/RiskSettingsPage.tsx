@@ -6,6 +6,7 @@ import type { RiskPolicy, RiskPolicyUpdate } from '../types/risk'
 
 interface RiskForm {
   minimumRoiPercent: string
+  minimumLiquidityContracts: string
   maximumSettlementDays: string
   maximumBookAgeSeconds: string
   perTradeLimit: string
@@ -75,6 +76,7 @@ const toRatio = (percent: string) => moveDecimal(percent, -2)
 function toForm(policy: RiskPolicy): RiskForm {
   return {
     minimumRoiPercent: toPercent(policy.minimum_roi),
+    minimumLiquidityContracts: expandScientificDecimal(policy.minimum_liquidity_contracts ?? '1'),
     maximumSettlementDays: String(policy.maximum_settlement_days),
     maximumBookAgeSeconds: expandScientificDecimal(policy.maximum_book_age_seconds),
     perTradeLimit: expandScientificDecimal(policy.per_trade_limit),
@@ -91,6 +93,7 @@ function toForm(policy: RiskPolicy): RiskForm {
 function toUpdate(form: RiskForm): RiskPolicyUpdate {
   return {
     minimum_roi: toRatio(form.minimumRoiPercent),
+    minimum_liquidity_contracts: form.minimumLiquidityContracts,
     maximum_settlement_days: Number(form.maximumSettlementDays),
     maximum_book_age_seconds: form.maximumBookAgeSeconds,
     per_trade_limit: form.perTradeLimit,
@@ -113,6 +116,7 @@ interface ValidationRule {
 
 const validationRules: ValidationRule[] = [
   { name: 'minimumRoiPercent', label: '最低保守 ROI' },
+  { name: 'minimumLiquidityContracts', label: '最低配对流动性', positive: true },
   { name: 'maximumSettlementDays', label: '最长预计结算', positive: true, integer: true },
   { name: 'maximumBookAgeSeconds', label: '行情最大年龄', positive: true },
   { name: 'perTradeLimit', label: '单笔上限', positive: true },
@@ -298,6 +302,8 @@ export function RiskSettingsPage() {
                 <RiskInput label="最低保守 ROI" name="minimumRoiPercent" value={form.minimumRoiPercent} onChange={updateField} suffix="%" min="0" max="100" step="any" />
                 <RiskInput label="最长预计结算" name="maximumSettlementDays" value={form.maximumSettlementDays} onChange={updateField} suffix="天" min="1" step="1" />
                 <RiskInput label="行情最大年龄" name="maximumBookAgeSeconds" value={form.maximumBookAgeSeconds} onChange={updateField} suffix="秒" min="0" step="any" />
+                <RiskInput label="最低配对流动性" name="minimumLiquidityContracts" value={form.minimumLiquidityContracts} onChange={updateField} suffix="份" min="0" step="any" />
+                <p className="settings-help">按两边当前最优卖价的可买数量中较小的一边计算，必须大于 0。</p>
               </div>
               <div className="settings-group">
                 <h3>资本限额</h3>

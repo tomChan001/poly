@@ -86,6 +86,7 @@ class PostgresRiskPolicyStore:
             maximum_arrival_gap_seconds=Decimal(
                 str(row["maximum_arrival_gap_seconds"])
             ),
+            minimum_liquidity_contracts=Decimal(str(row["minimum_liquidity_contracts"])),
         )
 
 
@@ -104,6 +105,7 @@ def _parameters(policy: RiskPolicy) -> dict[str, object]:
         "maximum_unhedged_seconds": policy.maximum_unhedged_seconds,
         "maximum_unhedged_loss": policy.maximum_unhedged_loss,
         "maximum_arrival_gap_seconds": policy.maximum_arrival_gap_seconds,
+        "minimum_liquidity_contracts": policy.minimum_liquidity_contracts,
     }
 
 
@@ -122,6 +124,7 @@ def _snapshot(value: RiskPolicyInput) -> RiskPolicy:
         maximum_unhedged_seconds=value.maximum_unhedged_seconds,
         maximum_unhedged_loss=value.maximum_unhedged_loss,
         maximum_arrival_gap_seconds=value.maximum_arrival_gap_seconds,
+        minimum_liquidity_contracts=value.minimum_liquidity_contracts,
     )
 
 
@@ -134,13 +137,13 @@ async def _insert(session: AsyncSession, policy: RiskPolicy) -> None:
                 maximum_book_age_seconds, per_trade_limit, per_event_limit,
                 portfolio_limit, explicit_cost, risk_buffer,
                 maximum_unhedged_seconds, maximum_unhedged_loss,
-                maximum_arrival_gap_seconds
+                maximum_arrival_gap_seconds, minimum_liquidity_contracts
             ) VALUES (
                 :version, :created_at, :minimum_roi, :maximum_settlement_days,
                 :maximum_book_age_seconds, :per_trade_limit, :per_event_limit,
                 :portfolio_limit, :explicit_cost, :risk_buffer,
                 :maximum_unhedged_seconds, :maximum_unhedged_loss,
-                :maximum_arrival_gap_seconds
+                :maximum_arrival_gap_seconds, :minimum_liquidity_contracts
             )
             """
         ),

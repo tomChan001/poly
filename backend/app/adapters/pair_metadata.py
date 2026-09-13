@@ -1,7 +1,8 @@
 import json
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -89,20 +90,18 @@ class NativePairMetadataResolver:
             "orderMinSize",
             "minimum_order_size",
         )
-        kalshi_settlement = _datetime_field(
-            kalshi_payload,
-            "settlement_date",
-            "expiration_time",
-            "close_date",
-            "end_date",
-        )
+        kalshi_settlement, kalshi_latest = _kalshi_settlements(kalshi_payload)
         polymarket_settlement = _datetime_field(
             polymarket,
+            "settlementDate",
+            "resolutionDate",
             "endDate",
             "end_date",
-            "resolutionDate",
-            "settlementDate",
         )
+        kalshi_market_url = _official_market_url(
+            _optional_text(kalshi_payload, "rules_url"), "kalshi.com", "/markets/"
+        ) or _official_market_url(kalshi_leg.market_url, "kalshi.com", "/markets/")
+        polymarket_market_url = _polymarket_market_url(polymarket, polymarket_leg)
 
         # Kalshi accepts whole contract counts, so the shared quantity step is
         # one contract even when Polymarket exposes finer token quantities.
@@ -112,23 +111,37 @@ class NativePairMetadataResolver:
             kalshi_outcome=_outcome(kalshi_leg),
             kalshi_rule_text=kalshi.rule_text,
             kalshi_rule_url=kalshi.rule_url,
+            kalshi_market_url=kalshi_market_url,
             polymarket_market_id=token_id,
             polymarket_outcome=_outcome(polymarket_leg),
             polymarket_rule_text=polymarket_rule,
-            polymarket_rule_url=(
-                polymarket_leg.market_url or f"https://polymarket.com/event/{slug}"
+            polymarket_rule_url=polymarket_market_url,
+            polymarket_market_url=polymarket_market_url,
+            polymarket_resolution_source=_text_field(polymarket, "resolutionSource"),
+            minimum_quantity=max(
+                kalshi.minimum_quantity, polymarket_minimum, Decimal(1)
             ),
-            minimum_quantity=max(kalshi.minimum_quantity, polymarket_minimum, Decimal(1)),
             quantity_step=Decimal(1),
             enabled=True,
             kalshi_expected_settlement_at=kalshi_settlement,
             polymarket_expected_settlement_at=polymarket_settlement,
-            worst_case_settlement_at=max(
-                [value for value in (kalshi_settlement, polymarket_settlement) if value is not None],
-                default=None,
+            # A planning horizon, not a guaranteed bound: Gamma endDate is an
+            # estimate and resolution disputes can delay either venue.
+            worst_case_settlement_at=(
+                max(
+                    kalshi_settlement,
+                    kalshi_latest or kalshi_settlement,
+                    polymarket_settlement,
+                )
+                if kalshi_settlement is not None and polymarket_settlement is not None
+                else None
             ),
-            kalshi_category=_text_field(kalshi_payload, "category", "series_ticker", "seriesTicker"),
-            polymarket_category=_text_field(polymarket, "category", "seriesSlug", "groupItemTitle"),
+            kalshi_category=_text_field(
+                kalshi_payload, "category", "series_ticker", "seriesTicker"
+            ),
+            polymarket_category=_text_field(
+                polymarket, "category", "seriesSlug", "groupItemTitle"
+            ),
             kalshi_minimum_tick=kalshi.minimum_tick,
             polymarket_minimum_tick=_decimal_field(
                 polymarket,
@@ -169,7 +182,9 @@ def _gamma_payload(response: httpx.Response) -> object:
 
 
 def _object_list(payload: object, name: str) -> list[dict[str, object]]:
-    if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
+    if not isinstance(payload, list) or not all(
+        isinstance(item, dict) for item in payload
+    ):
         raise TypeError(f"Polymarket {name} response must be an object list")
     return payload
 
@@ -179,7 +194,8 @@ def _event_markets(payload: object) -> list[dict[str, object]]:
     markets: list[dict[str, object]] = []
     for event in events:
         raw_markets = event.get("markets", [])
-        markets.extend(_object_list(raw_markets, "event markets"))
+        for market in _object_list(raw_markets, "event markets"):
+            markets.append({**market, "events": [{"slug": event.get("slug")}]})
     return markets
 
 
@@ -207,7 +223,9 @@ def _select_polymarket_market(
         if str(market.get("question", "")).strip().casefold() == title
     ]
     if len(matches) != 1:
-        raise ValueError("Polymarket reference must resolve to one uniquely matched market")
+        raise ValueError(
+            "Polymarket reference must resolve to one uniquely matched market"
+        )
     return matches[0]
 
 
@@ -224,12 +242,17 @@ def _polymarket_token(
         matches = [token for token in token_ids if token == expected_token_id]
         if len(matches) != 1:
             raise ValueError("Polymarket token ID must resolve to one native token")
+        normalized_outcomes = [label.strip().lower() for label in outcomes]
+        if set(normalized_outcomes) == {"yes", "no"}:
+            selected_outcome = normalized_outcomes[token_ids.index(expected_token_id)]
+            if selected_outcome != outcome.strip().lower():
+                raise ValueError("Polymarket token ID does not match requested outcome")
         return matches[0]
     normalized = outcome.strip().lower()
     matches = [
         token
         for label, token in zip(outcomes, token_ids, strict=True)
-        if label.lower() == normalized
+        if label.strip().lower() == normalized
     ]
     if len(matches) != 1:
         raise ValueError(f"Polymarket outcome has no unique token: {outcome}")
@@ -238,7 +261,9 @@ def _polymarket_token(
 
 def _string_list(value: object, name: str) -> list[str]:
     parsed = json.loads(value) if isinstance(value, str) else value
-    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+    if not isinstance(parsed, list) or not all(
+        isinstance(item, str) for item in parsed
+    ):
         raise TypeError(f"Polymarket {name} must be a string list")
     return parsed
 
@@ -287,8 +312,72 @@ def _datetime_field(payload: dict[str, object], *names: str) -> datetime | None:
     for name in names:
         value = payload.get(name)
         if isinstance(value, str) and value.strip():
-            return datetime.fromisoformat(value).astimezone(UTC)
+            parsed = datetime.fromisoformat(value)
+            return (
+                parsed.replace(tzinfo=UTC)
+                if parsed.tzinfo is None
+                else parsed.astimezone(UTC)
+            )
     return None
+
+
+def _kalshi_settlements(
+    payload: dict[str, object],
+) -> tuple[datetime | None, datetime | None]:
+    settled = _datetime_field(payload, "settlement_ts", "settlement_date")
+    if settled is not None:
+        return settled, settled
+    expected = _datetime_field(
+        payload, "expected_expiration_time", "latest_expiration_time", "expiration_time"
+    )
+    latest = _datetime_field(payload, "latest_expiration_time", "expiration_time")
+    timer = payload.get("settlement_timer_seconds", 0)
+    if isinstance(timer, bool) or not isinstance(timer, int) or timer < 0:
+        raise ValueError(
+            "Kalshi settlement_timer_seconds must be a non-negative integer"
+        )
+    delay = timedelta(seconds=timer)
+    return (
+        expected + delay if expected is not None else None,
+        latest + delay if latest is not None else None,
+    )
+
+
+def _official_market_url(value: str | None, host: str, prefix: str) -> str:
+    if not value or any(ord(character) < 32 for character in value) or "\\" in value:
+        return ""
+    try:
+        parsed = urlsplit(value.strip())
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname not in {host, f"www.{host}"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port not in {None, 443}
+            or not parsed.path.startswith(prefix)
+        ):
+            return ""
+    except ValueError:
+        return ""
+    return value.strip()
+
+
+def _polymarket_market_url(payload: dict[str, object], leg: OddpoolLeg) -> str:
+    source_url = _official_market_url(leg.market_url, "polymarket.com", "/event/")
+    if source_url:
+        return source_url
+    market_slug = _optional_text(payload, "slug")
+    events = payload.get("events")
+    if isinstance(events, list) and len(events) == 1 and isinstance(events[0], dict):
+        event_slug = _optional_text(events[0], "slug")
+        if event_slug:
+            path = quote(event_slug, safe="")
+            if market_slug and market_slug != event_slug:
+                path += "/" + quote(market_slug, safe="")
+            return f"https://polymarket.com/event/{path}"
+    return (
+        f"https://polymarket.com/event/{quote(market_slug or leg.market_ref, safe='')}"
+    )
 
 
 def _text_field(payload: dict[str, object], *names: str) -> str:

@@ -327,7 +327,10 @@ async def test_resolver_derives_kalshi_rule_url_when_native_api_omits_it() -> No
         ).resolve(opportunity)
 
     assert pair.kalshi_market_id == ticker
-    assert pair.kalshi_rule_text == "Resolves yes if Floyd Mayweather wins the bout."
+    assert pair.kalshi_rule_text == (
+        "Resolves yes if Floyd Mayweather wins the bout.\n\n"
+        "Official results determine the outcome."
+    )
     assert pair.kalshi_rule_url == f"https://kalshi.com/markets/{ticker}"
     assert pair.kalshi_minimum_tick == Decimal("0.01")
     assert pair.minimum_quantity >= Decimal(1)

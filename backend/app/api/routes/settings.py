@@ -37,6 +37,9 @@ class RiskPolicyRequest(BaseModel):
     maximum_unhedged_seconds: PositiveDecimal
     maximum_unhedged_loss: NonNegativeDecimal
     maximum_arrival_gap_seconds: PositiveDecimal = Decimal("0.5")
+    minimum_liquidity_contracts: Annotated[
+        Decimal, Field(gt=0, allow_inf_nan=False)
+    ] = Decimal(1)
 
 
 @router.get("/risk")

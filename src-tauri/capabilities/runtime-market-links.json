@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "runtime-market-links",
+  "description": "Open official market links from the local runtime page",
+  "windows": ["main"],
+  "local": false,
+  "remote": { "urls": ["http://127.0.0.1:*/*"] },
+  "permissions": ["allow-open-market-url"]
+}

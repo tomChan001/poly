@@ -2,6 +2,7 @@ export interface RiskPolicy {
   version: string
   created_at: string
   minimum_roi: string
+  minimum_liquidity_contracts?: string
   maximum_settlement_days: number
   maximum_book_age_seconds: string
   per_trade_limit: string

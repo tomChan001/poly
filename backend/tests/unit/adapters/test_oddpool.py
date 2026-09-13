@@ -20,6 +20,22 @@ def load_official_fixture() -> list[dict[str, object]]:
     )
 
 
+def test_official_row_preserves_provided_venue_market_links() -> None:
+    row = load_official_fixture()[0]
+    row["kalshi"]["market_url"] = "https://kalshi.com/markets/series/title/event"
+    row["polymarket"]["market_url"] = "https://polymarket.com/event/event/market"
+    opportunity = OddpoolArbitrageRow.model_validate(row).to_opportunity()
+    assert opportunity is not None
+    assert opportunity.legs[0].market_url == row["kalshi"]["market_url"]
+    assert opportunity.legs[1].market_url == row["polymarket"]["market_url"]
+
+
+def test_official_row_does_not_manufacture_kalshi_contract_link() -> None:
+    opportunity = OddpoolArbitrageRow.model_validate(load_official_fixture()[0]).to_opportunity()
+    assert opportunity is not None
+    assert opportunity.legs[0].market_url is None
+
+
 @pytest.mark.asyncio
 async def test_oddpool_import_is_idempotent_and_keeps_prices_as_evidence_only() -> None:
     response = OddpoolResponse.model_validate(load_fixture())

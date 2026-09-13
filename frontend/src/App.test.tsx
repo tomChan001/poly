@@ -55,6 +55,7 @@ test('loads and saves the active risk policy', async () => {
 
   await waitFor(() => expect(savedBody).not.toBeNull())
   expect(savedBody).toEqual({
+    minimum_liquidity_contracts: '1',
     minimum_roi: '0.05',
     maximum_settlement_days: 30,
     maximum_book_age_seconds: '2',
@@ -197,6 +198,7 @@ test('normalizes backend scientific decimal strings before displaying and saving
 
   fireEvent.click(screen.getByRole('button', { name: '保存策略' }))
   await waitFor(() => expect(savedBody).toEqual({
+    minimum_liquidity_contracts: '1',
     minimum_roi: '0.0000001',
     maximum_settlement_days: 30,
     maximum_book_age_seconds: '0.0000001',
@@ -1181,6 +1183,7 @@ const runtimeStatus = {
 }
 
 const pendingPair = {
+  preview: { eligible: true, rejection_reasons: [], evaluated_at: '2026-08-21T02:01:00Z', risk_policy_version: 'risk-v1', conservative_roi: null, gross_roi: null, quantity: null, paired_liquidity: null, total_fees: null },
   id: 'pair-1',
   title: '示例互补市场',
   kalshi_market_id: 'K-MARKET',
@@ -1194,6 +1197,15 @@ const pendingPair = {
   minimum_quantity: '10',
   quantity_step: '1',
   enabled: true,
+  kalshi_expected_settlement_at: '2026-09-01T00:00:00Z',
+  polymarket_expected_settlement_at: null,
+  worst_case_settlement_at: '2026-09-08T00:00:00Z',
+  kalshi_category: '政治',
+  polymarket_category: '新闻',
+  kalshi_minimum_tick: '0.01',
+  polymarket_minimum_tick: '0.001',
+  native_fingerprint: 'sha256:native-hidden',
+  material_fingerprint: 'sha256:material-hidden',
   status: 'pending_review',
   checklist: null,
   truth_table: [],
@@ -1219,7 +1231,7 @@ test('shows real runtime state and lets a human review market equivalence', asyn
           json: async () => ({ ...pendingPair, status: 'exact', checklist: reviewBody?.checklist }),
         })
       }
-      if (url.endsWith('/api/pairs')) {
+      if (url.endsWith('/api/pairs?with_preview=true')) {
         return Promise.resolve({ ok: true, json: async () => [pendingPair] })
       }
       if (url.includes('/health')) {
@@ -1246,6 +1258,33 @@ test('shows real runtime state and lets a human review market equivalence', asyn
   fireEvent.click(screen.getByRole('button', { name: '审核' }))
   expect(await screen.findByRole('heading', { name: '市场对审核' })).toBeInTheDocument()
   expect(await screen.findByRole('heading', { name: '示例互补市场' })).toBeInTheDocument()
+  expect(screen.getByText('候选更新时间')).toBeInTheDocument()
+  expect(screen.getByText('2026/08/21 10:00')).toBeInTheDocument()
+  expect(screen.getByText('Kalshi 预计结算')).toBeInTheDocument()
+  expect(screen.getByText('2026/09/01 08:00')).toBeInTheDocument()
+  const polymarketSettlement = screen.getByText('Polymarket 预计结算').closest('div')
+  expect(polymarketSettlement).not.toBeNull()
+  expect(within(polymarketSettlement!).getByText('平台暂未提供')).toBeInTheDocument()
+  expect(screen.getByText('预计最晚结算')).toBeInTheDocument()
+  expect(screen.getByText('2026/09/08 08:00')).toBeInTheDocument()
+  expect(screen.getByText('均为北京时间')).toBeInTheDocument()
+  expect(screen.getByText('最小下单数量')).toBeInTheDocument()
+  expect(screen.getByText('10 份')).toBeInTheDocument()
+  expect(screen.getByText('数量递增单位')).toBeInTheDocument()
+  expect(screen.getByText('1 份')).toBeInTheDocument()
+  expect(screen.getByText('Kalshi 市场类别')).toBeInTheDocument()
+  expect(screen.getByText('政治')).toBeInTheDocument()
+  expect(screen.getByText('Polymarket 市场类别')).toBeInTheDocument()
+  expect(screen.getByText('新闻')).toBeInTheDocument()
+  expect(screen.getByText('Kalshi 最小价格变化')).toBeInTheDocument()
+  expect(screen.getByText('$0.01')).toBeInTheDocument()
+  expect(screen.getByText('Polymarket 最小价格变化')).toBeInTheDocument()
+  expect(screen.getByText('$0.001')).toBeInTheDocument()
+  expect(screen.getByText('已启用')).toBeInTheDocument()
+  expect(screen.getByText('尚未审核')).toBeInTheDocument()
+  expect(screen.getAllByText('待审核')).toHaveLength(3)
+  expect(screen.queryByText('sha256:native-hidden')).not.toBeInTheDocument()
+  expect(screen.queryByText('sha256:material-hidden')).not.toBeInTheDocument()
   const candidateScrollRegion = screen.getByRole('region', { name: 'Oddpool 候选内容' })
   const candidateHeading = screen.getByRole('heading', { name: 'Oddpool 候选' })
   const candidateButton = await screen.findByRole('button', { name: /示例互补市场/ })
@@ -1257,21 +1296,23 @@ test('shows real runtime state and lets a human review market equivalence', asyn
   expect(screen.queryByRole('heading', { name: '新建市场对' })).not.toBeInTheDocument()
   expect(screen.queryByRole('button', { name: '保存市场对' })).not.toBeInTheDocument()
 
-  for (const checkbox of screen.getAllByRole('checkbox', { name: /^已核对/ })) {
+  const checkboxes = screen.getAllByRole('checkbox', { name: /^已核对/ })
+  for (const checkbox of checkboxes.slice(1)) {
     fireEvent.click(checkbox)
   }
-  expect(
-    screen.getAllByRole('checkbox', { name: /^已核对/ })
-      .filter((checkbox) => !(checkbox as HTMLInputElement).checked)
-      .map((checkbox) => checkbox.getAttribute('aria-label')),
-  ).toEqual([])
-  const confirmExact = screen.getByRole('button', { name: '确认 EXACT' })
+  expect(screen.getByText('还有 1 项未核对')).toBeInTheDocument()
+  expect(screen.getByText(/任何一项规则不同，都可能导致两个市场不能互相对冲/)).toBeInTheDocument()
+  const confirmExact = screen.getByRole('button', { name: '确认可以配对' })
+  expect(confirmExact).toBeDisabled()
+  fireEvent.click(checkboxes[0])
+  expect(screen.getByText('10 项都已核对，可以确认配对。')).toBeInTheDocument()
   expect(confirmExact).toBeEnabled()
   fireEvent.click(confirmExact)
 
-  expect(await screen.findByText('审核已保存，可进入自动执行')).toBeInTheDocument()
+  expect(await screen.findByText('已保存：系统会把这两个市场当作一对来评估。')).toBeInTheDocument()
   expect(reviewBody).toMatchObject({
     status: 'exact',
+    checklist: { subject: true },
     truth_table: [
       { kalshi: '1', polymarket: '0' },
       { kalshi: '0', polymarket: '1' },
@@ -1291,7 +1332,7 @@ test('preserves an unsaved review draft across automatic candidate refreshes', a
         if (url.includes('/api/runtime')) {
           return Promise.resolve({ ok: true, json: async () => runtimeStatus })
         }
-        if (url.endsWith('/api/pairs')) {
+        if (url.endsWith('/api/pairs?with_preview=true')) {
           pairReads += 1
           return Promise.resolve({ ok: true, json: async () => [{ ...pendingPair }] })
         }
@@ -1354,7 +1395,7 @@ test('discards the current draft without prompting when switching candidates', a
       if (url.includes('/api/runtime')) {
         return Promise.resolve({ ok: true, json: async () => runtimeStatus })
       }
-      if (url.endsWith('/api/pairs')) {
+      if (url.endsWith('/api/pairs?with_preview=true')) {
         return Promise.resolve({ ok: true, json: async () => [pendingPair, secondPair] })
       }
       if (url.includes('/health')) {
@@ -1395,7 +1436,7 @@ test('keeps the empty oddpool candidate state inside the scroll region', async (
       if (url.includes('/api/runtime')) {
         return Promise.resolve({ ok: true, json: async () => runtimeStatus })
       }
-      if (url.endsWith('/api/pairs')) {
+      if (url.endsWith('/api/pairs?with_preview=true')) {
         return Promise.resolve({ ok: true, json: async () => [] })
       }
       if (url.includes('/health')) {
@@ -1420,4 +1461,29 @@ test('keeps the empty oddpool candidate state inside the scroll region', async (
 
   expect(within(candidateScrollRegion).getByText('暂无自动发现的待审核候选')).toBeInTheDocument()
   expect(candidateScrollRegion).not.toContainElement(candidateHeading)
+})
+
+test('loads a compatible liquidity default, requires a positive amount and saves decimal strings', async () => {
+  let savedBody: Record<string, unknown> | null = null
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input)
+    if (url.includes('/api/settings/risk')) {
+      if (init?.method === 'PUT') savedBody = JSON.parse(String(init.body))
+      return Promise.resolve({ ok: true, json: async () => riskPolicy })
+    }
+    if (url.includes('/api/runtime')) return Promise.resolve({ ok: true, json: async () => runtimeStatus })
+    if (url.includes('/health')) return Promise.resolve({ ok: true, json: async () => ({ status: 'ok' }) })
+    return Promise.resolve({ ok: true, json: async () => [] })
+  }))
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '风控' }))
+  const liquidity = await screen.findByLabelText('最低配对流动性')
+  expect(liquidity).toHaveValue(1)
+  fireEvent.change(liquidity, { target: { value: '0' } })
+  fireEvent.click(screen.getByRole('button', { name: '保存策略' }))
+  expect(screen.getByText('最低配对流动性必须大于 0')).toBeInTheDocument()
+  expect(savedBody).toBeNull()
+  fireEvent.change(liquidity, { target: { value: '12.345' } })
+  fireEvent.click(screen.getByRole('button', { name: '保存策略' }))
+  await waitFor(() => expect(savedBody).toMatchObject({ minimum_liquidity_contracts: '12.345' }))
 })

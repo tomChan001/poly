@@ -1,7 +1,7 @@
 import asyncio
 import inspect
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
@@ -32,6 +32,7 @@ from backend.app.services.opportunities import (
 )
 from backend.app.services.optimizer import ExecutableQuote, QuoteOptimizer, QuotePolicy
 from backend.app.services.orderbooks import BookSynchronizationError, synchronize_books
+from backend.app.services.pair_risk import liquidity_reasons, settlement_reasons
 from backend.app.services.runtime_status import RuntimeStatusService
 from backend.app.services.settings import RiskPolicy, RiskPolicyStore
 from backend.app.services.system_control import SystemControl
@@ -344,16 +345,13 @@ class LiveRuntimeService:
         ports: dict[Venue, BalanceTradingPort],
         now: datetime,
     ) -> PairEvaluation | None:
-        if (
-            pair.worst_case_settlement_at is not None
-            and pair.worst_case_settlement_at
-            > now + timedelta(days=policy.maximum_settlement_days)
-        ):
+        settlement_failures = settlement_reasons(pair, policy, now)
+        if settlement_failures:
             return _rejected_evaluation(
                 pair,
                 policy,
                 now,
-                ("SETTLEMENT_TOO_LATE",),
+                settlement_failures,
             )
 
         kalshi_book, polymarket_book = await market_data.get_books(pair, now)
@@ -386,6 +384,13 @@ class LiveRuntimeService:
                 polymarket_book=books.polymarket,
             )
 
+        liquidity_failures = liquidity_reasons(books.kalshi, books.polymarket, policy)
+        if liquidity_failures:
+            return _rejected_evaluation(
+                pair, policy, now, liquidity_failures,
+                kalshi_book=books.kalshi, polymarket_book=books.polymarket,
+            )
+
         kalshi_balance, polymarket_balance = await _gather_balances(ports)
         self._capital_ledger.sync_available_balances(
             kalshi_available=kalshi_balance,
@@ -396,37 +401,50 @@ class LiveRuntimeService:
             sum((level.quantity for level in books.kalshi.asks), Decimal(0)),
             sum((level.quantity for level in books.polymarket.asks), Decimal(0)),
         )
+        quote_policy = QuotePolicy(
+            minimum_roi=policy.minimum_roi,
+            minimum_quantity=pair.minimum_quantity,
+            maximum_quantity=maximum_quantity,
+            quantity_step=pair.quantity_step,
+            explicit_cost=policy.explicit_cost,
+            risk_buffer=policy.risk_buffer,
+            kalshi_balance=self._capital_ledger.available(Venue.KALSHI),
+            polymarket_balance=self._capital_ledger.available(Venue.POLYMARKET),
+            per_trade_limit=policy.per_trade_limit,
+            per_event_limit=self._capital_ledger.remaining_event_limit(
+                pair.id,
+                policy.per_event_limit,
+            ),
+            portfolio_limit=self._capital_ledger.remaining_portfolio_limit(
+                policy.portfolio_limit
+            ),
+        )
         quote_result = self._optimizer.optimize(
             mapping_status=pair.status,
             kalshi_category=pair.kalshi_category,
             polymarket_category=pair.polymarket_category,
             kalshi_asks=list(books.kalshi.asks),
             polymarket_asks=list(books.polymarket.asks),
-            policy=QuotePolicy(
-                minimum_roi=policy.minimum_roi,
-                maximum_quantity=maximum_quantity,
-                quantity_step=pair.quantity_step,
-                explicit_cost=policy.explicit_cost,
-                risk_buffer=policy.risk_buffer,
-                kalshi_balance=self._capital_ledger.available(Venue.KALSHI),
-                polymarket_balance=self._capital_ledger.available(Venue.POLYMARKET),
-                per_trade_limit=policy.per_trade_limit,
-                per_event_limit=self._capital_ledger.remaining_event_limit(
-                    pair.id,
-                    policy.per_event_limit,
-                ),
-                portfolio_limit=self._capital_ledger.remaining_portfolio_limit(
-                    policy.portfolio_limit
-                ),
-            ),
+            policy=quote_policy,
         )
         quote = quote_result.best_quote
         if quote is None:
+            diagnostic_quote = None
+            if "BELOW_MINIMUM_QUANTITY" in quote_result.rejection_reasons:
+                diagnostic_quote = self._optimizer.optimize(
+                    mapping_status=pair.status,
+                    kalshi_category=pair.kalshi_category,
+                    polymarket_category=pair.polymarket_category,
+                    kalshi_asks=list(books.kalshi.asks),
+                    polymarket_asks=list(books.polymarket.asks),
+                    policy=replace(quote_policy, minimum_quantity=Decimal(0)),
+                ).best_quote
             return _rejected_evaluation(
                 pair,
                 policy,
                 now,
                 quote_result.rejection_reasons,
+                quote=diagnostic_quote,
                 kalshi_book=books.kalshi,
                 polymarket_book=books.polymarket,
                 balance_versions=(str(kalshi_balance), str(polymarket_balance)),

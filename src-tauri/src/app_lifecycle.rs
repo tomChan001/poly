@@ -468,7 +468,8 @@ pub(crate) fn configure_tauri_builder(
         }))
         .invoke_handler(tauri::generate_handler![
             crate::retry_desktop_runtime,
-            crate::reveal_desktop_logs
+            crate::reveal_desktop_logs,
+            crate::open_market_url
         ])
         .setup(crate::setup_desktop_runtime)
         .on_window_event(|window, event| {

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from decimal import ROUND_FLOOR, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from backend.app.domain.enums import MappingStatus, Venue
 from backend.app.domain.market import BookLevel
@@ -24,6 +24,7 @@ class QuotePolicy:
     per_trade_limit: Decimal
     per_event_limit: Decimal
     portfolio_limit: Decimal
+    minimum_quantity: Decimal = Decimal(0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +121,13 @@ class QuoteOptimizer:
         maximum_depth = _round_down(maximum_depth, policy.quantity_step)
         if maximum_depth <= 0:
             return OptimizationResult(None, ("INSUFFICIENT_DEPTH",))
+        minimum_quantity = max(
+            policy.quantity_step,
+            (policy.minimum_quantity / policy.quantity_step).to_integral_value(rounding=ROUND_CEILING)
+            * policy.quantity_step,
+        )
+        if maximum_depth < minimum_quantity:
+            return OptimizationResult(None, ("BELOW_MINIMUM_QUANTITY",))
 
         candidates = self._candidate_quantities(
             kalshi_asks,
@@ -142,13 +150,14 @@ class QuoteOptimizer:
             raise
         if feasible_quantity > 0:
             candidates = [quantity for quantity in candidates if quantity <= feasible_quantity]
-            quantity = policy.quantity_step
+            quantity = minimum_quantity
             while quantity <= feasible_quantity:
                 candidates.append(quantity)
                 quantity += policy.quantity_step
             candidates = sorted(set(candidates))
         else:
-            candidates = [policy.quantity_step]
+            candidates = [minimum_quantity]
+        candidates = [quantity for quantity in candidates if quantity >= minimum_quantity] or [minimum_quantity]
         eligible: list[ExecutableQuote] = []
         rejection_reasons: list[str] = []
         for quantity in candidates:

@@ -181,7 +181,10 @@ def test_kalshi_market_derives_rule_url_when_api_omits_it() -> None:
         }
     )
 
-    assert market.rule_text == "Resolves yes if Floyd Mayweather wins the bout."
+    assert market.rule_text == (
+        "Resolves yes if Floyd Mayweather wins the bout.\n\n"
+        "Official results determine the outcome."
+    )
     assert market.rule_url == (
         "https://kalshi.com/markets/KXBOXING-26SEP19FMAYMPAC-FMAY"
     )

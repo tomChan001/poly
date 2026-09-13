@@ -43,6 +43,7 @@ class OddpoolOfficialVenue(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     market_ticker: str | None = None
+    market_url: str | None = None
     condition_id: str | None = None
     yes_token_id: str | None = None
     no_token_id: str | None = None
@@ -139,9 +140,7 @@ class OddpoolArbitrageRow(BaseModel):
                     venue=Venue.KALSHI,
                     outcome=kalshi_side,
                     market_ref=self.kalshi.market_ticker,
-                    market_url=(
-                        f"https://kalshi.com/markets/{self.kalshi.market_ticker}"
-                    ),
+                    market_url=self.kalshi.market_url,
                     display_price=str(kalshi_price),
                 ),
                 OddpoolLeg(
@@ -149,7 +148,8 @@ class OddpoolArbitrageRow(BaseModel):
                     outcome=polymarket_side,
                     market_ref=self.polymarket_event_slug,
                     market_url=(
-                        f"https://polymarket.com/event/{self.polymarket_event_slug}"
+                        self.polymarket.market_url
+                        or f"https://polymarket.com/event/{self.polymarket_event_slug}"
                     ),
                     display_price=str(polymarket_price),
                     source_condition_id=self.polymarket.condition_id,

@@ -4,9 +4,25 @@ from decimal import Decimal
 import httpx
 import pytest
 
-from backend.app.adapters.native_market_data import NativeMarketDataClient
+from backend.app.adapters.native_market_data import (
+    NativeMarketDataClient,
+    _normalize_kalshi_payload,
+)
 from backend.app.domain.enums import MappingStatus
 from backend.app.services.executable_pairs import ExecutablePair
+
+
+def test_fixed_point_kalshi_book_keeps_dollar_prices_and_fractional_quantity():
+    result = _normalize_kalshi_payload({"orderbook_fp": {
+        "yes_dollars": [["0.3025", "12.50"]], "no_dollars": [["0.6900", "7.25"]],
+    }})
+    assert result["yes"] == [("0.3025", "12.50")]
+    assert result["no"] == [("0.6900", "7.25")]
+
+
+def test_missing_kalshi_orderbook_is_not_silently_an_empty_book():
+    with pytest.raises(TypeError):
+        _normalize_kalshi_payload({"error": "unavailable"})
 
 
 @pytest.mark.asyncio

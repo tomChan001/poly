@@ -86,13 +86,16 @@ def _object_payload(response: httpx.Response) -> dict[str, object]:
 
 
 def _normalize_kalshi_payload(payload: dict[str, object]) -> dict[str, object]:
-    raw_book = payload.get("orderbook", payload)
+    fixed_point = "orderbook_fp" in payload
+    raw_book = payload.get("orderbook_fp", payload.get("orderbook", payload))
     if not isinstance(raw_book, dict):
         raise TypeError("Kalshi response is missing orderbook data")
-
+    yes_key, no_key = ("yes_dollars", "no_dollars") if fixed_point else ("yes", "no")
+    if yes_key not in raw_book and no_key not in raw_book:
+        raise TypeError("Kalshi response is missing orderbook sides")
     normalized: dict[str, object] = {
-        "yes": _kalshi_levels(raw_book.get("yes", [])),
-        "no": _kalshi_levels(raw_book.get("no", [])),
+        "yes": _kalshi_levels(raw_book.get(yes_key) or [], dollars=fixed_point),
+        "no": _kalshi_levels(raw_book.get(no_key) or [], dollars=fixed_point),
     }
     sequence = payload.get("sequence") or raw_book.get("sequence")
     if sequence is None:
@@ -120,7 +123,7 @@ def _capture_time(payload: dict[str, object]) -> datetime | None:
     return None
 
 
-def _kalshi_levels(value: object) -> list[tuple[str, object]]:
+def _kalshi_levels(value: object, *, dollars: bool = False) -> list[tuple[str, object]]:
     if not isinstance(value, list):
         raise TypeError("Kalshi order book side must be a list")
     levels: list[tuple[str, object]] = []
@@ -133,6 +136,6 @@ def _kalshi_levels(value: object) -> list[tuple[str, object]]:
         # The domain decimal parser deliberately accepts text instead of an
         # already-created Decimal, keeping every external numeric boundary
         # consistent and rejecting accidental binary floats.
-        normalized_price = Decimal(price) / Decimal(100)
+        normalized_price = Decimal(price) if dollars else Decimal(price) / Decimal(100)
         levels.append((format(normalized_price, "f"), quantity))
     return levels

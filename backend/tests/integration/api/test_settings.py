@@ -1,3 +1,4 @@
+from dataclasses import asdict
 from datetime import datetime, timedelta
 
 import httpx
@@ -41,6 +42,7 @@ async def test_settings_update_creates_new_version() -> None:
     assert response.status_code == 200
     assert response.json()["minimum_roi"] == "0.05"
     assert response.json()["maximum_arrival_gap_seconds"] == "0.5"
+    assert response.json()["minimum_liquidity_contracts"] == "1"
     assert response.json()["version"] != original_version
 
 
@@ -64,6 +66,7 @@ async def test_risk_policy_update_is_returned_as_the_active_policy_with_utc_time
         "maximum_unhedged_seconds": "1.5",
         "maximum_unhedged_loss": "1.25",
         "maximum_arrival_gap_seconds": "0.25",
+        "minimum_liquidity_contracts": "25.5",
     }
     transport = httpx.ASGITransport(app=app)
 
@@ -168,3 +171,23 @@ async def test_negative_risk_limit_is_rejected() -> None:
         )
 
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["0", "-1", "NaN", "Infinity", "-Infinity", None, ""])
+async def test_invalid_liquidity_does_not_replace_active_policy(value: str | None) -> None:
+    container = ApplicationContainer()
+    original = container.risk_policies.current
+    app = create_app(container)
+    app.dependency_overrides[get_current_principal] = lambda: Principal(
+        "operator", frozenset({Role.OPERATOR})
+    )
+    payload = {key: str(item) for key, item in asdict(RiskPolicyInput.defaults()).items()}
+    payload["minimum_liquidity_contracts"] = value
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.put("/api/settings/risk", json=payload)
+
+    assert response.status_code == 422
+    assert container.risk_policies.current is original

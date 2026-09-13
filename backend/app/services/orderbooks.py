@@ -45,6 +45,7 @@ def synchronize_books(
     now: datetime,
     maximum_age: timedelta,
     maximum_arrival_gap: timedelta,
+    require_capture_time: bool = True,
 ) -> SynchronizedBooks:
     # `received_at` protects the local pipeline, while `captured_at` protects
     # against a venue returning an old snapshot in a newly completed response.
@@ -54,17 +55,19 @@ def synchronize_books(
         polymarket.captured_at,
         polymarket.received_at,
     )
-    if any(timestamp is None for timestamp in timestamps):
+    if require_capture_time and any(timestamp is None for timestamp in timestamps):
         raise BookSynchronizationError(
             "missing venue freshness evidence",
             code="BOOK_FRESHNESS_EVIDENCE_MISSING",
         )
     complete_timestamps = tuple(timestamp for timestamp in timestamps if timestamp is not None)
+    if any(timestamp > now for timestamp in complete_timestamps):
+        raise BookSynchronizationError("order book timestamp is in the future", code="BOOK_TIME_IN_FUTURE")
     if any(now - timestamp > maximum_age for timestamp in complete_timestamps):
         raise BookSynchronizationError("stale order book")
 
     arrival_gap = abs(kalshi.received_at - polymarket.received_at)
     if arrival_gap > maximum_arrival_gap:
-        raise BookSynchronizationError("order book arrival gap exceeds limit")
+        raise BookSynchronizationError("order book arrival gap exceeds limit", code="BOOK_ARRIVAL_GAP")
 
     return SynchronizedBooks(kalshi, polymarket)

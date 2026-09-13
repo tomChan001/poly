@@ -8,7 +8,13 @@ from backend.app.domain.metadata import MarketMetadata
 
 def normalize_kalshi_market(payload: dict[str, Any]) -> MarketMetadata:
     ticker = _required_text(payload, "ticker")
-    rules_primary = _required_text(payload, "rules_primary")
+    _required_text(payload, "rules_primary")
+    rules_secondary = payload.get("rules_secondary")
+    if rules_secondary is not None and not isinstance(rules_secondary, str):
+        raise TypeError("Kalshi rules_secondary must be text")
+    rule_text = payload["rules_primary"]
+    if rules_secondary and rules_secondary.strip():
+        rule_text += "\n\n" + rules_secondary
     rules_url_value = payload.get("rules_url")
     rules_url = (
         rules_url_value.strip()
@@ -22,7 +28,7 @@ def normalize_kalshi_market(payload: dict[str, Any]) -> MarketMetadata:
         title=str(payload["title"]),
         status=str(payload["status"]),
         outcomes=("yes", "no"),
-        rule_text=rules_primary,
+        rule_text=rule_text,
         rule_url=rules_url,
         minimum_tick=_minimum_tick(payload),
         minimum_quantity=_minimum_quantity(payload),

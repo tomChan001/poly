@@ -41,7 +41,8 @@ async def test_postgres_risk_policy_history_survives_store_recreation() -> None:
                         risk_buffer NUMERIC(38, 18) NOT NULL,
                         maximum_unhedged_seconds NUMERIC(38, 18) NOT NULL,
                         maximum_unhedged_loss NUMERIC(38, 18) NOT NULL,
-                        maximum_arrival_gap_seconds NUMERIC(38, 18) NOT NULL
+                        maximum_arrival_gap_seconds NUMERIC(38, 18) NOT NULL,
+                        minimum_liquidity_contracts NUMERIC(38, 18) NOT NULL DEFAULT 1
                     )
                     """
                 )
@@ -52,13 +53,19 @@ async def test_postgres_risk_policy_history_survives_store_recreation() -> None:
         first = await store.create(RiskPolicyInput.defaults())
         created_versions.append(first.version)
         second = await store.create(
-            replace(RiskPolicyInput.defaults(), minimum_roi=Decimal("0.07"))
+            replace(
+                RiskPolicyInput.defaults(),
+                minimum_roi=Decimal("0.07"),
+                minimum_liquidity_contracts=Decimal("25.125"),
+            )
         )
         created_versions.append(second.version)
 
         recreated = PostgresRiskPolicyStore(sessions)
         assert await recreated.get(first.version) == first
         assert await recreated.get(second.version) == second
+        assert first.minimum_liquidity_contracts == Decimal(1)
+        assert second.minimum_liquidity_contracts == Decimal("25.125")
         assert await recreated.initialize() == second
         assert recreated.current == second
 
@@ -124,7 +131,8 @@ async def test_concurrent_postgres_risk_policy_initialize_seeds_one_default_vers
                         risk_buffer NUMERIC(38, 18) NOT NULL,
                         maximum_unhedged_seconds NUMERIC(38, 18) NOT NULL,
                         maximum_unhedged_loss NUMERIC(38, 18) NOT NULL,
-                        maximum_arrival_gap_seconds NUMERIC(38, 18) NOT NULL
+                        maximum_arrival_gap_seconds NUMERIC(38, 18) NOT NULL,
+                        minimum_liquidity_contracts NUMERIC(38, 18) NOT NULL DEFAULT 1
                     )
                     """
                 )

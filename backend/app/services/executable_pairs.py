@@ -28,6 +28,9 @@ class ExecutablePairInput:
     minimum_quantity: Decimal
     quantity_step: Decimal
     enabled: bool
+    kalshi_market_url: str = ""
+    polymarket_market_url: str = ""
+    polymarket_resolution_source: str = ""
     kalshi_expected_settlement_at: datetime | None = None
     polymarket_expected_settlement_at: datetime | None = None
     worst_case_settlement_at: datetime | None = None
@@ -211,6 +214,7 @@ def build_pair_fingerprints(value: ExecutablePairInput) -> tuple[str, str]:
         "kalshi_outcome": value.kalshi_outcome,
         "kalshi_rule_text": value.kalshi_rule_text,
         "kalshi_rule_url": value.kalshi_rule_url,
+        "kalshi_market_url": value.kalshi_market_url,
         "kalshi_expected_settlement_at": _encoded_datetime(value.kalshi_expected_settlement_at),
         "kalshi_category": value.kalshi_category,
         "kalshi_minimum_tick": _encoded_decimal(value.kalshi_minimum_tick),
@@ -218,6 +222,8 @@ def build_pair_fingerprints(value: ExecutablePairInput) -> tuple[str, str]:
         "polymarket_outcome": value.polymarket_outcome,
         "polymarket_rule_text": value.polymarket_rule_text,
         "polymarket_rule_url": value.polymarket_rule_url,
+        "polymarket_market_url": value.polymarket_market_url,
+        "polymarket_resolution_source": value.polymarket_resolution_source,
         "polymarket_expected_settlement_at": _encoded_datetime(
             value.polymarket_expected_settlement_at
         ),
@@ -240,6 +246,7 @@ def build_pair_fingerprints(value: ExecutablePairInput) -> tuple[str, str]:
             "polymarket_market_id",
             "polymarket_outcome",
             "polymarket_rule_text",
+            "polymarket_resolution_source",
             "polymarket_expected_settlement_at",
             "worst_case_settlement_at",
             "polymarket_category",
@@ -257,7 +264,11 @@ def _normalize_input(value: ExecutablePairInput) -> ExecutablePairInput:
         value.polymarket_expected_settlement_at
     )
     worst_case = _normalized_datetime(value.worst_case_settlement_at)
-    if worst_case is None:
+    if (
+        worst_case is None
+        and kalshi_expected_settlement_at is not None
+        and polymarket_expected_settlement_at is not None
+    ):
         settlements = [
             settlement
             for settlement in (

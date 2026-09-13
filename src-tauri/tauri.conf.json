@@ -23,7 +23,7 @@
       }
     ],
     "security": {
-      "capabilities": ["main"]
+      "capabilities": ["main", "runtime-market-links"]
     }
   },
   "bundle": {

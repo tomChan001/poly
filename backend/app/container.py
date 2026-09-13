@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async
 from backend.app.adapters.integration_probe import HttpIntegrationConnectionProbe
 from backend.app.adapters.kalshi.http_transport import KalshiHttpTransport
 from backend.app.adapters.kalshi.trading import KalshiTradingAdapter
+from backend.app.adapters.native_fees import NativePreviewFeeProvider
 from backend.app.adapters.native_market_data import NativeMarketDataClient
 from backend.app.adapters.polymarket.sdk_transport import PolymarketSdkTransport
 from backend.app.adapters.polymarket.trading import PolymarketTradingAdapter
@@ -32,6 +33,7 @@ from backend.app.services.execution_supervisor import (
 from backend.app.services.fees import FeeEngine
 from backend.app.services.integration_config import (
     InMemoryIntegrationConfigRepository,
+    IntegrationConfigRepository,
     IntegrationConfigService,
 )
 from backend.app.services.live_runtime import BalanceTradingPort, LiveRuntimeService
@@ -44,6 +46,7 @@ from backend.app.services.notifications import (
 from backend.app.services.opportunities import InMemoryOpportunityStore
 from backend.app.services.optimizer import QuoteOptimizer
 from backend.app.services.pair_discovery import ConfiguredOddpoolPairDiscoveryService
+from backend.app.services.pair_previews import PairPreviewService
 from backend.app.services.rules import InMemoryRuleStore, RuleService
 from backend.app.services.runtime_status import RuntimeStatusService
 from backend.app.services.settings import (
@@ -96,6 +99,38 @@ class ApplicationContainer:
         )
         self.live_runtime: LiveRuntimeService | None = None
         self.pair_discovery: ConfiguredOddpoolPairDiscoveryService | None = None
+        self.pair_previews = PairPreviewService(QuoteOptimizer(self.fees))
+        self._preview_configurations: IntegrationConfigRepository | None = None
+        self._preview_cursor = 0
+
+    async def build_pair_previews(self) -> PairPreviewService:
+        if self._preview_configurations is None or self._http_client is None:
+            return self.pair_previews
+        # Public market reads only need venue URLs; never load credentials to
+        # calculate review information or acquire any execution permissions.
+        from backend.app.services.integration_config import IntegrationProvider
+
+        records = {item.provider: item for item in await self._preview_configurations.list()}
+        kalshi = records.get(IntegrationProvider.KALSHI)
+        polymarket = records.get(IntegrationProvider.POLYMARKET)
+        if kalshi is None or polymarket is None or not kalshi.enabled or not polymarket.enabled:
+            return self.pair_previews
+        start_index = self._preview_cursor
+        self._preview_cursor += 4
+        return PairPreviewService(
+            QuoteOptimizer(self.fees),
+            NativeMarketDataClient(
+                kalshi_base_url=kalshi.base_url,
+                polymarket_base_url=polymarket.base_url,
+                http_client=self._http_client,
+            ),
+            NativePreviewFeeProvider(
+                kalshi_base_url=kalshi.base_url,
+                polymarket_base_url=polymarket.base_url,
+                http_client=self._http_client,
+            ),
+            start_index=start_index,
+        )
 
     @classmethod
     def runtime(
@@ -108,6 +143,7 @@ class ApplicationContainer:
         http_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
         container._engine = engine
         container._http_client = http_client
+        container._preview_configurations = PostgresIntegrationConfigRepository(sessions)
         container.risk_policies = PostgresRiskPolicyStore(sessions)
         container.integration_configs = IntegrationConfigService(
             PostgresIntegrationConfigRepository(sessions),

@@ -3,5 +3,5 @@
   "identifier": "main",
   "description": "Core capabilities for the Poly desktop window",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "allow-retry-desktop-runtime", "allow-reveal-desktop-logs"]
 }

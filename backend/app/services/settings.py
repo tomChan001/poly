@@ -18,6 +18,11 @@ class RiskPolicyInput:
     maximum_unhedged_seconds: Decimal
     maximum_unhedged_loss: Decimal
     maximum_arrival_gap_seconds: Decimal = Decimal("0.5")
+    # Smaller of the two venues' best-ask quantities, measured in contracts/shares.
+    minimum_liquidity_contracts: Decimal = Decimal(1)
+
+    def __post_init__(self) -> None:
+        _validate_minimum_liquidity(self.minimum_liquidity_contracts)
 
     @classmethod
     def defaults(cls) -> "RiskPolicyInput":
@@ -51,6 +56,15 @@ class RiskPolicy:
     maximum_unhedged_seconds: Decimal
     maximum_unhedged_loss: Decimal
     maximum_arrival_gap_seconds: Decimal = Decimal("0.5")
+    minimum_liquidity_contracts: Decimal = Decimal(1)
+
+    def __post_init__(self) -> None:
+        _validate_minimum_liquidity(self.minimum_liquidity_contracts)
+
+
+def _validate_minimum_liquidity(value: Decimal) -> None:
+    if not value.is_finite() or value <= 0:
+        raise ValueError("minimum_liquidity_contracts must be positive and finite")
 
 
 class RiskPolicyStore(Protocol):

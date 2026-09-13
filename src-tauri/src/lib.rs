@@ -1,5 +1,6 @@
 pub mod app_lifecycle;
 pub mod desktop_service;
+pub mod market_links;
 pub mod runtime;
 pub mod webview;
 
@@ -269,6 +270,30 @@ async fn reveal_desktop_logs(state: tauri::State<'_, DesktopAppState>) -> Result
         Ok(())
     } else {
         Err("diagnostic logs could not be revealed".to_owned())
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[tauri::command]
+async fn open_market_url(window: tauri::WebviewWindow, url: String) -> Result<(), String> {
+    let origin = window.url().map_err(|_| "market links are unavailable")?;
+    if window.label() != "main"
+        || origin.scheme() != "http"
+        || origin.host_str() != Some("127.0.0.1")
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+    {
+        return Err("market links are unavailable".to_owned());
+    }
+    let status = market_links::market_browser_command(&url)
+        .map_err(str::to_owned)?
+        .status()
+        .await
+        .map_err(|_| "browser could not be opened".to_owned())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("browser could not be opened".to_owned())
     }
 }
 

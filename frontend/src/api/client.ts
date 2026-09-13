@@ -105,8 +105,8 @@ export function saveRiskPolicy(value: RiskPolicyUpdate): Promise<RiskPolicy> {
 }
 
 
-export function getPairs(): Promise<ExecutablePair[]> {
-  return apiRequest<ExecutablePair[]>('/api/pairs')
+export function getPairs(signal?: AbortSignal): Promise<ExecutablePair[]> {
+  return apiRequest<ExecutablePair[]>('/api/pairs?with_preview=true', { signal })
 }
 
 
