@@ -358,6 +358,7 @@ async def test_live_cycle_does_not_reserve_or_submit_when_publication_fails() ->
     }
     capital = CapitalLedger({})
     runtime = LiveRuntimeService(
+        clock=lambda: NOW,
         integrations=integrations,
         pairs=pairs,
         risk_policies=InMemoryRiskPolicyStore(RiskPolicyInput.defaults()),
@@ -420,6 +421,7 @@ async def test_closing_opening_after_evaluation_publishes_without_submitting() -
     capital = CapitalLedger({})
     opportunities = ClosingOpportunityStore(control)
     runtime = LiveRuntimeService(
+        clock=lambda: NOW,
         integrations=integrations,
         pairs=pairs,
         risk_policies=InMemoryRiskPolicyStore(RiskPolicyInput.defaults()),
@@ -491,6 +493,7 @@ async def test_live_cycle_executes_reviewed_profitable_pair_once_per_book_sequen
     capital = CapitalLedger({})
     supervisor = RecordingExecutionSupervisor()
     runtime = LiveRuntimeService(
+        clock=lambda: NOW,
         integrations=integrations,
         pairs=pairs,
         risk_policies=risk,
@@ -513,6 +516,7 @@ async def test_live_cycle_executes_reviewed_profitable_pair_once_per_book_sequen
     control.set_opening(True, "operator enabled real ordering")
     second = await runtime.run_once(NOW)
     restarted_runtime = LiveRuntimeService(
+        clock=lambda: NOW,
         integrations=integrations,
         pairs=pairs,
         risk_policies=risk,
@@ -588,6 +592,7 @@ async def test_cancel_after_reservation_commit_releases_unclaimed_capital() -> N
     }
     capital = CancelAfterReserveLedger({})
     runtime = LiveRuntimeService(
+        clock=lambda: NOW,
         integrations=integrations,
         pairs=pairs,
         risk_policies=InMemoryRiskPolicyStore(RiskPolicyInput.defaults()),
@@ -650,6 +655,7 @@ async def test_concurrent_live_cycles_submit_each_book_once() -> None:
     capital = CapitalLedger({})
     market_data = ConcurrentMarketData()
     runtime = LiveRuntimeService(
+        clock=lambda: NOW,
         integrations=integrations,
         pairs=pairs,
         risk_policies=InMemoryRiskPolicyStore(RiskPolicyInput.defaults()),
@@ -720,6 +726,7 @@ async def test_live_cycle_uses_the_risk_policy_snapshot_refreshed_this_cycle() -
         Venue.POLYMARKET: FakeTradingPort(Venue.POLYMARKET),
     }
     runtime = LiveRuntimeService(
+        clock=lambda: NOW,
         integrations=integrations,
         pairs=pairs,
         risk_policies=risk,
@@ -805,6 +812,7 @@ async def test_two_runtimes_leave_the_winners_reservation_on_a_lost_claim() -> N
 
     def runtime(control: SystemControl) -> LiveRuntimeService:
         return LiveRuntimeService(
+            clock=lambda: NOW,
             integrations=integrations,
             pairs=pairs,
             risk_policies=InMemoryRiskPolicyStore(RiskPolicyInput.defaults()),
@@ -913,6 +921,7 @@ async def test_off_cycle_retries_submitted_recovery_and_converts_reservation() -
         event_id=pair.id,
     )
     runtime = LiveRuntimeService(
+        clock=lambda: NOW,
         integrations=integrations,
         pairs=pairs,
         risk_policies=InMemoryRiskPolicyStore(RiskPolicyInput.defaults()),
@@ -988,6 +997,7 @@ async def test_terminal_settlement_failure_retries_without_resubmitting_orders()
     }
     capital = CapitalLedger({})
     runtime = LiveRuntimeService(
+        clock=lambda: NOW,
         integrations=integrations,
         pairs=pairs,
         risk_policies=InMemoryRiskPolicyStore(RiskPolicyInput.defaults()),
@@ -1046,6 +1056,7 @@ async def test_off_cycle_recovers_submitted_execution_without_current_pairs() ->
     await capital.reserve_pair(correlation_id, Decimal(7), Decimal(2))
     opportunities = InMemoryOpportunityStore()
     runtime = LiveRuntimeService(
+        clock=lambda: NOW,
         integrations=integrations,
         pairs=ExecutablePairService(InMemoryExecutablePairRepository()),
         risk_policies=InMemoryRiskPolicyStore(RiskPolicyInput.defaults()),
@@ -1113,6 +1124,7 @@ async def test_live_cycle_releases_reservation_when_order_outcome_stays_unknown(
     }
     capital = CapitalLedger({})
     runtime = LiveRuntimeService(
+        clock=lambda: NOW,
         integrations=integrations,
         pairs=pairs,
         risk_policies=risk,
@@ -1178,6 +1190,7 @@ async def test_late_settlement_is_retained_as_structured_rejection() -> None:
         Venue.POLYMARKET: FakeTradingPort(Venue.POLYMARKET),
     }
     runtime = LiveRuntimeService(
+        clock=lambda: NOW,
         integrations=integrations,
         pairs=pairs,
         risk_policies=risk,
@@ -1254,6 +1267,7 @@ async def test_stale_book_is_retained_as_structured_rejection() -> None:
     }
     capital = CapitalLedger({})
     runtime = LiveRuntimeService(
+        clock=lambda: NOW,
         integrations=integrations,
         pairs=pairs,
         risk_policies=risk,
@@ -1341,6 +1355,7 @@ async def test_below_minimum_quantity_retains_calculated_quote_metrics() -> None
         Venue.POLYMARKET: polymarket_port,
     }
     runtime = LiveRuntimeService(
+        clock=lambda: NOW,
         integrations=integrations,
         pairs=pairs,
         risk_policies=risk,

@@ -2,7 +2,7 @@ import asyncio
 import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from typing import Protocol
@@ -93,6 +93,7 @@ class LiveRuntimeService:
         optimizer: QuoteOptimizer,
         capital_ledger: CapitalLedger,
         execution_supervisor: ExecutionSupervisorPort | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._integrations = integrations
         self._pairs = pairs
@@ -106,6 +107,7 @@ class LiveRuntimeService:
         self._optimizer = optimizer
         self._capital_ledger = capital_ledger
         self._execution_supervisor = execution_supervisor
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._processed_books: set[tuple[str, str, str]] = set()
         self._cycle_lock = asyncio.Lock()
 
@@ -355,6 +357,9 @@ class LiveRuntimeService:
             )
 
         kalshi_book, polymarket_book = await market_data.get_books(pair, now)
+        # Network receipts occur after cycle start. Validate against a fresh,
+        # trusted local time, never against timestamps supplied by the books.
+        now = self._clock()
         try:
             books = synchronize_books(
                 kalshi_book,
