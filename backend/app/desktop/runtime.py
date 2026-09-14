@@ -408,7 +408,8 @@ class DesktopRuntime:
         from backend.app.main import create_app
 
         container = ApplicationContainer.runtime(
-            configured_settings=configured_settings
+            configured_settings=configured_settings,
+            desktop_macos_no_ui=sys.platform == "darwin",
         )
         try:
             application = create_app(

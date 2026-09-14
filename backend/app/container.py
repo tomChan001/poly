@@ -9,7 +9,11 @@ from backend.app.adapters.native_market_data import NativeMarketDataClient
 from backend.app.adapters.polymarket.sdk_transport import PolymarketSdkTransport
 from backend.app.adapters.polymarket.trading import PolymarketTradingAdapter
 from backend.app.core.config import Settings, settings
-from backend.app.core.secrets import InMemorySecretStore, KeyringSecretStore
+from backend.app.core.secrets import (
+    InMemorySecretStore,
+    KeyringSecretStore,
+    SecretStore,
+)
 from backend.app.db.capital import PostgresCapitalLedger
 from backend.app.db.executable_pairs import PostgresExecutablePairRepository
 from backend.app.db.executions import PostgresExecutionStore
@@ -134,9 +138,19 @@ class ApplicationContainer:
 
     @classmethod
     def runtime(
-        cls, configured_settings: Settings | None = None
+        cls,
+        configured_settings: Settings | None = None,
+        *,
+        desktop_macos_no_ui: bool = False,
     ) -> "ApplicationContainer":
         active_settings = configured_settings or settings
+        secret_store: SecretStore
+        if desktop_macos_no_ui:
+            from backend.app.core.macos_secrets import MacOSNoUISecretStore
+
+            secret_store = MacOSNoUISecretStore(active_settings.credential_service_name)
+        else:
+            secret_store = KeyringSecretStore(active_settings.credential_service_name)
         container = cls(active_settings)
         engine = create_async_engine(active_settings.database_url, pool_pre_ping=True)
         sessions = async_sessionmaker(engine, expire_on_commit=False)
@@ -147,7 +161,7 @@ class ApplicationContainer:
         container.risk_policies = PostgresRiskPolicyStore(sessions)
         container.integration_configs = IntegrationConfigService(
             PostgresIntegrationConfigRepository(sessions),
-            KeyringSecretStore(active_settings.credential_service_name),
+            secret_store,
             HttpIntegrationConnectionProbe(http_client),
         )
         container.executions = PostgresExecutionStore(sessions)

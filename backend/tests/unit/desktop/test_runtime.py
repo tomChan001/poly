@@ -570,7 +570,7 @@ async def test_default_application_factory_closes_container_if_app_creation_fail
     monkeypatch.setattr(
         ApplicationContainer,
         "runtime",
-        classmethod(lambda _cls, *, configured_settings: container),
+        classmethod(lambda _cls, *, configured_settings, **_kwargs: container),
     )
 
     def fail_create_app(*_args: object, **_kwargs: object) -> FastAPI:
@@ -885,6 +885,50 @@ def test_container_runtime_uses_supplied_settings(
         "keyring": "explicit-keyring",
     }
     assert container.system_control.opening_enabled is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform, expected", [("darwin", True), ("win32", False), ("linux", False)])
+async def test_desktop_selects_no_ui_storage_only_on_macos(monkeypatch, tmp_path, platform, expected):
+    from types import SimpleNamespace
+
+    observed = {}
+    container = FakeContainer([])
+
+    def factory(_cls, **kwargs):
+        observed.update(kwargs)
+        return container
+
+    monkeypatch.setattr(ApplicationContainer, "runtime", classmethod(factory))
+    monkeypatch.setattr("backend.app.main.create_app", lambda *args, **kwargs: FastAPI())
+    monkeypatch.setattr("backend.app.desktop.runtime.sys", SimpleNamespace(platform=platform))
+    runtime = DesktopRuntime(project_root=tmp_path)
+    await runtime._create_application(Settings(_env_file=None), DesktopSession.create())
+    assert observed.get("desktop_macos_no_ui") is expected
+
+
+def test_explicit_desktop_container_uses_native_no_ui_store(monkeypatch):
+    import backend.app.core.macos_secrets as native
+
+    observed = {}
+    configured = Settings(_env_file=None, credential_service_name="com.poly.desktop.integrations")
+    monkeypatch.setattr("backend.app.container.create_async_engine", lambda *a, **k: object())
+    monkeypatch.setattr("backend.app.container.async_sessionmaker", lambda *a, **k: object())
+    monkeypatch.setattr("backend.app.container.httpx.AsyncClient", lambda **k: object())
+    sentinel = object()
+
+    def native_store(name):
+        observed["service"] = name
+        return sentinel
+
+    def reject_automatic(name):
+        pytest.fail("macOS desktop used automatic keyring")
+
+    monkeypatch.setattr(native, "MacOSNoUISecretStore", native_store)
+    monkeypatch.setattr("backend.app.container.KeyringSecretStore", reject_automatic)
+    container = ApplicationContainer.runtime(configured, desktop_macos_no_ui=True)
+    assert container.integration_configs._secrets is sentinel
+    assert observed == {"service": "com.poly.desktop.integrations"}
 
 
 @pytest.mark.asyncio
@@ -1278,6 +1322,7 @@ def test_self_test_checks_resources_and_writable_temp_directory(tmp_path: Path) 
     "missing_module",
     [
         "backend.app.db.tables", "backend.app.db.base", "asyncpg",
+        "backend.app.core.macos_secrets",
         "backend.app.adapters.native_fees",
         "backend.app.services.pair_previews",
         "backend.app.services.pair_risk",
@@ -1331,6 +1376,7 @@ async def test_keychain_smoke_uses_fixed_service_and_never_outputs_secret(
         return store
 
     monkeypatch.setattr(desktop_main, "KeyringSecretStore", keyring_store)
+    monkeypatch.setattr(desktop_main, "MacOSNoUISecretStore", keyring_store)
     account = "ci-smoke-1234-arm64"
     secret = b"synthetic-secret-that-must-not-be-printed"
 
@@ -1373,6 +1419,7 @@ async def test_keychain_smoke_rejects_non_ci_accounts_before_keyring_access(
         raise AssertionError("invalid accounts must not reach Keychain")
 
     monkeypatch.setattr(desktop_main, "KeyringSecretStore", unexpected_store)
+    monkeypatch.setattr(desktop_main, "MacOSNoUISecretStore", unexpected_store)
 
     event = await desktop_main.keychain_smoke(
         "set", account, secret_stream=BytesIO(b"synthetic")
@@ -1396,6 +1443,7 @@ async def test_keychain_smoke_rejects_unsafe_stdin_without_leaking_it(
 ) -> None:
     store = FakeKeychainSmokeStore()
     monkeypatch.setattr(desktop_main, "KeyringSecretStore", lambda _service: store)
+    monkeypatch.setattr(desktop_main, "MacOSNoUISecretStore", lambda _service: store)
 
     event = await desktop_main.keychain_smoke(
         "set", "ci-smoke-safe", secret_stream=BytesIO(secret)
@@ -1416,6 +1464,7 @@ async def test_keychain_smoke_verify_mismatch_is_sanitized(
     store = FakeKeychainSmokeStore()
     store.values["ci-smoke-safe"] = "stored-value"
     monkeypatch.setattr(desktop_main, "KeyringSecretStore", lambda _service: store)
+    monkeypatch.setattr(desktop_main, "MacOSNoUISecretStore", lambda _service: store)
 
     event = await desktop_main.keychain_smoke(
         "verify", "ci-smoke-safe", secret_stream=BytesIO(b"different-value")
@@ -1434,6 +1483,7 @@ def test_keychain_smoke_cli_reads_secret_only_from_stdin_and_emits_status(
     store = FakeKeychainSmokeStore()
     secret = b"stdin-only-synthetic-secret"
     monkeypatch.setattr(desktop_main, "KeyringSecretStore", lambda _service: store)
+    monkeypatch.setattr(desktop_main, "MacOSNoUISecretStore", lambda _service: store)
     monkeypatch.setattr(
         desktop_main.sys,
         "stdin",
