@@ -165,7 +165,9 @@ def test_workflow_has_the_required_ordered_locked_pipeline() -> None:
             if owner not in {"actions/checkout", "actions/upload-artifact"}
         },
         "actions/checkout": 2,
-        "actions/upload-artifact": 2,
+        "actions/setup-node": 2,
+        "astral-sh/setup-uv": 2,
+        "actions/upload-artifact": 3,
     }
 
 

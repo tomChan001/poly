@@ -13,6 +13,11 @@ on:
         required: false
         type: boolean
         default: false
+      full_acceptance:
+        description: Run full installed acceptance against the existing unchanged Apple Silicon DMG
+        required: false
+        type: boolean
+        default: false
   push:
     tags:
       - 'v*'
@@ -245,7 +250,10 @@ jobs:
           SMOKE_KEYCHAIN_PASSWORD="$(uuidgen)"
           SMOKE_SECRET="$(uuidgen)"
           APP_PATH="${GITHUB_WORKSPACE}/src-tauri/target/${POLY_TARGET_TRIPLE}/release/bundle/macos/Poly.app"
-          DMG_PATH="$(find "${GITHUB_WORKSPACE}/src-tauri/target/${POLY_TARGET_TRIPLE}/release/bundle/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          DMG_PATH="${POLY_EXISTING_DMG:-}"
+          if [[ -z "${DMG_PATH}" ]]; then
+            DMG_PATH="$(find "${GITHUB_WORKSPACE}/src-tauri/target/${POLY_TARGET_TRIPLE}/release/bundle/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          fi
           INSTALLED_APP="${SMOKE_APPLICATIONS}/Poly.app"
           RUNTIME_ROOT="${INSTALLED_APP}/Contents/Resources/poly-runtime"
           RUNTIME_EXECUTABLE="${RUNTIME_ROOT}/poly-runtime"
@@ -277,6 +285,7 @@ jobs:
             [[ "${#ORIGINAL_KEYCHAINS[@]}" -gt 0 ]]
           fi
           mkdir -p "${SMOKE_HOME}/Library/Application Support" "${SMOKE_HOME}/Library/Caches"
+          mkdir -p "${SMOKE_HOME}/Library/Preferences"
           mkdir -p "${SMOKE_APPLICATIONS}" "${GUARD_DIR}" "${MOUNT_POINT}" "${DIAGNOSTICS_DIR}"
           chmod 700 "${SMOKE_HOME}" "${SMOKE_APPLICATIONS}"
           : >"${GUARD_LOG}"
@@ -339,7 +348,9 @@ jobs:
           trap 'exit 130' INT
           trap 'exit 143' TERM
 
-          test -d "${APP_PATH}"
+          if [[ -z "${POLY_EXISTING_DMG:-}" ]]; then
+            test -d "${APP_PATH}"
+          fi
           test -n "${DMG_PATH}"
           /usr/bin/hdiutil attach "${DMG_PATH}" -mountpoint "${MOUNT_POINT}" -nobrowse -readonly
           mounted=1
@@ -348,6 +359,7 @@ jobs:
           /usr/bin/ditto "${SOURCE_APP}" "${INSTALLED_APP}"
           /usr/bin/hdiutil detach "${MOUNT_POINT}"
           mounted=0
+          "${GITHUB_WORKSPACE}/packaging/macos/verify-bundle.sh" --audit-bundle "${INSTALLED_APP}"
 
           # Keychain preferences and the frozen runtime must use the same HOME.
           export HOME="${SMOKE_HOME}"
@@ -512,10 +524,12 @@ jobs:
     name: Re-smoke existing Apple Silicon DMG
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.arm64_artifact_run_id != '' }}
     runs-on: macos-15
-    timeout-minutes: 10
+    timeout-minutes: 20
     env:
       POLY_TARGET_ARCH: arm64
       POLY_TARGET_TRIPLE: aarch64-apple-darwin
+      UV_PYTHON: '3.12.11'
+      UV_MANAGED_PYTHON: '1'
 
     steps:
       - name: Check out source
@@ -533,12 +547,65 @@ jobs:
           DMG_PATH="$(find "${RUNNER_TEMP}/poly-resmoke-artifact" -type f -name '*.dmg' -print -quit)"
           test -n "${DMG_PATH}"
           printf 'DMG_PATH=%s\n' "${DMG_PATH}" >>"${GITHUB_ENV}"
+          if [[ "${{ inputs.full_acceptance }}" == 'true' ]]; then
+            ARTIFACT_COMMIT="$(gh run view "${{ inputs.arm64_artifact_run_id }}" --repo "${GITHUB_REPOSITORY}" --json headSha --jq .headSha)"
+            [[ "${ARTIFACT_COMMIT}" =~ ^[0-9a-f]{40}$ ]]
+            git fetch --no-tags --depth=1 origin "${ARTIFACT_COMMIT}"
+            git diff --quiet "${ARTIFACT_COMMIT}" HEAD -- backend frontend src-tauri migrations pyproject.toml uv.lock alembic.ini
+            mkdir -p "${RUNNER_TEMP}/poly-diagnostics"
+            printf '{"artifact_run":"%s","artifact_commit":"%s","validation_commit":"%s"}\n' \
+              "${{ inputs.arm64_artifact_run_id }}" "${ARTIFACT_COMMIT}" "${GITHUB_SHA}" \
+              >"${RUNNER_TEMP}/poly-diagnostics/artifact-origin.json"
+            /usr/bin/shasum -a 256 "${DMG_PATH}" >"${RUNNER_TEMP}/poly-diagnostics/artifact-sha256.txt"
+          fi
+
+      - name: Set up Node for artifact acceptance
+        if: ${{ inputs.full_acceptance == true }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Rebuild source frontend for artifact comparison
+        if: ${{ inputs.full_acceptance == true }}
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Set up uv for artifact acceptance
+        if: ${{ inputs.full_acceptance == true }}
+        uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          version: '0.8.15'
+
+      - name: Prepare artifact acceptance Python
+        if: ${{ inputs.full_acceptance == true }}
+        run: |
+          uv python install "${UV_PYTHON}"
+          uv sync --frozen
+
+      - name: Full installed acceptance of unchanged artifact
+        if: ${{ inputs.full_acceptance == true }}
+        env:
+          POLY_EXISTING_DMG: ${{ env.DMG_PATH }}
+          SMOKE_ACCOUNT: ci-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+        run: uv run --frozen python packaging/macos/run-installed-smoke.py
+
+      - name: Upload full artifact acceptance diagnostics
+        if: ${{ always() && inputs.full_acceptance == true }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Poly-macos-arm64-full-acceptance-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/poly-diagnostics
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Compare frozen no-UI keychain environments
+        if: ${{ inputs.full_acceptance != true }}
         run: /usr/bin/python3 packaging/macos/probe-no-ui-artifact.py "${DMG_PATH}"
 
       - name: Re-smoke installed DMG with explicit phases
-        if: ${{ inputs.probe_only != true }}
+        if: ${{ inputs.probe_only != true && inputs.full_acceptance != true }}
         run: |
           set -euo pipefail
           SMOKE_ROOT="$(mktemp -d "${RUNNER_TEMP}/poly-resmoke.XXXXXXXX")"
