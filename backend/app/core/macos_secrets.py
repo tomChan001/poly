@@ -157,9 +157,9 @@ class NativeMacOSKeychain:
             self._check(self._security.SecKeychainItemFreeContent(None, data))
 
     def set_password(self, service: str, key: str, value: str) -> None:
+        value_bytes = value.encode("utf-8")
         item = ctypes.c_void_p()
         status = self._find(service, key, item=ctypes.byref(item))
-        value_bytes = value.encode("utf-8")
         if status == _NOT_FOUND:
             service_bytes, key_bytes = service.encode("utf-8"), key.encode("utf-8")
             self._check(

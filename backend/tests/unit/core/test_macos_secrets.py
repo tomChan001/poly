@@ -342,6 +342,17 @@ def test_native_locked_lookup_propagates_sanitized_error(native_backend, operati
     assert api.calls == ["disable", "find"]
 
 
+def test_native_invalid_unicode_does_not_acquire_an_item(native_backend):
+    backend, api = native_backend
+    api.value = b"original synthetic"
+
+    with pytest.raises(UnicodeEncodeError):
+        backend.set_password("service", "account", "\ud800")
+
+    assert api.calls == []
+    assert api.value == b"original synthetic"
+
+
 def test_native_failed_update_preserves_existing_value_and_releases_handle(
     native_backend,
 ):
