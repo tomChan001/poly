@@ -40,7 +40,9 @@ Intel 构建已配置，但在 `macos-15-intel` 的完整绿色原生 CI 运行�
 
 本 workflow 不连接真实市场服务，不使用真实市场凭证，也不执行真实订单。Python CI 只运行使用 fake/mock transports 的 unit 和 security 测试。
 
-经过 Developer ID 签名的 release 隔离 smoke 使用唯一的合成值和临时默认 Keychain，并调用安装后 `.app` 内的 `poly-runtime --keychain-smoke`，由打包的生产 `KeyringSecretStore` 和 macOS backend 执行 set/verify/delete。Secret 只经 stdin 传入，绝不出现在参数、日志或输出中；该命令固定使用 `com.poly.desktop.integrations`，只接受 `ci-smoke-*` account，也不提供 secret readback。测试在两次应用启动之间验证同一值，结束时删除测试项。临时 Keychain 只有在原 default/search list 成功恢复后才会删除，恢复失败会保留诊断并使 job 失败。普通 workflow-dispatch 验证使用 ad-hoc 签名，不执行可能触发 headless Security 授权的 Keychain 集成操作；Keyring 逻辑由单元测试覆盖。
+所有 GitHub 原生构建（包括 ad-hoc 验证）的安装包隔离 smoke 使用唯一的合成值和临时默认 Keychain，并调用安装后 `.app` 内的 `poly-runtime --keychain-smoke`。Mac 上该命令与生产桌面共用 `MacOSNoUISecretStore`，复用 `KeyringSecretStore` 的分块格式，但直接调用禁止交互的原生 Keychain API。Secret 只经 stdin 传入，绝不出现在参数、日志或输出中；service 为 `com.poly.desktop.integrations.no-ui.v1.<运行时文件SHA256>`，只接受 `ci-smoke-*` account，也不提供 secret readback。测试在两次应用启动之间验证同一值，结束时删除测试项，成功后生成 `keychain-no-ui-frozen.json`。临时 Keychain 只有在原 default/search list 成功恢复后才会删除，恢复失败会保留诊断并使 job 失败。
+
+所有原生构建（含 ad-hoc workflow-dispatch）还必须通过 `Run disposable no-UI keychain acceptance`：仅在 GitHub macOS 临时 runner 中创建独立测试钥匙串，每个原生读写都传入该钥匙串句柄，绝不访问真实用户的 login 钥匙串。创建可能自动注册测试钥匙串，因此立即及最终恢复原搜索列表，不重新设置默认钥匙串。测试覆盖短值、长值分块、跨进程重启、覆盖保存、删除、锁定时快速失败且保留旧值、构建隔离，以及旧 service 中的合成哨兵未被修改；每个子进程有 15 秒超时。只输出阶段和成功状态，不输出测试值。
 
 Smoke 同时使用 PATH deny shim 和精确的运行时进程证据。检查器单次读取 PID、父 PID 和参数的进程快照，以安装包内运行时绝对路径筛选种子进程，再沿父子关系纳入会改写参数的 PostgreSQL worker；每个候选进程仍通过逐 PID 的 `lsof` 核验真实可执行文件路径。运行时必须只监听 loopback，PostgreSQL 不得开放 TCP 端口，且 `python`、`python3`、`node`、`postgres`、`aws`、`docker` 或 `brew` 的 PATH deny shim 不得被调用。安装 smoke 设有 10 分钟步骤上限。Validation 即使失败也通过独立的 `always()` step 上传不含凭证值的工具链、签名检查和 bundle 清单诊断。
 
@@ -48,7 +50,7 @@ Smoke 同时使用 PATH deny shim 和精确的运行时进程证据。检查器�
 
 1. 根据 Mac 架构打开对应的已公证 DMG。
 2. 将 `Poly.app` 拖到 `/Applications`，再从 Applications 启动。
-3. 首次保存 Kalshi、Polymarket 或 Oddpool 凭证时，macOS 可能显示标准 Keychain 授权提示。确认应用是已验证的 Poly 后再授权；Poly 使用稳定 service name `com.poly.desktop.integrations`，升级后仍读取同一组授权。
+3. 打开“集成”，重新填写 Kalshi、Polymarket 和 Oddpool 的平台凭据。新版不读取或删除旧 `com.poly.desktop.integrations` service 的条目，不需要输入 Mac 登录密码；新凭据仍由系统钥匙串保护，不改存明文。同一安装包重启后继续使用已保存的值；运行时文件改变（包括后续更新或重新签名）后需要重新填写平台凭据。
 
 运营员无需安装任何其他运行时。应用只在本机回环地址提供 UI/API，PostgreSQL 只使用本地 Unix socket。没有 AWS runtime configuration，也不要为桌面版增加 AWS 凭证。
 
@@ -70,7 +72,7 @@ Smoke 同时使用 PATH deny shim 和精确的运行时进程证据。检查器�
 ## 故障恢复
 
 - 迁移失败：保持 Poly 退出，先制作停止状态备份，再查看 `logs`。不要反向修改 schema；恢复已验证备份或安装修复版本后再启动。
-- Keychain 拒绝：在 System Settings/Keychain Access 核对 Poly 的授权和 Developer ID；不要把凭证改存为文本文件。重新授权后使用错误页的“重试”。
+- Keychain 拒绝或锁定：程序会直接显示密钥存储不可用，不弹系统密码框、不把失败当保存成功，也不改存为文本文件。保留未保存的输入，等系统钥匙串恢复可用后重试。不要删除或重置用户钥匙串；若持续失败，保留应用数据并提供不含凭据的错误信息进行排查。
 - Runtime/resource 错误：从同一可信 release 重新安装对应架构的 `Poly.app`，不要删除 `Application Support/Poly`。先查看日志，再重试。
 - 重试仍失败：退出 Poly，保留数据目录与日志副本，记录应用版本、Mac 型号、架构和 Actions release run，然后升级处理。恢复数据时必须保持 Poly 停止，先把当前故障目录另存，再用已验证备份替换。
 

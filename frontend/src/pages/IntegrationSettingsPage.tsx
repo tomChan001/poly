@@ -43,6 +43,14 @@ interface EditableConfig {
 
 const ODDPOOL_BASE_URL = 'https://api.oddpool.com'
 
+function integrationError(error: unknown, fallback: string): string {
+  if (!(error instanceof Error)) return fallback
+  if (error.message === 'credential storage unavailable') {
+    return '无法安全访问密钥存储，本次操作未完成。请稍后重试。'
+  }
+  return error.message
+}
+
 const providers: ProviderDefinition[] = [
   {
     provider: 'oddpool',
@@ -151,7 +159,7 @@ export function IntegrationSettingsPage({
         })
       })
       .catch((error: unknown) => {
-        const text = error instanceof Error ? error.message : '读取集成配置失败'
+        const text = integrationError(error, '读取集成配置失败')
         setMessages(Object.fromEntries(providers.map((item) => [item.provider, { ok: false, text }])))
       })
       .finally(() => setLoading(false))
@@ -207,7 +215,7 @@ export function IntegrationSettingsPage({
     } catch (error) {
       setMessages((current) => ({
         ...current,
-        [provider]: { ok: false, text: error instanceof Error ? error.message : '保存失败' },
+        [provider]: { ok: false, text: integrationError(error, '保存失败') },
       }))
     } finally {
       setPending(null)
@@ -222,7 +230,7 @@ export function IntegrationSettingsPage({
     } catch (error) {
       setMessages((current) => ({
         ...current,
-        [provider]: { ok: false, text: error instanceof Error ? error.message : '连接失败' },
+        [provider]: { ok: false, text: integrationError(error, '连接失败') },
       }))
     } finally {
       setPending(null)
@@ -240,7 +248,7 @@ export function IntegrationSettingsPage({
     } catch (error) {
       setMessages((current) => ({
         ...current,
-        [provider]: { ok: false, text: error instanceof Error ? error.message : '删除失败' },
+        [provider]: { ok: false, text: integrationError(error, '删除失败') },
       }))
     } finally {
       setPending(null)
@@ -252,6 +260,11 @@ export function IntegrationSettingsPage({
       <section className="page-heading">
         <div><h2>集成配置</h2><p>平台连接、账户标识与凭证状态</p></div>
       </section>
+
+      <p className="integration-help">
+        Mac 桌面版不会请求系统密码。安装新版后，请重新填写平台 API 密钥；旧钥匙串记录会保留。
+        新密钥仍由系统钥匙串保护，同一安装版本重启后可继续使用。存储不可用时会报告失败，不会改用明文保存。
+      </p>
 
       <section className="real-ordering-panel" aria-labelledby="real-ordering-title">
         <div>

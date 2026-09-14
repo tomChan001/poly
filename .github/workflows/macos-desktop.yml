@@ -90,7 +90,12 @@ jobs:
             packaging/macos/tests/test_distribution_contract.py \
             packaging/macos/tests/test_ci_documentation_contract.py \
             packaging/macos/tests/test_feedback_release_acceptance.py \
+            packaging/macos/tests/test_no_ui_keychain_contract.py \
             -q
+
+      - name: Run disposable no-UI keychain acceptance
+        timeout-minutes: 3
+        run: uv run --frozen python packaging/macos/test-no-ui-keychain.py
 
       - name: Lint frontend
         working-directory: frontend
@@ -256,7 +261,7 @@ jobs:
           }
           ORIGINAL_DEFAULT_KEYCHAIN=""
           ORIGINAL_KEYCHAINS=()
-          if [[ "${IS_RELEASE}" == 'true' ]]; then
+          if [[ "${GITHUB_ACTIONS}" == 'true' ]]; then
             ORIGINAL_DEFAULT_KEYCHAIN="$(/usr/bin/security default-keychain -d user | trim_keychain_path)"
             while IFS= read -r keychain_path; do
               keychain_path="$(printf '%s\n' "${keychain_path}" | trim_keychain_path)"
@@ -334,7 +339,7 @@ jobs:
           /usr/bin/hdiutil detach "${MOUNT_POINT}"
           mounted=0
 
-          if [[ "${IS_RELEASE}" == 'true' ]]; then
+          if [[ "${GITHUB_ACTIONS}" == 'true' ]]; then
             /usr/bin/security create-keychain -p "${SMOKE_KEYCHAIN_PASSWORD}" "${SMOKE_KEYCHAIN}"
             keychain_created=1
             /usr/bin/security set-keychain-settings -lut 21600 "${SMOKE_KEYCHAIN}"
@@ -347,7 +352,7 @@ jobs:
           export PATH="${GUARD_DIR}:/usr/bin:/bin:/usr/sbin:/sbin"
           export POLY_GUARD_LOG="${GUARD_LOG}"
           accept_feedback bundle
-          if [[ "${IS_RELEASE}" == 'true' ]]; then
+          if [[ "${GITHUB_ACTIONS}" == 'true' ]]; then
             printf '%s' "${SMOKE_SECRET}" \
               | "${RUNTIME_EXECUTABLE}" --keychain-smoke set --account "${SMOKE_ACCOUNT}" >/dev/null
           fi
@@ -411,7 +416,7 @@ jobs:
           app_pid=$!
           wait_for_health
           accept_feedback persisted
-          if [[ "${IS_RELEASE}" == 'true' ]]; then
+          if [[ "${GITHUB_ACTIONS}" == 'true' ]]; then
             printf '%s' "${SMOKE_SECRET}" \
               | "${RUNTIME_EXECUTABLE}" --keychain-smoke verify --account "${SMOKE_ACCOUNT}" >/dev/null
           fi
@@ -431,8 +436,10 @@ jobs:
             /bin/sleep 1
           done
           [[ -z "${remaining}" && "${app_count}" -eq 0 ]]
-          if [[ "${IS_RELEASE}" == 'true' ]]; then
+          if [[ "${GITHUB_ACTIONS}" == 'true' ]]; then
             "${RUNTIME_EXECUTABLE}" --keychain-smoke delete --account "${SMOKE_ACCOUNT}" >/dev/null
+            printf '%s\n' '{"frozen_no_ui_keychain":"passed","set":true,"restart_verify":true,"delete":true}' \
+              >"${DIAGNOSTICS_DIR}/keychain-no-ui-frozen.json"
           fi
           copy_smoke_diagnostics
           [[ ! -s "${GUARD_LOG}" ]]

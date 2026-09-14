@@ -331,12 +331,12 @@ def test_fast_resmoke_launches_directly_and_captures_failure_diagnostics() -> No
     assert '/usr/bin/open -n "${INSTALLED_APP}"' not in smoke
 
 
-def test_keychain_smoke_is_limited_to_signed_release_builds() -> None:
+def test_keychain_smoke_runs_for_all_disposable_ci_builds() -> None:
     workflow = read(WORKFLOW)
     smoke = workflow.split(
         "- name: Install DMG into an isolated home and smoke test", 1
     )[1].split("- name: Remove temporary signing keychain", 1)[0]
-    release_guard = "if [[ \"${IS_RELEASE}\" == 'true' ]]; then"
+    ci_guard = "if [[ \"${GITHUB_ACTIONS}\" == 'true' ]]; then"
 
     for marker in (
         '"${RUNTIME_EXECUTABLE}" --keychain-smoke set --account',
@@ -344,7 +344,7 @@ def test_keychain_smoke_is_limited_to_signed_release_builds() -> None:
         '"${RUNTIME_EXECUTABLE}" --keychain-smoke delete --account',
     ):
         marker_position = smoke.index(marker)
-        guard_position = smoke.rfind(release_guard, 0, marker_position)
+        guard_position = smoke.rfind(ci_guard, 0, marker_position)
         end_position = smoke.find("\n          fi", marker_position)
         assert guard_position != -1
         assert end_position != -1

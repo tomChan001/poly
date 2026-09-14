@@ -16,6 +16,7 @@ from pathlib import Path
 
 HEAD = "0010_risk_policy_liquidity"
 REQUIRED_MODULES = {
+    "backend.app.core.macos_secrets",
     "backend.app.db.base",
     "backend.app.db.tables",
     "backend.app.adapters.native_fees",

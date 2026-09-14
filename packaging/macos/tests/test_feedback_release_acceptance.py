@@ -52,7 +52,8 @@ def test_frontend_manifest_rejects_changed_or_extra_installed_files(tmp_path):
 def test_frozen_module_inventory_rejects_any_missing_feedback_module():
     helper = load_helper()
     required = set(helper.REQUIRED_MODULES)
-    assert len(required) == 5
+    assert len(required) == 6
+    assert 'backend.app.core.macos_secrets' in required
     helper.verify_modules(required)
     for module in required:
         with pytest.raises(ValueError, match="frozen modules missing"):

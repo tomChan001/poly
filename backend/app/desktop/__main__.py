@@ -20,6 +20,7 @@ from typing import Protocol
 if __name__ == "__main__" or getattr(sys, "frozen", False):
     os.environ["POLY_DESKTOP_MODE"] = "1"
 
+from backend.app.core.macos_secrets import MacOSNoUISecretStore
 from backend.app.core.secrets import KeyringSecretStore, SecretStore
 from backend.app.desktop.parent import trusted_packaged_parent
 from backend.app.desktop.protocol import (
@@ -230,6 +231,7 @@ def self_test(
     # import graph. Verify their dependencies in the frozen process as well.
     try:
         for module_name in (
+            "backend.app.core.macos_secrets",
             "backend.app.db.base",
             "backend.app.db.tables",
             "backend.app.adapters.native_fees",
@@ -279,7 +281,11 @@ async def keychain_smoke(
     } or not _KEYCHAIN_SMOKE_ACCOUNT.fullmatch(account):
         return _failure("keychain_smoke_failed", "keychain smoke failed")
     try:
-        active_store = store or KeyringSecretStore(_KEYCHAIN_SMOKE_SERVICE)
+        active_store = store or (
+            MacOSNoUISecretStore(_KEYCHAIN_SMOKE_SERVICE)
+            if sys.platform == "darwin"
+            else KeyringSecretStore(_KEYCHAIN_SMOKE_SERVICE)
+        )
         if action == "delete":
             await active_store.delete(account)
             if await active_store.get(account) is not None:
