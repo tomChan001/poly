@@ -56,7 +56,21 @@ def probe(dmg):
         command([security, 'list-keychains', '-d', 'user', '-s', str(keychain)]).check_returncode()
         command([security, 'default-keychain', '-d', 'user', '-s', str(keychain)]).check_returncode()
         executable = app / 'Contents/Resources/poly-runtime/poly-runtime'
-        for label, env in [('original-home', original_env), ('isolated-home', isolated_env)]:
+        for label, env in [
+            ('original-home', original_env),
+            ('isolated-home', isolated_env),
+            ('isolated-configured', isolated_env),
+            ('isolated-preferences', isolated_env),
+        ]:
+            if label == 'isolated-preferences':
+                (isolated_home / 'Library/Preferences').mkdir(parents=True, exist_ok=True)
+            if label in {'isolated-configured', 'isolated-preferences'}:
+                for args in [
+                    [security, 'list-keychains', '-d', 'user', '-s', str(keychain)],
+                    [security, 'default-keychain', '-d', 'user', '-s', str(keychain)],
+                ]:
+                    result = command(args, env=env)
+                    print(json.dumps({'context': label, 'configure': args[1], 'exit': result.returncode}), flush=True)
             result = command([sys.executable, str(Path(__file__).resolve()), '--default-status'], env=env)
             print(label, result.stdout.decode().strip(), flush=True)
             for action in ['set', 'verify', 'delete']:
@@ -64,6 +78,13 @@ def probe(dmg):
                 print(json.dumps({'context': label, 'action': action, 'exit': result.returncode}), flush=True)
     finally:
         if created:
+            # No original-home change below; this clears only disposable prefs.
+            for args in [
+                [security, 'default-keychain', '-d', 'user', '-s'],
+                [security, 'list-keychains', '-d', 'user', '-s'],
+            ]:
+                result = command(args, env=isolated_env)
+                print(json.dumps({'cleanup': args[1], 'exit': result.returncode}), flush=True)
             restored_default = command([security, 'default-keychain', '-d', 'user', '-s', saved_default], env=original_env)
             restored_list = command([security, 'list-keychains', '-d', 'user', '-s', *saved_list], env=original_env)
             restored_default.check_returncode()

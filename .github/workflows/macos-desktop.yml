@@ -8,6 +8,11 @@ on:
         description: Existing workflow run whose Apple Silicon DMG should be re-smoked
         required: false
         type: string
+      probe_only:
+        description: Run only the synthetic keychain environment probe against an existing DMG
+        required: false
+        type: boolean
+        default: false
   push:
     tags:
       - 'v*'
@@ -533,6 +538,7 @@ jobs:
         run: /usr/bin/python3 packaging/macos/probe-no-ui-artifact.py "${DMG_PATH}"
 
       - name: Re-smoke installed DMG with explicit phases
+        if: ${{ inputs.probe_only != true }}
         run: |
           set -euo pipefail
           SMOKE_ROOT="$(mktemp -d "${RUNNER_TEMP}/poly-resmoke.XXXXXXXX")"
