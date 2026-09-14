@@ -19,3 +19,13 @@ def test_native_acceptance_never_targets_login_keychain() -> None:
     assert 'timeout=15' in script
     assert 'legacy_preserved' in script
     assert 'locked_read_rejected' in script
+
+
+def test_installed_smoke_configures_keychain_in_the_runtime_home() -> None:
+    workflow = (ROOT / '.github/workflows/macos-desktop.yml').read_text(encoding='utf-8')
+    smoke = workflow.split('- name: Install DMG into an isolated home and smoke test', 1)[1]
+    smoke = smoke.split('- name: Remove temporary signing keychain', 1)[0]
+    assert smoke.index('export HOME="${SMOKE_HOME}"') < smoke.index('security create-keychain')
+    assert 'ORIGINAL_KEYCHAIN_HOME="${HOME}"' in smoke
+    assert '/usr/bin/env HOME="${ORIGINAL_KEYCHAIN_HOME}" /usr/bin/security default-keychain' in smoke
+    assert '/usr/bin/env HOME="${ORIGINAL_KEYCHAIN_HOME}" /usr/bin/security list-keychains' in smoke

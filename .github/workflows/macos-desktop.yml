@@ -259,6 +259,7 @@ jobs:
           trim_keychain_path() {
             /usr/bin/sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//'
           }
+          ORIGINAL_KEYCHAIN_HOME="${HOME}"
           ORIGINAL_DEFAULT_KEYCHAIN=""
           ORIGINAL_KEYCHAINS=()
           if [[ "${GITHUB_ACTIONS}" == 'true' ]]; then
@@ -286,8 +287,12 @@ jobs:
           keychain_created=0
           restore_keychains() {
             local restore_failed=0
-            /usr/bin/security default-keychain -d user -s "${ORIGINAL_DEFAULT_KEYCHAIN}" >/dev/null 2>&1 || restore_failed=1
-            /usr/bin/security list-keychains -d user -s "${ORIGINAL_KEYCHAINS[@]}" >/dev/null 2>&1 || restore_failed=1
+            # Remove fixture references only from the disposable runtime home.
+            /usr/bin/security default-keychain -d user -s >/dev/null 2>&1 || restore_failed=1
+            /usr/bin/security list-keychains -d user -s >/dev/null 2>&1 || restore_failed=1
+            # The original snapshots belong to the original HOME, not SMOKE_HOME.
+            /usr/bin/env HOME="${ORIGINAL_KEYCHAIN_HOME}" /usr/bin/security default-keychain -d user -s "${ORIGINAL_DEFAULT_KEYCHAIN}" >/dev/null 2>&1 || restore_failed=1
+            /usr/bin/env HOME="${ORIGINAL_KEYCHAIN_HOME}" /usr/bin/security list-keychains -d user -s "${ORIGINAL_KEYCHAINS[@]}" >/dev/null 2>&1 || restore_failed=1
             if [[ "${restore_failed}" -ne 0 ]]; then
               printf 'failed to restore original user Keychain configuration\n' >"${KEYCHAIN_RESTORE_FAILURE}"
               return 1
@@ -339,16 +344,17 @@ jobs:
           /usr/bin/hdiutil detach "${MOUNT_POINT}"
           mounted=0
 
+          # Keychain preferences and the frozen runtime must use the same HOME.
+          export HOME="${SMOKE_HOME}"
           if [[ "${GITHUB_ACTIONS}" == 'true' ]]; then
             /usr/bin/security create-keychain -p "${SMOKE_KEYCHAIN_PASSWORD}" "${SMOKE_KEYCHAIN}"
             keychain_created=1
             /usr/bin/security set-keychain-settings -lut 21600 "${SMOKE_KEYCHAIN}"
             /usr/bin/security unlock-keychain -p "${SMOKE_KEYCHAIN_PASSWORD}" "${SMOKE_KEYCHAIN}"
-            /usr/bin/security list-keychains -d user -s "${SMOKE_KEYCHAIN}" "${ORIGINAL_KEYCHAINS[@]}"
+            /usr/bin/security list-keychains -d user -s "${SMOKE_KEYCHAIN}"
             /usr/bin/security default-keychain -d user -s "${SMOKE_KEYCHAIN}"
           fi
 
-          export HOME="${SMOKE_HOME}"
           export PATH="${GUARD_DIR}:/usr/bin:/bin:/usr/sbin:/sbin"
           export POLY_GUARD_LOG="${GUARD_LOG}"
           accept_feedback bundle

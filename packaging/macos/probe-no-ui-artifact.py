@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 def command(args, *, env=None, data=None):
-    return subprocess.run(args, env=env, input=data, capture_output=True, timeout=30)
+    return subprocess.run(args, env=env, input=data, capture_output=True, timeout=30, check=False)
 
 
 def default_status():
