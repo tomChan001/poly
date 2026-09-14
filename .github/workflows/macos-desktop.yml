@@ -101,6 +101,7 @@ jobs:
             packaging/macos/tests/test_ci_documentation_contract.py \
             packaging/macos/tests/test_feedback_release_acceptance.py \
             packaging/macos/tests/test_no_ui_keychain_contract.py \
+            packaging/macos/tests/test_installed_smoke_runner.py \
             -q
 
       - name: Run disposable no-UI keychain acceptance
