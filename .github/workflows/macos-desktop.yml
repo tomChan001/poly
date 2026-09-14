@@ -523,6 +523,9 @@ jobs:
           test -n "${DMG_PATH}"
           printf 'DMG_PATH=%s\n' "${DMG_PATH}" >>"${GITHUB_ENV}"
 
+      - name: Compare frozen no-UI keychain environments
+        run: /usr/bin/python3 packaging/macos/probe-no-ui-artifact.py "${DMG_PATH}"
+
       - name: Re-smoke installed DMG with explicit phases
         run: |
           set -euo pipefail
